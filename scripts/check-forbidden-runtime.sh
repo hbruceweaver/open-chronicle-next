@@ -27,11 +27,6 @@ fi
 
 root=${1:-$default_root}
 
-if ! command -v rg >/dev/null 2>&1; then
-    echo "forbidden-runtime guard requires ripgrep (rg)" >&2
-    exit 2
-fi
-
 if [ ! -d "$root" ]; then
     echo "forbidden-runtime guard root does not exist: $root" >&2
     exit 2
@@ -46,11 +41,23 @@ for relative_path in crates macos app Sources spikes scripts; do
         continue
     fi
 
-    if matches=$(rg --line-number --with-filename --pcre2 \
-        --glob '*.rs' --glob '*.swift' --glob '*.sh' --glob '*.toml' \
-        --glob '*.json' --glob '*.plist' --glob '*.yml' --glob '*.yaml' \
-        --glob '!check-forbidden-runtime.sh' \
-        "$runtime_pattern" "$candidate"); then
+    if command -v rg >/dev/null 2>&1; then
+        matches=$(rg --line-number --with-filename --pcre2 \
+            --glob '*.rs' --glob '*.swift' --glob '*.sh' --glob '*.toml' \
+            --glob '*.json' --glob '*.plist' --glob '*.yml' --glob '*.yaml' \
+            --glob '!check-forbidden-runtime.sh' \
+            "$runtime_pattern" "$candidate" || true)
+    else
+        matches=$(find "$candidate" -type f \
+            ! -path '*/.build/*' ! -path '*/target/*' ! -path '*/.git/*' \
+            \( -name '*.rs' -o -name '*.swift' -o -name '*.sh' \
+            -o -name '*.toml' -o -name '*.json' -o -name '*.plist' \
+            -o -name '*.yml' -o -name '*.yaml' \) \
+            ! -name 'check-forbidden-runtime.sh' \
+            -exec grep -nEH "$runtime_pattern" {} + 2>/dev/null || true)
+    fi
+
+    if [ -n "$matches" ]; then
         echo "forbidden runtime or source-checkout dependency found:" >&2
         echo "$matches" >&2
         failed=1
@@ -59,7 +66,11 @@ done
 
 fixtures="$root/fixtures"
 if [ -d "$fixtures" ]; then
-    fixture_files=$(rg --files --hidden "$fixtures" || true)
+    if command -v rg >/dev/null 2>&1; then
+        fixture_files=$(rg --files --hidden "$fixtures" || true)
+    else
+        fixture_files=$(find "$fixtures" -type f -print)
+    fi
     if [ -n "$fixture_files" ]; then
         while IFS= read -r fixture; do
             case "$fixture" in
@@ -74,10 +85,16 @@ $fixture_files
 EOF
     fi
 
-    if matches=$(rg --line-number --with-filename --hidden \
-        --glob '!synthetic/**' \
-        '(/Users/[^/[:space:]"'\'']+/|BEGIN[[:space:]]+PRIVATE|real[_ -]?evidence)' \
-        "$fixtures"); then
+    fixture_pattern='(/Users/[^/[:space:]"'\'']+/|BEGIN[[:space:]]+PRIVATE|real[_ -]?evidence)'
+    if command -v rg >/dev/null 2>&1; then
+        matches=$(rg --line-number --with-filename --hidden \
+            --glob '!synthetic/**' "$fixture_pattern" "$fixtures" || true)
+    else
+        matches=$(find "$fixtures" -type f ! -path '*/synthetic/*' \
+            -exec grep -nEH "$fixture_pattern" {} + 2>/dev/null || true)
+    fi
+
+    if [ -n "$matches" ]; then
         echo "possible real-user evidence fixture found:" >&2
         echo "$matches" >&2
         failed=1
@@ -89,4 +106,3 @@ if [ "$failed" -ne 0 ]; then
 fi
 
 echo "forbidden-runtime guard passed"
-
