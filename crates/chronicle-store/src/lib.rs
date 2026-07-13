@@ -1,3 +1,149 @@
-//! Canonical journal and rebuildable projection infrastructure.
-//!
-//! Storage behavior starts in U3 after U2 freezes the evidence contracts.
+//! Durable canonical storage and rebuildable SQLite projection.
+
+pub mod artifacts;
+pub mod checksum;
+pub mod generation;
+pub mod journal;
+pub mod layout;
+pub mod locks;
+pub mod permissions;
+pub mod projection;
+pub mod recovery;
+pub mod sqlite;
+
+use std::io;
+
+use chronicle_domain::{
+    DurableAcknowledgement, HealthCode, HealthSeverity, HealthSnapshot, ProjectionHealth,
+};
+use chrono::{DateTime, Utc};
+use thiserror::Error;
+
+pub use artifacts::*;
+pub use generation::*;
+pub use journal::*;
+pub use layout::*;
+pub use locks::*;
+pub use projection::*;
+pub use recovery::*;
+pub use sqlite::*;
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("managed path is invalid: {0}")]
+    InvalidPath(String),
+    #[error("managed root must be owned by the current non-root user")]
+    WrongOwner,
+    #[error("managed object has unsafe permissions: {0}")]
+    UnsafePermissions(String),
+    #[error("I/O failure: {0}")]
+    Io(#[from] io::Error),
+    #[error("JSON failure: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("SQLite failure: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("contract failure: {0}")]
+    Contract(#[from] chronicle_domain::ContractError),
+    #[error("complete canonical record is corrupt in {shard} at byte {offset}: {reason}")]
+    CorruptRecord {
+        shard: String,
+        offset: u64,
+        reason: String,
+    },
+    #[error("lock timed out: {0}")]
+    LockTimeout(String),
+    #[error("stable ID {id} was replayed with different canonical bytes")]
+    StableIdConflict { id: String },
+    #[error("artifact expected prior revision conflict")]
+    ArtifactConflict,
+    #[error("store handle is stale; expected generation {expected}, found {actual}")]
+    StaleGeneration { expected: u64, actual: u64 },
+    #[error("runtime SQLite identity mismatch: {0}")]
+    SqliteIdentity(String),
+    #[error("journal repair requires explicit confirmation")]
+    RepairNotConfirmed,
+    #[error("journal repair is incomplete: {0}")]
+    RepairIncomplete(String),
+    #[error("injected crash boundary: {0:?}")]
+    InjectedFault(FaultPoint),
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+pub fn critical_storage_health(observed_at: DateTime<Utc>) -> HealthSnapshot {
+    HealthSnapshot {
+        observed_at,
+        severity: HealthSeverity::Critical,
+        code: HealthCode::StorageUnavailable,
+        projection: ProjectionHealth::Blocked,
+        acknowledgement: Some(DurableAcknowledgement::NotDurable),
+        factual_message: "Canonical storage is unavailable; recording must pause until recovery."
+            .to_owned(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultPoint {
+    AfterJournalAppend,
+    AfterJournalSync,
+    AfterRowInsert,
+    AfterCursorUpdate,
+    AfterCurrentPointerUpdate,
+    AfterWatermarkUpdate,
+    BeforeTransactionCommit,
+    AfterTransactionCommit,
+    AfterArtifactRename,
+    AfterArtifactDirectorySync,
+    AfterProvisionalImageSync,
+    AfterObservationAppend,
+    AfterImagePromotion,
+    AfterImagePromotionDirectorySync,
+    AfterLifecycleCompletion,
+    AfterDeleteRequest,
+    AfterImageUnlink,
+    AfterImageUnlinkDirectorySync,
+    AfterDeleteCompletion,
+    AfterRepairArchive,
+    AfterRepairSuccessor,
+    AfterRepairOriginalUnlink,
+    AfterRepairMarker,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FaultInjector {
+    point: Option<FaultPoint>,
+    abort_process: bool,
+}
+
+impl FaultInjector {
+    pub const fn at(point: FaultPoint) -> Self {
+        Self {
+            point: Some(point),
+            abort_process: false,
+        }
+    }
+
+    pub const fn abort_at(point: FaultPoint) -> Self {
+        Self {
+            point: Some(point),
+            abort_process: true,
+        }
+    }
+
+    pub const fn none() -> Self {
+        Self {
+            point: None,
+            abort_process: false,
+        }
+    }
+
+    pub fn check(self, point: FaultPoint) -> Result<()> {
+        if self.point == Some(point) {
+            if self.abort_process {
+                std::process::abort();
+            }
+            return Err(StoreError::InjectedFault(point));
+        }
+        Ok(())
+    }
+}

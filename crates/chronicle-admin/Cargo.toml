@@ -15,7 +15,7 @@ path = "src/main.rs"
 chronicle-domain = { path = "../chronicle-domain" }
 chronicle-engine = { path = "../chronicle-engine" }
 chronicle-store = { path = "../chronicle-store" }
+serde_json.workspace = true
 
 [lints]
 workspace = true
-

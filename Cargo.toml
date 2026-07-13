@@ -19,11 +19,13 @@ repository = "https://github.com/hbruceweaver/open-chronicle-next"
 [workspace.dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "chrono", "uuid"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 thiserror = "2.0.18"
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
+tempfile = "3.27.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -38,4 +40,3 @@ codegen-units = 1
 lto = "thin"
 panic = "unwind"
 strip = "symbols"
-
