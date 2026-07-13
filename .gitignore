@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Xcode and Swift
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Rust
+target/
+
+# Local Chronicle data
+.chronicle/
+open-chronicle-data/
+*.db
+*.db-shm
+*.db-wal
+screenshots/
+
+# Secrets and local overrides
+.env
+.env.*
+!.env.example
+*.local.toml
+
+# Generated release artifacts
+dist/
+*.dmg
+*.app.zip
+
