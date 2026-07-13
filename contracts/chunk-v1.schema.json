@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openchronicle.dev/contracts/chunk-v1.schema.json",
+  "title": "Open Chronicle five-minute chunk revision v1",
+  "type": "object",
+  "required": ["schema_version", "chunk_id", "revision_id", "prior_revision_id", "supersedes_revision_id", "window", "generated_at", "display_timezone", "aggregator_version", "input_digest", "store_generation", "finalization_cadence_seconds", "evidence_seconds", "presence_seconds", "duration_estimates", "transitions", "ocr_extracts", "gaps", "supporting_event_ids", "late_input"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "chunk_id": {"$ref": "#/$defs/id"},
+    "revision_id": {"$ref": "#/$defs/id"},
+    "prior_revision_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    "supersedes_revision_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    "window": {"type": "object", "required": ["start", "end"], "properties": {"start": {"type": "string", "format": "date-time"}, "end": {"type": "string", "format": "date-time"}}, "additionalProperties": false},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "display_timezone": {"type": "string", "minLength": 1},
+    "aggregator_version": {"type": "string", "minLength": 1},
+    "input_digest": {"type": "string", "minLength": 1},
+    "store_generation": {"type": "integer", "minimum": 1},
+    "finalization_cadence_seconds": {"enum": [30, 60]},
+    "evidence_seconds": {"$ref": "#/$defs/evidenceSeconds"},
+    "presence_seconds": {"$ref": "#/$defs/presenceSeconds"},
+    "duration_estimates": {"type": "array", "items": {"$ref": "#/$defs/duration"}},
+    "transitions": {"type": "array", "items": {"$ref": "#/$defs/transition"}},
+    "ocr_extracts": {"type": "array", "items": {"$ref": "#/$defs/extract"}},
+    "gaps": {"type": "array", "items": {"$ref": "#/$defs/gap"}},
+    "supporting_event_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "late_input": {"type": "boolean"}
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9_.:-]+$"},
+    "evidenceSeconds": {"type": "object", "required": ["captured", "protected", "paused", "unavailable", "error", "gap"], "properties": {"captured": {"type": "integer", "minimum": 0}, "protected": {"type": "integer", "minimum": 0}, "paused": {"type": "integer", "minimum": 0}, "unavailable": {"type": "integer", "minimum": 0}, "error": {"type": "integer", "minimum": 0}, "gap": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+    "presenceSeconds": {"type": "object", "required": ["active", "idle", "unknown"], "properties": {"active": {"type": "integer", "minimum": 0}, "idle": {"type": "integer", "minimum": 0}, "unknown": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+    "duration": {"type": "object", "required": ["dimension", "key", "label", "estimated_seconds", "supporting_event_ids"], "properties": {"dimension": {"enum": ["application", "window", "authorized-domain"]}, "key": {"type": "string", "minLength": 1}, "label": {"type": "string", "minLength": 1}, "estimated_seconds": {"type": "integer", "minimum": 0, "maximum": 300}, "supporting_event_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}}, "additionalProperties": false},
+    "transition": {"type": "object", "required": ["at", "from_key", "to_key", "supporting_event_id"], "properties": {"at": {"type": "string", "format": "date-time"}, "from_key": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]}, "to_key": {"type": "string", "minLength": 1}, "supporting_event_id": {"$ref": "#/$defs/id"}}, "additionalProperties": false},
+    "extract": {"type": "object", "required": ["text", "source_event_id", "untrusted_evidence"], "properties": {"text": {"type": "string", "minLength": 1}, "source_event_id": {"$ref": "#/$defs/id"}, "untrusted_evidence": {"const": true}}, "additionalProperties": false},
+    "gap": {"type": "object", "required": ["start", "end", "kind", "supporting_event_ids"], "properties": {"start": {"type": "string", "format": "date-time"}, "end": {"type": "string", "format": "date-time"}, "kind": {"enum": ["protected", "paused", "unavailable", "error", "missing-observation"]}, "supporting_event_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}}, "additionalProperties": false}
+  }
+}

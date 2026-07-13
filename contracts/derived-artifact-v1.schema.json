@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openchronicle.dev/contracts/derived-artifact-v1.schema.json",
+  "title": "Open Chronicle derived artifact revision v1",
+  "type": "object",
+  "required": ["schema_version", "artifact_id", "revision_id", "prior_revision_id", "expected_prior_revision_id", "artifact_type", "author", "created_at", "status", "payload", "evidence", "confidence", "store_generation"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "artifact_id": {"$ref": "#/$defs/id"},
+    "revision_id": {"$ref": "#/$defs/id"},
+    "prior_revision_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    "expected_prior_revision_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    "artifact_type": {"enum": ["annotation", "tag", "hypothesis", "report"]},
+    "author": {
+      "type": "object",
+      "required": ["kind", "display_name", "client_id", "model"],
+      "properties": {
+        "kind": {"enum": ["user", "consultant", "mcp-client", "model"]},
+        "display_name": {"type": ["string", "null"]},
+        "client_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "model": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["draft", "accepted", "rejected", "superseded"]},
+    "payload": {},
+    "evidence": {
+      "type": "object",
+      "required": ["event_ids", "chunk_ids"],
+      "properties": {
+        "event_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+        "chunk_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        {"properties": {"event_ids": {"minItems": 1}}},
+        {"properties": {"chunk_ids": {"minItems": 1}}}
+      ]
+    },
+    "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "store_generation": {"type": "integer", "minimum": 1}
+  },
+  "additionalProperties": true,
+  "$defs": {"id": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9_.:-]+$"}}
+}

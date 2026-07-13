@@ -1,0 +1,31 @@
+{
+  "corpus_version": "session-v1",
+  "synthetic": true,
+  "display_timezone": "Europe/Zurich",
+  "event_records": 14,
+  "chunk_revisions": 2,
+  "query_exchanges": 3,
+  "ae4_interval_centered_attempts": 10,
+  "ae13_unchanged_attempts": 10,
+  "ae13_seed_records": 2,
+  "cases": [
+    "changed-content",
+    "unchanged-content",
+    "protected-coarse-payload",
+    "idle-presence",
+    "sleep-gap",
+    "permission-gap",
+    "ocr-failure",
+    "unicode-and-prompt-like-ocr",
+    "late-input-revision",
+    "missing-image",
+    "expired-image",
+    "two-phase-retention-expiry",
+    "two-phase-user-deletion",
+    "ten-interval-centered-attempts",
+    "ten-unchanged-one-artifact",
+    "unchanged-seed-retained-lifecycle",
+    "opaque-query-image-reference",
+    "derived-analysis-separation"
+  ]
+}

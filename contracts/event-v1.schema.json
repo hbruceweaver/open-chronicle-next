@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openchronicle.dev/contracts/event-v1.schema.json",
+  "title": "Open Chronicle event v1",
+  "type": "object",
+  "required": ["schema_version", "event_id", "device_id", "scheduled_at", "observed_at", "recorded_at", "display_timezone", "source", "kind", "payload"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "event_id": {"$ref": "#/$defs/opaqueId"},
+    "device_id": {"$ref": "#/$defs/opaqueId"},
+    "scheduled_at": {"type": ["string", "null"], "format": "date-time"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "display_timezone": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "required": ["adapter", "version"],
+      "properties": {"adapter": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1}},
+      "additionalProperties": false
+    },
+    "kind": {"enum": ["observation-attempt", "recording-gap", "screenshot-lifecycle"]},
+    "payload": {"oneOf": [
+      {"$ref": "#/$defs/observationPayload"},
+      {"$ref": "#/$defs/gapPayload"},
+      {"$ref": "#/$defs/lifecyclePayload"}
+    ]}
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {"if": {"properties": {"kind": {"const": "observation-attempt"}}}, "then": {"properties": {"scheduled_at": {"type": "string"}, "payload": {"$ref": "#/$defs/observationPayload"}}}},
+    {"if": {"properties": {"kind": {"const": "recording-gap"}}}, "then": {"properties": {"scheduled_at": {"type": "null"}, "payload": {"$ref": "#/$defs/gapPayload"}}}},
+    {"if": {"properties": {"kind": {"const": "screenshot-lifecycle"}}}, "then": {"properties": {"scheduled_at": {"type": "null"}, "payload": {"$ref": "#/$defs/lifecyclePayload"}}}}
+  ],
+  "$defs": {
+    "opaqueId": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9_.:-]+$"},
+    "observationPayload": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {
+        "type": {"const": "observation-attempt"},
+        "data": {
+          "type": "object",
+          "required": ["cadence_seconds", "attempt_status", "evidence_state", "presence_state", "idle_seconds", "ocr_state", "content"],
+          "properties": {
+            "cadence_seconds": {"enum": [30, 60]},
+            "attempt_status": {"enum": ["completed", "skipped", "failed"]},
+            "evidence_state": {"enum": ["captured-new", "captured-unchanged", "protected", "paused", "unavailable", "capture-failed"]},
+            "presence_state": {"enum": ["active", "idle", "locked", "asleep", "unknown"]},
+            "idle_seconds": {"type": ["integer", "null"], "minimum": 0},
+            "ocr_state": {"enum": ["complete", "empty", "partial", "failed", "not-run"]},
+            "content": {"oneOf": [
+              {"$ref": "#/$defs/capturedContent"},
+              {"$ref": "#/$defs/unchangedContent"},
+              {"$ref": "#/$defs/protectedContent"},
+              {"$ref": "#/$defs/noEvidenceContent"}
+            ]}
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {"if": {"properties": {"presence_state": {"const": "idle"}}}, "then": {"properties": {"idle_seconds": {"type": "integer", "minimum": 1}}}},
+            {"if": {"properties": {"presence_state": {"not": {"const": "idle"}}}}, "then": {"properties": {"idle_seconds": {"type": "null"}}}},
+            {"if": {"properties": {"evidence_state": {"enum": ["captured-new", "captured-unchanged"]}}}, "then": {"properties": {"attempt_status": {"const": "completed"}, "presence_state": {"enum": ["active", "idle", "unknown"]}}}},
+            {"if": {"properties": {"evidence_state": {"const": "captured-new"}}}, "then": {"properties": {"content": {"$ref": "#/$defs/capturedContent"}}}},
+            {"if": {"properties": {"evidence_state": {"const": "captured-unchanged"}}}, "then": {"properties": {"content": {"$ref": "#/$defs/unchangedContent"}, "ocr_state": {"const": "not-run"}}}},
+            {"if": {"properties": {"evidence_state": {"const": "protected"}}}, "then": {"properties": {"attempt_status": {"const": "skipped"}, "ocr_state": {"const": "not-run"}, "content": {"$ref": "#/$defs/protectedContent"}}}},
+            {"if": {"properties": {"evidence_state": {"const": "paused"}}}, "then": {"properties": {"attempt_status": {"const": "skipped"}, "ocr_state": {"const": "not-run"}, "content": {"allOf": [{"$ref": "#/$defs/noEvidenceContent"}, {"properties": {"data": {"properties": {"reason": {"enum": ["user-paused", "study-expired"]}}}}}]}}}},
+            {"if": {"properties": {"evidence_state": {"const": "unavailable"}}}, "then": {"properties": {"attempt_status": {"const": "skipped"}, "ocr_state": {"const": "not-run"}, "content": {"allOf": [{"$ref": "#/$defs/noEvidenceContent"}, {"properties": {"data": {"properties": {"reason": {"enum": ["permission-denied", "locked", "asleep", "no-exact-window", "ambiguous-window"]}}}}}]}}}},
+            {"if": {"properties": {"evidence_state": {"const": "capture-failed"}}}, "then": {"properties": {"attempt_status": {"const": "failed"}, "ocr_state": {"const": "not-run"}, "content": {"allOf": [{"$ref": "#/$defs/noEvidenceContent"}, {"properties": {"data": {"properties": {"reason": {"const": "capture-api-failure"}}}}}]}}}}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "windowContext": {
+      "type": "object",
+      "required": ["application_bundle_id", "process_name", "window_title", "authorized_domain"],
+      "properties": {
+        "application_bundle_id": {"type": "string", "minLength": 1},
+        "process_name": {"type": "string", "minLength": 1},
+        "window_title": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+        "authorized_domain": {"oneOf": [{"$ref": "#/$defs/authorizedDomain"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "authorizedDomain": {
+      "type": "object",
+      "required": ["adapter", "domain"],
+      "properties": {"adapter": {"type": "string", "minLength": 1}, "domain": {"type": "string", "minLength": 1}},
+      "additionalProperties": false
+    },
+    "ocr": {
+      "type": "object",
+      "required": ["text", "change", "confidence", "untrusted_evidence"],
+      "properties": {
+        "text": {"type": "string"},
+        "change": {"enum": ["new", "changed", "unchanged"]},
+        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "untrusted_evidence": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "image": {
+      "type": "object",
+      "required": ["artifact_id", "managed_relative_path", "content_hash", "dimensions", "expires_at", "intent_state"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/opaqueId"},
+        "managed_relative_path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"},
+        "content_hash": {"type": "string"},
+        "dimensions": {
+          "type": "object",
+          "required": ["width", "height", "scale_milli"],
+          "properties": {"width": {"type": "integer", "minimum": 1, "maximum": 2560}, "height": {"type": "integer", "minimum": 1, "maximum": 2560}, "scale_milli": {"type": "integer", "minimum": 1}},
+          "additionalProperties": false
+        },
+        "expires_at": {"type": "string", "format": "date-time"},
+        "intent_state": {"const": "pending"}
+      },
+      "additionalProperties": false
+    },
+    "capturedContent": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {
+        "type": {"const": "captured"},
+        "data": {
+          "type": "object",
+          "required": ["context", "content_hash", "ocr", "image"],
+          "properties": {"context": {"$ref": "#/$defs/windowContext"}, "content_hash": {"type": "string", "minLength": 1}, "ocr": {"oneOf": [{"$ref": "#/$defs/ocr"}, {"type": "null"}]}, "image": {"oneOf": [{"$ref": "#/$defs/image"}, {"type": "null"}]}},
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "unchangedContent": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {
+        "type": {"const": "unchanged"},
+        "data": {
+          "type": "object",
+          "required": ["context", "content_hash", "previous_event_id", "reused_ocr_event_id", "image_artifact_id"],
+          "properties": {"context": {"$ref": "#/$defs/windowContext"}, "content_hash": {"type": "string", "minLength": 1}, "previous_event_id": {"$ref": "#/$defs/opaqueId"}, "reused_ocr_event_id": {"oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]}, "image_artifact_id": {"oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]}},
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "protectedContent": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {
+        "type": {"const": "protected"},
+        "data": {
+          "type": "object",
+          "required": ["reason", "privacy_policy_version"],
+          "properties": {"reason": {"enum": ["secure-input", "application-excluded", "title-excluded", "chronicle-self", "foreground-changed"]}, "privacy_policy_version": {"type": "string", "minLength": 1}},
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "noEvidenceContent": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {
+        "type": {"const": "no-evidence"},
+        "data": {
+          "type": "object",
+          "required": ["reason"],
+          "properties": {"reason": {"enum": ["user-paused", "study-expired", "permission-denied", "locked", "asleep", "no-exact-window", "ambiguous-window", "capture-api-failure"]}},
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "gapPayload": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {"type": {"const": "recording-gap"}, "data": {"type": "object", "required": ["start", "end", "reason"], "properties": {"start": {"type": "string", "format": "date-time"}, "end": {"type": "string", "format": "date-time"}, "reason": {"enum": ["sleep", "quit", "storage-outage", "permission-loss", "clock-correction"]}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "lifecyclePayload": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {"type": {"const": "screenshot-lifecycle"}, "data": {"type": "object", "required": ["artifact_id", "action", "deletion_cause", "projected_state", "requested_at", "completed_at", "source_event_id"], "properties": {"artifact_id": {"$ref": "#/$defs/opaqueId"}, "action": {"enum": ["write-completed", "delete-requested", "delete-completed", "missing", "write-failed"]}, "deletion_cause": {"type": ["string", "null"], "enum": ["retention-expired", "user-requested", null]}, "projected_state": {"enum": ["retained", "delete-pending", "expired", "user-deleted", "missing", "write-failed"]}, "requested_at": {"type": ["string", "null"], "format": "date-time"}, "completed_at": {"type": ["string", "null"], "format": "date-time"}, "source_event_id": {"$ref": "#/$defs/opaqueId"}}, "additionalProperties": false,
+        "oneOf": [
+          {"properties": {"action": {"const": "write-completed"}, "deletion_cause": {"type": "null"}, "projected_state": {"const": "retained"}, "requested_at": {"type": "null"}, "completed_at": {"type": "string"}}},
+          {"properties": {"action": {"const": "delete-requested"}, "deletion_cause": {"enum": ["retention-expired", "user-requested"]}, "projected_state": {"const": "delete-pending"}, "requested_at": {"type": "string"}, "completed_at": {"type": "null"}}},
+          {"properties": {"action": {"const": "delete-completed"}, "deletion_cause": {"const": "retention-expired"}, "projected_state": {"const": "expired"}, "requested_at": {"type": "string"}, "completed_at": {"type": "string"}}},
+          {"properties": {"action": {"const": "delete-completed"}, "deletion_cause": {"const": "user-requested"}, "projected_state": {"const": "user-deleted"}, "requested_at": {"type": "string"}, "completed_at": {"type": "string"}}},
+          {"properties": {"action": {"const": "missing"}, "deletion_cause": {"type": "null"}, "projected_state": {"const": "missing"}, "requested_at": {"type": "null"}, "completed_at": {"type": "string"}}},
+          {"properties": {"action": {"const": "write-failed"}, "deletion_cause": {"type": "null"}, "projected_state": {"const": "write-failed"}, "requested_at": {"type": "null"}, "completed_at": {"type": "string"}}}
+        ]}},
+      "additionalProperties": false
+    }
+  }
+}
