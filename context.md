@@ -66,10 +66,13 @@ The diagnostic engagement and the self-serve desktop product use the same eviden
 
 - Local screenshot.
 - Raw OCR.
-- Timestamp and capture status.
+- Scheduled timestamp and one factual outcome for every capture attempt, including
+  unchanged, paused, protected, unavailable, and error states.
 - Active application, process, and window title.
 - Permitted domain context when available.
 - Privacy decision, gap, or error metadata.
+- Metadata-only idle state; never key values, buttons, coordinates, clipboard
+  contents, typed text, or an input-event stream.
 
 ### Canonical evidence
 
@@ -84,7 +87,7 @@ The diagnostic engagement and the self-serve desktop product use the same eviden
 - Time coverage and gaps.
 - Applications/windows observed and deterministic duration estimates.
 - Transitions, OCR changes, factual extracts, and supporting event IDs.
-- Longer windows and natural sessions derived from the base chunks.
+- Longer factual windows composed from the base chunks when needed.
 
 ### Derived analysis
 
@@ -115,7 +118,7 @@ Use WakaTime's information hierarchy as a dashboard reference:
 - Breakdowns by useful dimensions.
 - Detailed cards and drill-downs.
 
-For MVP, Chronicle uses factual dimensions such as applications, windows, domains, observed time, sessions, transitions, and evidence coverage. Semantic project/category assignment is explicitly post-MVP; later models may propose assignments that users can correct.
+For MVP, Chronicle uses factual dimensions such as applications, windows, authorized domains, observed-time estimates, transitions, five-minute chunks, and evidence coverage. Semantic project/category assignment and semantic work sessions are explicitly post-MVP; later models may propose assignments that users can correct.
 
 ## Existing Implementations
 
@@ -128,7 +131,7 @@ The public Swift/Node proof of concept supplies the strongest product shell:
 - Capture controls, exclusions, settings, data deletion, and memory/timeline concepts.
 - Claude and Codex detection and MCP-registration concepts.
 
-It is not directly productizable as a DMG. It depends on a source checkout, Node/npm, runtime TypeScript, plaintext environment secrets, and deprecated whole-desktop capture. Its MCP process also owns summarization work, creating lifecycle and duplication risk.
+It is not directly productizable as a DMG. It depends on a source checkout, Node/npm, runtime TypeScript, plaintext environment secrets, and deprecated whole-desktop capture. Its MCP process also owns summarization work, creating lifecycle and duplication risk. Its privacy preflight cannot make whole-display pixels safe when an excluded background window is visible.
 
 ### Second Brain Rust Chronicle
 
@@ -141,21 +144,30 @@ The Rust implementation supplies the stronger systems substrate:
 - Untrusted-input wrapping, validation, deterministic fallback, and hardened model execution.
 - Contract and behavior tests.
 
-It is not directly productizable as a desktop app. It is CLI-first, uses source-tree Swift helper paths, assumes developer tooling, and contains cadence/storage mechanics that need redesign for a consumer product.
+It is not directly productizable as a desktop app. It is CLI-first, uses source-tree Swift helper paths, assumes developer tooling, and contains cadence/storage mechanics that need redesign for a consumer product. Its foreground preflight is followed by full-display capture, so its existing capture loop is also unsuitable for the product privacy contract.
 
 ### Target combination
 
 - Preserve and adapt the public repository's SwiftUI interaction patterns and onboarding.
-- Extract and redesign the Rust substrate into a packaged engine with a documented evidence contract.
-- Rebuild capture around ScreenCaptureKit and on-device Vision OCR.
-- Replace the Node/source-checkout MCP runtime with a bundled query bridge.
+- Extract and redesign the Rust substrate into a packaged core with a documented evidence contract, append-only journal, rebuildable SQLite projection, deterministic chunker, and shared query service.
+- Rebuild capture around exact-window ScreenCaptureKit capture, a pre/post-capture privacy race check, and on-device Vision OCR.
+- Link the Rust core into the signed Swift application through a narrow versioned C ABI; the app remains the sole capture and aggregation owner.
+- Replace the Node/source-checkout MCP runtime with a bundled Rust stdio server that uses the same query service and can only read evidence or write derived artifacts.
+- Make MCP registration opt-in and grant each client a visible, revocable disclosure scope; local installation alone does not authorize full-history OCR access.
 - Build the report and evidence timeline around factual events and five-minute chunks.
 
 ## MVP Boundary
 
-MVP is a local-first macOS product for personal and consultant-assisted use. It includes a self-contained app/DMG, onboarding, visible capture controls, privacy-safe active-window capture, local OCR, immutable factual events, five-minute chunks, report-led home, searchable timeline, MCP, derived write-back, export, deletion, health, and retention.
+MVP is a local-first macOS product for personal and consultant-assisted use. It includes a self-contained app/DMG, onboarding, visible capture controls, privacy-safe active-window capture, local OCR, immutable factual events, five-minute chunks, report-led home, searchable timeline, MCP, derived write-back, export, evidence deletion, factory reset, health, and retention.
 
 MVP excludes cloud sync, team administration, Windows, audio recording, semantic project inference, automatic workflow extraction, built-in automation recommendations, autonomous actions, and cloud screenshot storage.
+
+The MVP trusts the signed Chronicle processes and the user's macOS login account.
+Restrictive local permissions, checksums, and FileVault guidance reduce accidental
+exposure and corruption; they do not defend against a compromised same-user process,
+prove hostile tampering, or erase external backups. Launch at login is convenience,
+not crash supervision: a fatal app crash stops recording until relaunch and is shown
+later as a factual gap.
 
 ## Longer-term Direction
 
@@ -177,6 +189,22 @@ MVP excludes cloud sync, team administration, Windows, audio recording, semantic
 - No native audio in MVP.
 - Semantic project assignment is not an MVP feature.
 - Screenshots remain local in MVP.
+- Every scheduled attempt produces an honest factual outcome; an unchanged screen
+  is evidence coverage, while missing evidence is never treated as inactivity.
+- Daily append-only event and chunk journals plus immutable derived-artifact revision
+  files are canonical; SQLite is a disposable, rebuildable projection.
+- Five-minute chunks are deterministic immutable revisions. Model-written prose is
+  always a derived artifact.
+- Screenshot expiry preserves OCR and factual evidence until the user explicitly
+  deletes evidence; onboarding must disclose that distinction.
+- Domain reporting appears only when an explicitly authorized adapter supplied the
+  domain. Chronicle never infers a domain from OCR.
+- Study mode automatically pauses at its end boundary, including after sleep, and
+  requires an explicit extension.
+- MCP never returns screenshot bytes or arbitrary local paths.
+- MCP registration is opt-in; per-client grants bound time, content classes, expiry,
+  response size, and pagination, with full OCR denied until explicitly granted.
 - Personal recording can launch automatically; consultant studies are time-boxed.
+- MVP upgrades use manual DMG replacement with data/settings compatibility; an
+  automatic updater is post-MVP.
 - Cloud and organizational policy depend on deployment context and are later product layers.
-
