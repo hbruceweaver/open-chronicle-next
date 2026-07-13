@@ -1,0 +1,21 @@
+[package]
+name = "chronicle-admin"
+description = "Development-only verification and recovery CLI for Open Chronicle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chronicle-admin"
+path = "src/main.rs"
+
+[dependencies]
+chronicle-domain = { path = "../chronicle-domain" }
+chronicle-engine = { path = "../chronicle-engine" }
+chronicle-store = { path = "../chronicle-store" }
+
+[lints]
+workspace = true
+

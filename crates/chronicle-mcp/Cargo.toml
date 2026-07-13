@@ -1,0 +1,20 @@
+[package]
+name = "chronicle-mcp"
+description = "Grant-bounded local MCP adapter for Open Chronicle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chronicle-mcp"
+path = "src/main.rs"
+
+[dependencies]
+chronicle-domain = { path = "../chronicle-domain" }
+chronicle-engine = { path = "../chronicle-engine" }
+
+[lints]
+workspace = true
+

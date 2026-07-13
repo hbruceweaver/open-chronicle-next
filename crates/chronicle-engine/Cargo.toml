@@ -1,0 +1,16 @@
+[package]
+name = "chronicle-engine"
+description = "Serialized factual ingestion, aggregation, and query services for Open Chronicle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chronicle-domain = { path = "../chronicle-domain" }
+chronicle-store = { path = "../chronicle-store" }
+
+[lints]
+workspace = true
+

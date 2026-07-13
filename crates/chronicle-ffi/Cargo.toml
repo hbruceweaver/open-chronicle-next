@@ -1,0 +1,18 @@
+[package]
+name = "chronicle-ffi"
+description = "Versioned C ABI between the Open Chronicle macOS app and Rust core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+chronicle-engine = { path = "../chronicle-engine" }
+
+[lints]
+workspace = true
+
