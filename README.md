@@ -1,4 +1,4 @@
-# Open Chronicle Next
+# Open Chronicle
 
 Open Chronicle is a local-first macOS work-observability application. It turns privacy-filtered screen observations into a factual, queryable evidence record, five-minute work chunks, a diagnostic report, a searchable timeline, and MCP context for Claude and Codex.
 
@@ -10,6 +10,7 @@ The MVP is currently in planning and initial implementation.
 
 - [Product context](context.md)
 - [MVP product requirements](docs/PRD.md)
+- [Implementation plan](docs/plans/2026-07-13-001-feat-open-chronicle-mvp-plan.md)
 
 ## MVP boundary
 
@@ -26,4 +27,3 @@ Cloud sync, team administration, Windows, audio capture, semantic project infere
 ## License
 
 MIT
-
