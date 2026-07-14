@@ -103,6 +103,57 @@ fn event_request_id(
 }
 
 #[test]
+fn schema_discovery_lists_every_published_u5_contract() -> Result<(), Box<dyn Error>> {
+    let (_temporary, root, sqlite, _projector) = common::store()?;
+    let service = SharedService::open(root, sqlite)?;
+    service.install_grant(grant(
+        "schema-discovery",
+        "codex",
+        vec![ContentClass::Metadata, ContentClass::Derived],
+        UtcRange {
+            start: at("2026-07-13T09:00:00Z"),
+            end: at("2026-07-13T09:05:00Z"),
+        },
+    ))?;
+    let request_id = RequestId::new("schema-discovery-request")?;
+    let response = service.execute(
+        SharedServiceRequest {
+            schema_version: "1.0".to_owned(),
+            request_id: request_id.clone(),
+            store_generation: 1,
+            operation: SharedServiceOperation::Query(Box::new(QueryRequest {
+                schema_version: "1.0".to_owned(),
+                request_id,
+                client_id: ClientId::new("codex")?,
+                grant_id: GrantId::new("schema-discovery")?,
+                store_generation: 1,
+                operation: QueryOperation::Schemas,
+            })),
+        },
+        at("2026-07-13T09:04:00Z"),
+    )?;
+    let SharedServiceResult::Query(query) = response.result else {
+        return Err("expected query response".into());
+    };
+    let chronicle_domain::QueryResult::Schemas { schemas } = query.result else {
+        return Err("expected schema response".into());
+    };
+    assert_eq!(
+        schemas
+            .iter()
+            .map(|schema| (schema.name.as_str(), schema.schema_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("event", "open-chronicle/event/v1"),
+            ("chunk", "open-chronicle/chunk/v1"),
+            ("derived-artifact", "open-chronicle/derived-artifact/v1"),
+            ("query", "open-chronicle/query/v1"),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn no_grant_expiry_revoke_and_store_generation_fail_closed() -> Result<(), Box<dyn Error>> {
     let (_temporary, root, sqlite, projector) = common::store()?;
     common::seed_events(&root, &projector, &common::fixture_events("events.jsonl")?)?;
@@ -713,7 +764,7 @@ fn large_history_health_is_indexed_and_does_not_interrupt_capture() -> Result<()
 }
 
 #[test]
-fn unsupported_later_slice_operations_do_not_charge_disclosure_bytes() -> Result<(), Box<dyn Error>>
+fn derived_reads_without_derived_grant_do_not_charge_disclosure_bytes() -> Result<(), Box<dyn Error>>
 {
     let (_temporary, root, sqlite, _projector) = common::store()?;
     let service = SharedService::open(root, sqlite)?;
@@ -746,7 +797,7 @@ fn unsupported_later_slice_operations_do_not_charge_disclosure_bytes() -> Result
     };
     assert!(matches!(
         service.execute(request, at("2026-07-13T09:04:00Z")),
-        Err(SharedServiceError::UnsupportedOperation)
+        Err(SharedServiceError::ContentDenied(ContentClass::Derived))
     ));
     assert_eq!(
         service

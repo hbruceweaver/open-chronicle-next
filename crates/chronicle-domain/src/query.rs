@@ -5,12 +5,13 @@ use std::collections::HashSet;
 use crate::{
     ArtifactId, ArtifactRevisionId, ArtifactStatus, ArtifactType, AttemptStatus, AuthorIdentity,
     ChunkGap, ChunkGapKind, ChunkId, ChunkRevision, ChunkRevisionId, ClientId, ContentClass,
-    ContractError, DerivedArtifactRevision, DeviceId, DisclosureLimits, EventId, EventKind,
-    EvidenceReferences, EvidenceSeconds, EvidenceSource, EvidenceState, GrantId, GrantState,
-    GrantTimeScope, ImageArtifactId, NoEvidenceContent, NoEvidenceReason, OcrEvidence, OcrState,
-    PermittedWindowContext, PresenceSeconds, PresenceState, ProtectedContent, ReceiptId,
-    RecordingGap, RequestId, ScreenshotDeletionCause, ScreenshotLifecycle,
-    ScreenshotLifecycleAction, ScreenshotProjectedState, UtcRange, parse_versioned,
+    ContextPacketManifest, ContractError, DerivedArtifactRevision, DeviceId, DisclosureLimits,
+    EventId, EventKind, EvidenceReferences, EvidenceSeconds, EvidenceSource, EvidenceState,
+    GrantId, GrantState, GrantTimeScope, ImageArtifactId, NoEvidenceContent, NoEvidenceReason,
+    OcrEvidence, OcrState, PermittedWindowContext, PresenceSeconds, PresenceState,
+    ProtectedContent, ReceiptId, RecordingGap, RequestId, ScreenshotDeletionCause,
+    ScreenshotLifecycle, ScreenshotLifecycleAction, ScreenshotProjectedState, UtcRange,
+    parse_versioned,
 };
 use serde_json::Value;
 
@@ -212,6 +213,37 @@ pub struct GrantSummary {
     pub remaining_cumulative_bytes: u64,
     pub disclosed_bytes: u64,
     pub store_generation: u64,
+}
+
+impl GrantSummary {
+    pub(crate) fn validate_active_at(&self, at: DateTime<Utc>) -> Result<(), String> {
+        if self.store_generation == 0
+            || self.state != GrantState::Active
+            || self.created_at >= self.expires_at
+            || at < self.created_at
+            || at >= self.expires_at
+            || self.limits.max_page_items == 0
+            || self.limits.max_response_bytes == 0
+            || self.limits.max_cumulative_bytes < self.limits.max_response_bytes
+            || self.disclosed_bytes > self.limits.max_cumulative_bytes
+            || self.remaining_cumulative_bytes
+                > self
+                    .limits
+                    .max_cumulative_bytes
+                    .saturating_sub(self.disclosed_bytes)
+        {
+            return Err("grant summary is not active or internally bounded".to_owned());
+        }
+        validate_unique(&self.content_classes, "grant content classes")?;
+        validate_unique(&self.capabilities, "grant capabilities")?;
+        match &self.time_scope {
+            GrantTimeScope::Absolute { range } => range.validate(),
+            GrantTimeScope::RollingHorizon { seconds } if *seconds > 0 => Ok(()),
+            GrantTimeScope::RollingHorizon { .. } => {
+                Err("grant rolling horizon must be positive".to_owned())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,7 +591,7 @@ pub struct QueryEvent {
 }
 
 impl QueryEvent {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.recorded_at < self.observed_at
             || self.display_timezone.is_empty()
             || self.source.adapter.is_empty()
@@ -692,7 +724,7 @@ pub struct QueryArtifact {
 }
 
 impl QueryArtifact {
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate_public(&self) -> Result<(), String> {
         if self.store_generation == 0
             || (self.evidence.event_ids.is_empty() && self.evidence.chunk_ids.is_empty())
             || contains_forbidden_key(&self.payload, QUERY_FORBIDDEN_KEYS)
@@ -770,6 +802,7 @@ pub enum QueryResult {
         events: Vec<QueryEvent>,
     },
     ContextPacket {
+        manifest: ContextPacketManifest,
         chunks: Vec<ChunkRevision>,
         events: Vec<QueryEvent>,
     },
@@ -818,7 +851,7 @@ impl QueryResult {
             }
             Self::Chunk { chunk, .. } => validate_query_chunk(chunk),
             Self::Event { event } => event.validate(),
-            Self::Artifact { artifact } => artifact.validate(),
+            Self::Artifact { artifact } => artifact.validate_public(),
             Self::Search { events }
             | Self::Moment { events }
             | Self::SupportingEvidence { events } => {
@@ -837,7 +870,18 @@ impl QueryResult {
                 first.validate()?;
                 second.validate()
             }
-            Self::ContextPacket { chunks, events } => {
+            Self::ContextPacket {
+                manifest,
+                chunks,
+                events,
+            } => {
+                manifest.validate()?;
+                if manifest.included_counts.chunks != chunks.len() as u64
+                    || manifest.included_counts.events != events.len() as u64
+                    || manifest.included_counts.artifacts != 0
+                {
+                    return Err("context packet manifest counts disagree with payload".to_owned());
+                }
                 for chunk in chunks {
                     validate_query_chunk(chunk)?;
                 }
@@ -848,7 +892,7 @@ impl QueryResult {
             }
             Self::DerivedList { artifacts } => {
                 for artifact in artifacts {
-                    artifact.validate()?;
+                    artifact.validate_public()?;
                 }
                 Ok(())
             }
@@ -862,7 +906,7 @@ impl QueryResult {
             Self::Search { events }
             | Self::Moment { events }
             | Self::SupportingEvidence { events } => events.iter().any(query_event_has_ocr),
-            Self::ContextPacket { chunks, events } => {
+            Self::ContextPacket { chunks, events, .. } => {
                 chunks.iter().any(|chunk| !chunk.ocr_extracts.is_empty())
                     || events.iter().any(query_event_has_ocr)
             }
@@ -967,7 +1011,7 @@ impl QueryResult {
                     Err("comparison coverage falls outside effective scope".to_owned())
                 }
             }
-            Self::ContextPacket { chunks, events } => {
+            Self::ContextPacket { chunks, events, .. } => {
                 for chunk in chunks {
                     if !range_in_ranges(chunk.window.start, chunk.window.end, ranges) {
                         return Err("context chunk falls outside effective scope".to_owned());
@@ -1012,7 +1056,7 @@ fn range_in_ranges(start: DateTime<Utc>, end: DateTime<Utc>, ranges: &[UtcRange]
             .any(|range| range.start <= start && end <= range.end)
 }
 
-fn validate_query_chunk(chunk: &ChunkRevision) -> Result<(), String> {
+pub(crate) fn validate_query_chunk(chunk: &ChunkRevision) -> Result<(), String> {
     let mut version_parts = chunk.schema_version.split('.');
     let supported_version = version_parts.next() == Some("1")
         && version_parts

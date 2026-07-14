@@ -46,3 +46,17 @@ pub fn seed_events(
     }
     Ok(())
 }
+
+pub fn seed_chunks(root: &ManagedRoot, projector: &Projector) -> Result<(), Box<dyn Error>> {
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/session-v1/chunks.jsonl"),
+    )?;
+    let journal = CanonicalJournal::new(root.clone());
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let chunk = ChunkRevision::parse(line)?;
+        let record = journal.append_chunk(&chunk, FaultInjector::none())?;
+        projector.project_record(&record, FaultInjector::none())?;
+    }
+    Ok(())
+}

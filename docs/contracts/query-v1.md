@@ -20,6 +20,15 @@ Requests are typed operations: status/schemas, chunk list/read, activity search,
 moment inspection, factual statistics/comparison, supporting evidence, bounded
 context packet, derived listing, and direct `get-event` / `get-artifact` evidence
 drill-down. Inputs accept typed filters/IDs/ranges, never SQL or filesystem paths.
+Schema discovery names the published event, chunk, derived-artifact, and query v1
+contracts. A later MCP resource layer will publish the separately typed shared
+write/export transport contract rather than claiming a JSON schema before it exists.
+
+Context packets carry a manifest with included and available event/chunk counts,
+included/excluded content classes, pinned projection journal cutoffs, a SHA-256
+content checksum, and truncation. They
+contain only fully range-contained chunks and individually contained supporting
+events; screenshots and derived artifacts are explicitly excluded.
 
 Responses use a tagged `QueryResult` with detailed, path-safe event, complete chunk,
 and artifact DTOs rather than ID-only placeholders. Every response identifies the

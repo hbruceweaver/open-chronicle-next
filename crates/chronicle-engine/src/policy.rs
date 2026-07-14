@@ -54,7 +54,14 @@ pub fn authorize_query(
     }
     let page_limit =
         requested_page_limit(operation).map(|limit| limit.min(grant.limits.max_page_items));
-    let mut content_classes = vec![ContentClass::Metadata];
+    let mut content_classes = if matches!(
+        operation,
+        QueryOperation::GetArtifact { .. } | QueryOperation::ListDerived { .. }
+    ) {
+        vec![ContentClass::Metadata, ContentClass::Derived]
+    } else {
+        vec![ContentClass::Metadata]
+    };
     if search_uses_ocr || include_ocr {
         content_classes.push(ContentClass::Ocr);
     }
@@ -76,12 +83,20 @@ pub fn authorize_query_content(
     if !grant.content_classes.contains(&ContentClass::Metadata) {
         return Err(PolicyError::ContentDenied(ContentClass::Metadata));
     }
+    if matches!(
+        operation,
+        QueryOperation::GetArtifact { .. } | QueryOperation::ListDerived { .. }
+    ) && !grant.content_classes.contains(&ContentClass::Derived)
+    {
+        return Err(PolicyError::ContentDenied(ContentClass::Derived));
+    }
     // Even without snippets, OCR FTS discloses which event IDs matched OCR.
     // Therefore every search consumes OCR capability. Evidence-detail reads
     // include OCR when the user explicitly granted that content class.
     let search_uses_ocr = matches!(operation, QueryOperation::SearchActivity { .. });
     let include_ocr = match operation {
         QueryOperation::SearchActivity { include_ocr, .. } => *include_ocr,
+        QueryOperation::BuildContextPacket { include_ocr, .. } => *include_ocr,
         QueryOperation::ReadChunk { .. }
         | QueryOperation::GetEvent { .. }
         | QueryOperation::InspectMoment { .. }
@@ -180,5 +195,6 @@ pub fn operation_requires_full_range(operation: QueryOperationKind) -> bool {
             | QueryOperationKind::GetEvent
             | QueryOperationKind::InspectMoment
             | QueryOperationKind::SupportingEvidence
+            | QueryOperationKind::GetArtifact
     )
 }

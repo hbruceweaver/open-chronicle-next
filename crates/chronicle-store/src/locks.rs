@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use crate::permissions::io_error;
 use crate::{JournalFamily, ManagedRoot, Result, StoreError};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+static DERIVED_REVISION_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct LockManager {
@@ -75,6 +77,18 @@ pub struct SharedStoreGuard {
 }
 
 impl SharedStoreGuard {
+    pub fn derived_revisions(&self) -> Result<DerivedRevisionGuard> {
+        let process = lock_derived_revision_process(self.timeout)?;
+        let file = self
+            .root
+            .open_file("locks/derived-revisions.lock", true, false, false)?;
+        lock_bounded(&file, true, self.timeout, "derived revisions")?;
+        Ok(DerivedRevisionGuard {
+            _process: process,
+            _file: file,
+        })
+    }
+
     pub fn artifact(&self, artifact_id: &str) -> Result<ArtifactGuard> {
         if artifact_id.is_empty()
             || !artifact_id
@@ -98,6 +112,12 @@ pub struct ExclusiveStoreGuard {
 #[derive(Debug)]
 pub struct ArtifactGuard {
     file: File,
+}
+
+#[derive(Debug)]
+pub struct DerivedRevisionGuard {
+    _process: MutexGuard<'static, ()>,
+    _file: File,
 }
 
 #[derive(Debug)]
@@ -138,6 +158,23 @@ fn lock_bounded(file: &File, exclusive: bool, timeout: Duration, label: &str) ->
     }
 }
 
+fn lock_derived_revision_process(timeout: Duration) -> Result<MutexGuard<'static, ()>> {
+    let lock = DERIVED_REVISION_PROCESS_LOCK.get_or_init(|| Mutex::new(()));
+    let started = Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if started.elapsed() < timeout => {
+                thread::sleep(RETRY_INTERVAL);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(StoreError::LockTimeout("derived revisions".to_owned()));
+            }
+        }
+    }
+}
+
 macro_rules! unlock_on_drop {
     ($type:ty) => {
         impl Drop for $type {
@@ -151,6 +188,11 @@ macro_rules! unlock_on_drop {
 unlock_on_drop!(SharedStoreGuard);
 unlock_on_drop!(ExclusiveStoreGuard);
 unlock_on_drop!(ArtifactGuard);
+impl Drop for DerivedRevisionGuard {
+    fn drop(&mut self) {
+        let _ = flock(&self._file, FlockOperation::Unlock);
+    }
+}
 unlock_on_drop!(JournalGuard);
 unlock_on_drop!(GrantReceiptGuard);
 unlock_on_drop!(QuerySnapshotGuard);

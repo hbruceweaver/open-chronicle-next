@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ContractError, DiagnosticHealthSnapshot, QueryRequest, QueryResponse, RequestId,
-    parse_versioned, validate_schema_version,
+    ContractError, DerivedArtifactWriteRequest, DerivedArtifactWriteResponse,
+    DiagnosticHealthSnapshot, ExportRequest, ExportResponse, QueryRequest, QueryResponse,
+    RequestId, parse_versioned, validate_schema_version,
 };
 
 pub const MAX_SHARED_REQUEST_BYTES: usize = 64 * 1024;
@@ -22,6 +23,8 @@ const FORBIDDEN_TRANSPORT_KEYS: &[&str] = &[
 pub enum SharedServiceOperation {
     Health,
     Query(Box<QueryRequest>),
+    WriteDerived(Box<DerivedArtifactWriteRequest>),
+    Export(Box<ExportRequest>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,16 +53,25 @@ impl SharedServiceRequest {
         if self.store_generation == 0 {
             return Err("shared request requires a nonzero store generation".to_owned());
         }
-        if let SharedServiceOperation::Query(query) = &self.operation {
-            validate_schema_version(&query.schema_version)?;
-            query.validate()?;
-            if query.request_id != self.request_id
-                || query.store_generation != self.store_generation
-            {
-                return Err(
-                    "shared request and nested query identity or generation disagree".to_owned(),
-                );
+        let nested = match &self.operation {
+            SharedServiceOperation::Health => return Ok(()),
+            SharedServiceOperation::Query(query) => {
+                query.validate()?;
+                (&query.request_id, query.store_generation)
             }
+            SharedServiceOperation::WriteDerived(request) => {
+                request.validate()?;
+                (&request.request_id, request.store_generation)
+            }
+            SharedServiceOperation::Export(request) => {
+                request.validate()?;
+                (&request.request_id, request.store_generation)
+            }
+        };
+        if nested.0 != &self.request_id || nested.1 != self.store_generation {
+            return Err(
+                "shared request and nested operation identity or generation disagree".to_owned(),
+            );
         }
         Ok(())
     }
@@ -70,6 +82,8 @@ impl SharedServiceRequest {
 pub enum SharedServiceResult {
     Health(Box<DiagnosticHealthSnapshot>),
     Query(Box<QueryResponse>),
+    DerivedWritten(Box<DerivedArtifactWriteResponse>),
+    Export(Box<ExportResponse>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,6 +129,30 @@ impl SharedServiceResponse {
                 {
                     return Err(
                         "shared response and query identity, generation, or timestamp disagree"
+                            .to_owned(),
+                    );
+                }
+            }
+            SharedServiceResult::DerivedWritten(write) => {
+                write.validate()?;
+                if write.request_id != self.request_id
+                    || write.store_generation != self.store_generation
+                    || write.generated_at != self.generated_at
+                {
+                    return Err(
+                        "shared response and derived write identity, generation, or timestamp disagree"
+                            .to_owned(),
+                    );
+                }
+            }
+            SharedServiceResult::Export(export) => {
+                export.validate()?;
+                if export.request_id != self.request_id
+                    || export.store_generation != self.store_generation
+                    || export.generated_at != self.generated_at
+                {
+                    return Err(
+                        "shared response and export identity, generation, or timestamp disagree"
                             .to_owned(),
                     );
                 }

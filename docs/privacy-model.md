@@ -13,10 +13,12 @@ image bytes, absolute paths, or managed relative screenshot paths.
 
 ## Evidence versus operations
 
-Canonical events and five-minute chunks are immutable factual evidence. The U5a
-shared API offers evidence reads and content-free health only. Capture, privacy,
+Canonical events and five-minute chunks are immutable factual evidence. The U5b
+shared API offers bounded evidence reads, explicit export, immutable derived writes,
+and content-free health. Capture, privacy,
 retention, deletion, and evidence mutation are absent from the agent-facing
-operation enum. Derived artifact creation remains a separate immutable U5b surface.
+operation enum. Derived artifacts cite existing in-scope evidence and never become
+canonical facts.
 
 ## Grant lifecycle
 
@@ -30,6 +32,14 @@ effect for the next request, removes outstanding cursor receipts, and does not
 change evidence. A query and its receipt charge hold the grant lock together, so a
 concurrent revoke cannot permit an uncharged response or a later request using an
 old cursor.
+
+Derived-write request receipts and cumulative byte charges are committed together.
+An exact retry after an artifact/projection/receipt crash compares the complete
+canonical revision and is not charged twice. Reusing the request ID with mutated
+payload, status, attribution, or evidence fails closed.
+Receipt history is bounded to 4,096 derived writes. The service refuses a new write
+before creating its canonical artifact once that bound is reached; revocation and
+store-generation cleanup remove receipts that can no longer authorize a retry.
 
 OCR is treated as a distinct disclosure class. In particular, FTS search requires
 OCR authorization even if text snippets are omitted, since the existence and IDs of

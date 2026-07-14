@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use chronicle_domain::{
-    DerivedArtifactRevision, EventEnvelope, EventPayload, ObservationContent,
-    ScreenshotLifecycleAction,
+    ArtifactId, ArtifactRevisionId, ArtifactStatus, DerivedArtifactRevision, EventEnvelope,
+    EventPayload, ObservationContent, ScreenshotLifecycleAction,
 };
 
 use crate::checksum::canonical_json;
@@ -11,6 +11,8 @@ use crate::{
     CanonicalJournal, FaultInjector, FaultPoint, LockManager, ManagedRoot, Projector, Result,
     StoreError, StoreGeneration,
 };
+
+const MAX_ARTIFACT_DIRECTORIES: usize = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct ArtifactStore {
@@ -45,8 +47,16 @@ impl ArtifactStore {
         }
         let shared = self.locks.shared_request()?;
         generation.ensure_current(&self.root)?;
+        let _revisions = shared.derived_revisions()?;
         let _artifact = shared.artifact(revision.artifact_id.as_str())?;
         let _snapshot = self.locks.query_snapshot()?;
+        if let Some(owner) = revision_owner(&self.root, revision.revision_id.as_str())?
+            && owner != revision.artifact_id.as_str()
+        {
+            return Err(StoreError::StableIdConflict {
+                id: revision.revision_id.to_string(),
+            });
+        }
         let directory = format!("derived/{}", revision.artifact_id);
         self.root.ensure_directory(&directory)?;
         let relative = format!("{directory}/{}.json", revision.revision_id);
@@ -62,7 +72,7 @@ impl ArtifactStore {
             return self.projector.project_artifact(revision, faults);
         }
         let current = current_revision(&self.root, revision.artifact_id.as_str())?;
-        if current.as_deref()
+        if current.as_ref().map(|value| value.revision_id.as_str())
             != revision
                 .expected_prior_revision_id
                 .as_ref()
@@ -70,6 +80,7 @@ impl ArtifactStore {
         {
             return Err(StoreError::ArtifactConflict);
         }
+        validate_artifact_transition(current.as_ref(), revision)?;
         if self.root.exists(&relative)? {
             return Err(StoreError::ArtifactConflict);
         } else {
@@ -85,6 +96,50 @@ impl ArtifactStore {
     pub fn scan_all(&self) -> Result<Vec<DerivedArtifactRevision>> {
         scan_artifact_revisions(&self.root)
     }
+
+    pub fn revision(
+        &self,
+        artifact_id: &ArtifactId,
+        revision_id: &ArtifactRevisionId,
+    ) -> Result<Option<DerivedArtifactRevision>> {
+        let relative = format!("derived/{artifact_id}/{revision_id}.json");
+        if !self.root.exists(&relative)? {
+            return Ok(None);
+        }
+        let bytes = self.root.read(&relative)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        let revision = DerivedArtifactRevision::parse(text)?;
+        if revision.artifact_id != *artifact_id || revision.revision_id != *revision_id {
+            return Err(StoreError::ArtifactConflict);
+        }
+        Ok(Some(revision))
+    }
+
+    /// Returns the prior-linked canonical chain tip. Authored timestamps are
+    /// metadata and never replace immutable prior links as recovery ordering.
+    pub fn current_revision(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<Option<DerivedArtifactRevision>> {
+        current_revision(&self.root, artifact_id.as_str())
+    }
+}
+
+fn revision_owner(root: &ManagedRoot, revision_id: &str) -> Result<Option<String>> {
+    let artifact_ids = directory_names(root.path().join("derived"))?;
+    if artifact_ids.len() > MAX_ARTIFACT_DIRECTORIES {
+        return Err(StoreError::InvalidPath(
+            "derived artifact directory limit reached".to_owned(),
+        ));
+    }
+    for artifact_id in artifact_ids {
+        let relative = format!("derived/{artifact_id}/{revision_id}.json");
+        if root.exists(&relative)? {
+            return Ok(Some(artifact_id));
+        }
+    }
+    Ok(None)
 }
 
 pub fn scan_artifact_revisions(root: &ManagedRoot) -> Result<Vec<DerivedArtifactRevision>> {
@@ -309,7 +364,10 @@ pub(crate) fn derived_screenshot_path(event: &EventEnvelope, artifact_id: &str) 
     )
 }
 
-fn current_revision(root: &ManagedRoot, artifact_id: &str) -> Result<Option<String>> {
+fn current_revision(
+    root: &ManagedRoot,
+    artifact_id: &str,
+) -> Result<Option<DerivedArtifactRevision>> {
     let directory = format!("derived/{artifact_id}");
     if !root.path().join(&directory).exists() {
         return Ok(None);
@@ -324,9 +382,41 @@ fn current_revision(root: &ManagedRoot, artifact_id: &str) -> Result<Option<Stri
             revisions.push(DerivedArtifactRevision::parse(text)?);
         }
     }
-    Ok(order_artifact_chains(revisions)?
-        .last()
-        .map(|revision| revision.revision_id.to_string()))
+    Ok(order_artifact_chains(revisions)?.pop())
+}
+
+fn validate_artifact_transition(
+    current: Option<&DerivedArtifactRevision>,
+    next: &DerivedArtifactRevision,
+) -> Result<()> {
+    let valid = match current {
+        None => next.prior_revision_id.is_none() && next.status == ArtifactStatus::Draft,
+        Some(current) => {
+            current.artifact_id == next.artifact_id
+                && current.artifact_type == next.artifact_type
+                && match current.status {
+                    ArtifactStatus::Draft => matches!(
+                        next.status,
+                        ArtifactStatus::Draft
+                            | ArtifactStatus::Accepted
+                            | ArtifactStatus::Rejected
+                            | ArtifactStatus::Superseded
+                    ),
+                    ArtifactStatus::Accepted => matches!(
+                        next.status,
+                        ArtifactStatus::Accepted | ArtifactStatus::Superseded
+                    ),
+                    ArtifactStatus::Rejected => matches!(
+                        next.status,
+                        ArtifactStatus::Rejected | ArtifactStatus::Superseded
+                    ),
+                    ArtifactStatus::Superseded => false,
+                }
+        }
+    };
+    valid
+        .then_some(())
+        .ok_or(StoreError::InvalidArtifactTransition)
 }
 
 fn order_artifact_chains(

@@ -40,12 +40,24 @@ existing record before returning; the same ID with different bytes is critical
 corruption.
 
 Derived artifacts are immutable files at
-`derived/<artifact-id>/<revision-id>.json`. A write takes the shared store lock,
-then the stable per-artifact exclusive lock, checks `expected_prior_revision_id`,
-writes a same-directory temporary file, syncs it, atomically renames it, and syncs
-the directory. Revision chains are rebuilt by their explicit prior links, never by
+`derived/<artifact-id>/<revision-id>.json`. Revision IDs are globally unique across
+artifacts because the SQLite projection is rebuildable around that identity. A write
+takes the shared store lock, then a fixed process-and-file global revision lock, then
+the stable per-artifact exclusive lock, checks global revision ownership and
+`expected_prior_revision_id`, writes a same-directory temporary file, syncs it,
+atomically renames it, and syncs the directory. Revision chains are rebuilt by their explicit prior links, never by
 authored timestamp or file name. Missing parents, multiple roots, branches, and
 cycles are rejected. A retry of the identical revision is idempotent.
+
+The shared derived-write surface separately enforces current-generation client
+attribution, server-time and monotonic creation timestamps, existing in-scope
+event/chunk references, immutable artifact type/prior links, and the draft status
+state machine. Recovery still orders historical/imported revisions only by prior
+links, so authored timestamps never become a substitute chain pointer. Projection
+failure after the immutable rename is repaired by exact retry or startup rebuild.
+Until that repair, the shared write surface reads and authorizes the canonical chain
+tip directly; projection lag cannot turn an out-of-scope parent into an appendable
+artifact for another grant.
 
 ## Screenshot transaction
 

@@ -1,6 +1,7 @@
 use chronicle_domain::{
-    ActivityFilter, ChunkId, ChunkRevision, DeviceId, EventEnvelope, EventId, EventPayload,
-    ImageMetadata, ObservationContent, QueryEvent, QueryEventPayload, QueryObservation,
+    ActivityFilter, ArtifactId, ArtifactRevisionId, ChunkId, ChunkRevision,
+    DerivedArtifactRevision, DeviceId, EventEnvelope, EventId, EventPayload, ImageMetadata,
+    ObservationContent, QueryArtifact, QueryEvent, QueryEventPayload, QueryObservation,
     QueryObservationContent, ScreenshotProjectedState, UtcRange,
 };
 use chrono::{DateTime, Utc};
@@ -187,6 +188,115 @@ impl StoreQueries {
                 .optional()?;
             body.map(|body| ChunkRevision::parse(&body).map_err(StoreError::from))
                 .transpose()
+        })
+    }
+
+    pub fn artifact(
+        &self,
+        artifact_id: &ArtifactId,
+        revision_id: Option<&ArtifactRevisionId>,
+    ) -> Result<Option<QueryArtifact>> {
+        self.with_connection(|connection| {
+            let body: Option<String> = match revision_id {
+                Some(revision_id) => connection
+                    .query_row(
+                        "SELECT body_json FROM artifact_revisions
+                         WHERE artifact_id=?1 AND revision_id=?2",
+                        params![artifact_id.as_str(), revision_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+                None => connection
+                    .query_row(
+                        "SELECT revision.body_json
+                         FROM current_artifacts current
+                         JOIN artifact_revisions revision
+                           ON revision.revision_id=current.revision_id
+                         WHERE current.artifact_id=?1",
+                        [artifact_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+            };
+            body.map(|body| {
+                DerivedArtifactRevision::parse(&body)
+                    .map(QueryArtifact::from)
+                    .map_err(StoreError::from)
+            })
+            .transpose()
+        })
+    }
+
+    pub fn current_artifact_page(
+        &self,
+        range: &UtcRange,
+        after_artifact_id: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<QueryArtifact>, bool)> {
+        range.validate().map_err(StoreError::InvalidPath)?;
+        if limit == 0 || limit > MAX_SHARED_PAGE_ITEMS {
+            return Err(StoreError::InvalidPath(format!(
+                "artifact page limit must be 1..={MAX_SHARED_PAGE_ITEMS}"
+            )));
+        }
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT revision.body_json
+                 FROM current_artifacts current
+                 JOIN artifact_revisions revision ON revision.revision_id=current.revision_id
+                 WHERE revision.created_at >= ?1 AND revision.created_at < ?2
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM artifact_evidence_refs refs
+                     WHERE refs.revision_id=revision.revision_id
+                       AND (
+                         (refs.evidence_kind='event' AND NOT EXISTS (
+                           SELECT 1 FROM events event
+                           WHERE event.event_id=refs.evidence_id
+                             AND json_extract(event.body_json, '$.observed_at') >= ?1
+                             AND json_extract(event.body_json, '$.observed_at') < ?2
+                             AND (json_extract(event.body_json, '$.scheduled_at') IS NULL
+                                  OR (json_extract(event.body_json, '$.scheduled_at') >= ?1
+                                      AND json_extract(event.body_json, '$.scheduled_at') < ?2))
+                             AND (event.kind <> 'recording-gap'
+                                  OR (json_extract(event.body_json, '$.payload.data.start') >= ?1
+                                      AND json_extract(event.body_json, '$.payload.data.end') <= ?2))
+                         ))
+                         OR (refs.evidence_kind='chunk' AND NOT EXISTS (
+                           SELECT 1
+                           FROM current_chunks chunk
+                           JOIN chunk_revisions chunk_revision
+                             ON chunk_revision.revision_id=chunk.revision_id
+                           WHERE chunk.chunk_id=refs.evidence_id
+                             AND chunk_revision.window_start >= ?1
+                             AND chunk_revision.window_end <= ?2
+                         ))
+                         OR refs.evidence_kind NOT IN ('event', 'chunk')
+                       )
+                   )
+                   AND (?3 IS NULL OR current.artifact_id > ?3)
+                 ORDER BY current.artifact_id
+                 LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    range.start.to_rfc3339(),
+                    range.end.to_rfc3339(),
+                    after_artifact_id,
+                    i64::from(limit.saturating_add(1)),
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut artifacts = rows
+                .map(|row| {
+                    DerivedArtifactRevision::parse(&row?)
+                        .map(QueryArtifact::from)
+                        .map_err(StoreError::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let truncated = artifacts.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+            artifacts.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok((artifacts, truncated))
         })
     }
 

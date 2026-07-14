@@ -1,19 +1,22 @@
+use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 
 use chronicle_domain::{
-    ClientId, DisclosureGrant, GrantId, GrantState, McpHealthSummary, QueryOperationKind,
+    ArtifactId, ArtifactRevisionId, ClientId, DisclosureGrant, GrantId, GrantState,
+    McpHealthSummary, QueryOperationKind, RequestId,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    GrantReceiptGuard, LockManager, ManagedRoot, Result, SharedStoreGuard, StoreError,
-    StoreGeneration,
+    FaultInjector, FaultPoint, GrantReceiptGuard, LockManager, ManagedRoot, Result,
+    SharedStoreGuard, StoreError, StoreGeneration,
 };
 
 const RECEIPT_PATH: &str = "receipts/disclosure-grants.json";
 const MAX_ACTIVE_CURSORS: usize = 512;
+const MAX_DERIVED_WRITE_RECEIPTS: usize = 4_096;
 const CURSOR_LIFETIME_SECONDS: i64 = 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,11 +32,24 @@ struct DisclosureCursorReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DerivedWriteReceipt {
+    request_id: RequestId,
+    grant_id: GrantId,
+    client_id: ClientId,
+    artifact_id: ArtifactId,
+    revision_id: ArtifactRevisionId,
+    store_generation: u64,
+    committed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DisclosureReceiptDocument {
     schema_version: String,
     updated_at: DateTime<Utc>,
     grants: Vec<DisclosureGrant>,
     cursors: Vec<DisclosureCursorReceipt>,
+    #[serde(default)]
+    derived_writes: Vec<DerivedWriteReceipt>,
 }
 
 impl DisclosureReceiptDocument {
@@ -43,6 +59,7 @@ impl DisclosureReceiptDocument {
             updated_at: now,
             grants: Vec::new(),
             cursors: Vec::new(),
+            derived_writes: Vec::new(),
         }
     }
 
@@ -55,26 +72,38 @@ impl DisclosureReceiptDocument {
         for grant in &self.grants {
             grant.validate().map_err(StoreError::InvalidPath)?;
         }
-        for (index, grant) in self.grants.iter().enumerate() {
-            if self.grants[index + 1..].iter().any(|other| {
-                other.grant_id == grant.grant_id || other.receipt_id == grant.receipt_id
-            }) {
+        let mut grant_ids = HashSet::new();
+        let mut receipt_ids = HashSet::new();
+        for grant in &self.grants {
+            if !grant_ids.insert(&grant.grant_id) || !receipt_ids.insert(&grant.receipt_id) {
                 return Err(StoreError::InvalidPath(
                     "disclosure receipt contains duplicate grant or receipt IDs".to_owned(),
                 ));
             }
         }
-        for (index, cursor) in self.cursors.iter().enumerate() {
+        let mut cursor_tokens = HashSet::new();
+        for cursor in &self.cursors {
             if cursor.token.is_empty()
                 || cursor.scope_digest.is_empty()
                 || cursor.position.is_empty()
                 || cursor.store_generation == 0
-                || self.cursors[index + 1..]
-                    .iter()
-                    .any(|other| other.token == cursor.token)
+                || !cursor_tokens.insert(&cursor.token)
             {
                 return Err(StoreError::InvalidPath(
                     "disclosure receipt contains an invalid cursor".to_owned(),
+                ));
+            }
+        }
+        if self.derived_writes.len() > MAX_DERIVED_WRITE_RECEIPTS {
+            return Err(StoreError::InvalidPath(
+                "derived-write receipt limit exceeded".to_owned(),
+            ));
+        }
+        let mut write_request_ids = HashSet::new();
+        for write in &self.derived_writes {
+            if write.store_generation == 0 || !write_request_ids.insert(&write.request_id) {
+                return Err(StoreError::InvalidPath(
+                    "disclosure receipt contains an invalid derived-write receipt".to_owned(),
                 ));
             }
         }
@@ -150,6 +179,9 @@ impl GrantReceiptStore {
         document
             .cursors
             .retain(|cursor| &cursor.grant_id != grant_id);
+        document
+            .derived_writes
+            .retain(|write| &write.grant_id != grant_id);
         self.persist(&mut document, now)
     }
 
@@ -192,6 +224,9 @@ impl GrantReceiptStore {
         document.cursors.retain(|cursor| {
             cursor.expires_at > now && cursor.store_generation == store_generation
         });
+        document
+            .derived_writes
+            .retain(|write| write.store_generation == store_generation);
         let index = document
             .grants
             .iter()
@@ -365,11 +400,91 @@ impl GrantQuerySession {
         Ok(())
     }
 
-    pub fn commit(mut self) -> Result<DisclosureGrant> {
+    /// Returns true only for an already committed retry of the exact same
+    /// derived write. Reusing a request ID for different content fails closed.
+    pub fn derived_write_committed(
+        &self,
+        request_id: &RequestId,
+        artifact_id: &ArtifactId,
+        revision_id: &ArtifactRevisionId,
+    ) -> Result<bool> {
+        let Some(receipt) = self
+            .document
+            .derived_writes
+            .iter()
+            .find(|receipt| &receipt.request_id == request_id)
+        else {
+            return Ok(false);
+        };
+        let grant = self.grant();
+        if receipt.grant_id != grant.grant_id
+            || receipt.client_id != grant.client_id
+            || receipt.store_generation != grant.store_generation
+            || &receipt.artifact_id != artifact_id
+            || &receipt.revision_id != revision_id
+        {
+            return Err(StoreError::StableIdConflict {
+                id: request_id.to_string(),
+            });
+        }
+        Ok(true)
+    }
+
+    pub fn repair_receipt_durability(&self, faults: FaultInjector) -> Result<()> {
+        self.root.sync_directory("receipts")?;
+        faults.check(FaultPoint::AfterArtifactDirectorySync)
+    }
+
+    pub fn stage_derived_write(
+        &mut self,
+        request_id: RequestId,
+        artifact_id: ArtifactId,
+        revision_id: ArtifactRevisionId,
+    ) -> Result<()> {
+        if self.document.derived_writes.len() >= MAX_DERIVED_WRITE_RECEIPTS {
+            return Err(StoreError::InvalidPath(
+                "derived-write receipt limit reached".to_owned(),
+            ));
+        }
+        if self
+            .document
+            .derived_writes
+            .iter()
+            .any(|receipt| receipt.request_id == request_id)
+        {
+            return Err(StoreError::StableIdConflict {
+                id: request_id.to_string(),
+            });
+        }
+        let grant = self.grant().clone();
+        self.document.derived_writes.push(DerivedWriteReceipt {
+            request_id,
+            grant_id: grant.grant_id,
+            client_id: grant.client_id,
+            artifact_id,
+            revision_id,
+            store_generation: grant.store_generation,
+            committed_at: self.now,
+        });
+        self.document
+            .derived_writes
+            .sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        Ok(())
+    }
+
+    pub fn commit(self) -> Result<DisclosureGrant> {
+        self.commit_with_faults(FaultInjector::none())
+    }
+
+    pub fn commit_with_faults(mut self, faults: FaultInjector) -> Result<DisclosureGrant> {
         self.document.updated_at = self.now;
         self.document.validate()?;
-        self.root
-            .atomic_write(RECEIPT_PATH, &serde_json::to_vec(&self.document)?)?;
+        faults.check(FaultPoint::BeforeTransactionCommit)?;
+        self.root.atomic_write_with_boundary(
+            RECEIPT_PATH,
+            &serde_json::to_vec(&self.document)?,
+            || faults.check(FaultPoint::AfterArtifactRename),
+        )?;
         Ok(self.document.grants[self.grant_index].clone())
     }
 }

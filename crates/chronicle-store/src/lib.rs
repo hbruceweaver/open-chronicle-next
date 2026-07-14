@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod checksum;
+pub mod export;
 pub mod generation;
 pub mod health;
 pub mod journal;
@@ -25,6 +26,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 pub use artifacts::*;
+pub use export::*;
 pub use generation::*;
 pub use health::*;
 pub use journal::*;
@@ -66,6 +68,10 @@ pub enum StoreError {
     StableIdConflict { id: String },
     #[error("artifact expected prior revision conflict")]
     ArtifactConflict,
+    #[error("derived artifact status or identity transition is invalid")]
+    InvalidArtifactTransition,
+    #[error("derived artifact evidence reference is invalid")]
+    InvalidEvidenceReference,
     #[error("disclosure grant already exists")]
     GrantAlreadyExists,
     #[error("disclosure grant was not found")]
