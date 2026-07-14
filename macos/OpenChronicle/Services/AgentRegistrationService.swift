@@ -53,6 +53,8 @@ enum AgentRegistrationIssue: String, Equatable, Sendable {
     case receiptMissing = "receipt-missing"
     case receiptMismatch = "receipt-mismatch"
     case removalFailed = "removal-failed"
+    case grantFailed = "grant-failed"
+    case credentialStorageFailed = "credential-storage-failed"
 }
 
 enum AgentRegistrationOutcome: Equatable, Sendable {

@@ -399,6 +399,187 @@ final class CoreDisclosureGrantTests: XCTestCase {
     }
 }
 
+@MainActor
+final class AgentConnectionServiceTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_784_016_000)
+
+    func testCredentialIsDurableBeforeRegistrationAndSuccessfulConnectionKeepsGrant() async throws {
+        let fixture = try InstallFixture()
+        defer { fixture.destroy() }
+        let grant = Self.grant(fixture: fixture)
+        let grants = StubDisclosureGrantService(grant: grant)
+        let credentials = MemoryAgentGrantCredentialStore()
+        let receipt = Self.registrationReceipt(grant: grant, fixture: fixture)
+        let registration = InspectingAgentRegistration { plan in
+            XCTAssertEqual(plan.grantID, grant.grantID)
+            XCTAssertEqual(
+                try? credentials.credential(for: .codex)?.grant,
+                grant,
+                "credential must be durable before external CLI registration"
+            )
+            return .registered(receipt)
+        }
+        let service = AgentConnectionService(
+            grants: grants,
+            registration: registration,
+            credentials: credentials,
+            applicationBundleURL: fixture.bundle,
+            helperURL: fixture.helper,
+            managedRootURL: fixture.managedRoot,
+            now: { self.now }
+        )
+
+        let outcome = await service.connect(Self.codex(fixture: fixture))
+
+        XCTAssertEqual(outcome, .registered(receipt))
+        XCTAssertEqual(try credentials.credential(for: .codex)?.grant, grant)
+        let activity = await grants.activity()
+        XCTAssertEqual(activity.provisionCount, 1)
+        XCTAssertEqual(activity.installCount, 1)
+        XCTAssertEqual(activity.revokeCount, 0)
+    }
+
+    func testRegistrationConflictRevokesNewGrantAndRemovesProtectedCredential() async throws {
+        let fixture = try InstallFixture()
+        defer { fixture.destroy() }
+        let grant = Self.grant(fixture: fixture)
+        let grants = StubDisclosureGrantService(grant: grant)
+        let credentials = MemoryAgentGrantCredentialStore()
+        let registration = InspectingAgentRegistration { _ in .conflict }
+        let service = AgentConnectionService(
+            grants: grants,
+            registration: registration,
+            credentials: credentials,
+            applicationBundleURL: fixture.bundle,
+            helperURL: fixture.helper,
+            managedRootURL: fixture.managedRoot,
+            now: { self.now }
+        )
+
+        let outcome = await service.connect(Self.codex(fixture: fixture))
+
+        XCTAssertEqual(outcome, .conflict)
+        XCTAssertNil(try credentials.credential(for: .codex))
+        let activity = await grants.activity()
+        XCTAssertEqual(activity.revokeCount, 1)
+        XCTAssertEqual(activity.lastRevokedGrantID, grant.grantID)
+    }
+
+    func testInterruptedSetupResumesExactStoredGrantWithoutProvisioningAnother() async throws {
+        let fixture = try InstallFixture()
+        defer { fixture.destroy() }
+        let grant = Self.grant(fixture: fixture)
+        let grants = StubDisclosureGrantService(grant: grant)
+        let credentials = MemoryAgentGrantCredentialStore()
+        try credentials.save(
+            AgentGrantCredential(
+                schemaVersion: AgentGrantCredential.schemaVersion,
+                agentKind: .codex,
+                grant: grant
+            )
+        )
+        let receipt = Self.registrationReceipt(grant: grant, fixture: fixture)
+        let registration = InspectingAgentRegistration { plan in
+            XCTAssertEqual(plan.grantID, grant.grantID)
+            return .alreadyRegistered(receipt)
+        }
+        let service = AgentConnectionService(
+            grants: grants,
+            registration: registration,
+            credentials: credentials,
+            applicationBundleURL: fixture.bundle,
+            helperURL: fixture.helper,
+            managedRootURL: fixture.managedRoot,
+            now: { self.now }
+        )
+
+        let outcome = await service.connect(Self.codex(fixture: fixture))
+
+        XCTAssertEqual(outcome, .alreadyRegistered(receipt))
+        let activity = await grants.activity()
+        XCTAssertEqual(activity.provisionCount, 0)
+        XCTAssertEqual(activity.installCount, 1)
+    }
+
+    func testAmbiguousPostAddFailurePreservesCredentialForRepair() async throws {
+        let fixture = try InstallFixture()
+        defer { fixture.destroy() }
+        let grant = Self.grant(fixture: fixture)
+        let grants = StubDisclosureGrantService(grant: grant)
+        let credentials = MemoryAgentGrantCredentialStore()
+        let registration = InspectingAgentRegistration { _ in
+            .failed(.verificationFailed)
+        }
+        let service = AgentConnectionService(
+            grants: grants,
+            registration: registration,
+            credentials: credentials,
+            applicationBundleURL: fixture.bundle,
+            helperURL: fixture.helper,
+            managedRootURL: fixture.managedRoot,
+            now: { self.now }
+        )
+
+        let outcome = await service.connect(Self.codex(fixture: fixture))
+
+        XCTAssertEqual(outcome, .failed(.verificationFailed))
+        XCTAssertEqual(try credentials.credential(for: .codex)?.grant, grant)
+        let activity = await grants.activity()
+        XCTAssertEqual(activity.revokeCount, 0)
+    }
+
+    private static func codex(fixture: InstallFixture) -> AgentInstallation {
+        AgentInstallation(
+            kind: .codex,
+            executableURL: fixture.root.appendingPathComponent("codex"),
+            applicationURL: nil,
+            version: "codex-cli 0.144.0",
+            support: .supported,
+            alternateExecutableURLs: []
+        )
+    }
+
+    private static func grant(fixture: InstallFixture) -> DisclosureGrantRecord {
+        DisclosureGrantRecord(
+            schemaVersion: "1.0",
+            grantID: "grant-connection-test",
+            clientID: "client-open-chronicle-codex",
+            receiptID: "receipt-connection-test",
+            timeScope: .rollingHorizon(seconds: 86_400),
+            contentClasses: [.metadata, .derived],
+            createdAt: "2026-07-13T09:00:00Z",
+            expiresAt: "2026-07-20T09:00:00Z",
+            state: "active",
+            limits: .init(
+                maxPageItems: 50,
+                maxResponseBytes: 262_144,
+                maxCumulativeBytes: 67_108_864
+            ),
+            disclosedBytes: 0,
+            storeGeneration: 1
+        )
+    }
+
+    private static func registrationReceipt(
+        grant: DisclosureGrantRecord,
+        fixture: InstallFixture
+    ) -> AgentRegistrationReceipt {
+        AgentRegistrationReceipt(
+            schemaVersion: AgentRegistrationReceipt.schemaVersion,
+            agentKind: .codex,
+            agentVersion: "codex-cli 0.144.0",
+            serverName: AgentRegistrationPlan.serverName,
+            clientID: grant.clientID,
+            resolvedHelperPath: fixture.helper.path,
+            managedRootPath: fixture.managedRoot.path,
+            argumentDigest: String(repeating: "a", count: 64),
+            priorState: .absent,
+            result: .added,
+            registeredAt: Date(timeIntervalSince1970: 1_784_016_000)
+        )
+    }
+}
+
 final class InstallLocationTests: XCTestCase {
     func testPackagedHelperAndExternalManagedRootAreReady() throws {
         let fixture = try InstallFixture()
@@ -487,6 +668,126 @@ private actor ScriptedAgentCommandRunner: AgentCommandRunning {
 
     func recordedCalls() -> [Call] {
         calls
+    }
+}
+
+private actor StubDisclosureGrantService: DisclosureGrantServicing {
+    struct Activity: Equatable, Sendable {
+        var provisionCount = 0
+        var installCount = 0
+        var revokeCount = 0
+        var lastRevokedGrantID: String?
+    }
+
+    private let grant: DisclosureGrantRecord
+    private var recorded = Activity()
+
+    init(grant: DisclosureGrantRecord) {
+        self.grant = grant
+    }
+
+    func provision(
+        for kind: AgentKind,
+        policy: DisclosureGrantPolicy,
+        now: Date
+    ) -> DisclosureGrantRecord {
+        _ = kind
+        _ = policy
+        _ = now
+        recorded.provisionCount += 1
+        return grant
+    }
+
+    func install(
+        _ grant: DisclosureGrantRecord,
+        now: Date
+    ) -> DisclosureGrantMutationResponse {
+        _ = now
+        recorded.installCount += 1
+        return DisclosureGrantMutationResponse(mutation: .installed, grant: grant)
+    }
+
+    func revoke(
+        grantID: String,
+        clientID: String,
+        receiptID: String,
+        now: Date
+    ) -> DisclosureGrantMutationResponse {
+        _ = clientID
+        _ = receiptID
+        _ = now
+        recorded.revokeCount += 1
+        recorded.lastRevokedGrantID = grantID
+        var revoked = grant
+        revoked = DisclosureGrantRecord(
+            schemaVersion: revoked.schemaVersion,
+            grantID: revoked.grantID,
+            clientID: revoked.clientID,
+            receiptID: revoked.receiptID,
+            timeScope: revoked.timeScope,
+            contentClasses: revoked.contentClasses,
+            createdAt: revoked.createdAt,
+            expiresAt: revoked.expiresAt,
+            state: "revoked",
+            limits: revoked.limits,
+            disclosedBytes: revoked.disclosedBytes,
+            storeGeneration: revoked.storeGeneration
+        )
+        return DisclosureGrantMutationResponse(mutation: .revoked, grant: revoked)
+    }
+
+    func activity() -> Activity {
+        recorded
+    }
+}
+
+@MainActor
+private final class InspectingAgentRegistration: AgentRegistering {
+    typealias Handler = (AgentRegistrationPlan) -> AgentRegistrationOutcome
+    private let handler: Handler
+
+    init(handler: @escaping Handler) {
+        self.handler = handler
+    }
+
+    func register(
+        installation: AgentInstallation,
+        plan: AgentRegistrationPlan
+    ) -> AgentRegistrationOutcome {
+        _ = installation
+        return handler(plan)
+    }
+
+    func unregister(
+        installation: AgentInstallation,
+        plan: AgentRegistrationPlan
+    ) -> AgentRegistrationOutcome {
+        _ = installation
+        _ = plan
+        return .removed
+    }
+}
+
+private final class MemoryAgentGrantCredentialStore: AgentGrantCredentialStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var credentials: [AgentKind: AgentGrantCredential] = [:]
+
+    func credential(for kind: AgentKind) throws -> AgentGrantCredential? {
+        lock.lock()
+        defer { lock.unlock() }
+        return credentials[kind]
+    }
+
+    func save(_ credential: AgentGrantCredential) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        credentials[credential.agentKind] = credential
+    }
+
+    func remove(kind: AgentKind) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        credentials.removeValue(forKey: kind)
     }
 }
 
