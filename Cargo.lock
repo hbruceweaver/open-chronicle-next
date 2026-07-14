@@ -151,7 +151,14 @@ dependencies = [
 name = "chronicle-ffi"
 version = "0.1.0"
 dependencies = [
+ "chronicle-domain",
  "chronicle-engine",
+ "chronicle-store",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

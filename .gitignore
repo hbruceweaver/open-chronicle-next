@@ -9,6 +9,7 @@ xcuserdata/
 
 # Rust
 target/
+build/
 
 # Local Chronicle data
 .chronicle/
@@ -28,4 +29,3 @@ screenshots/
 dist/
 *.dmg
 *.app.zip
-

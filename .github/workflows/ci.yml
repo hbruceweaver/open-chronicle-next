@@ -56,4 +56,28 @@ jobs:
       - name: Check workspace target
         run: cargo check --workspace --all-targets --locked --target "${{ matrix.target }}"
 
-  # U6 adds the required Xcode build/test job with the real macOS application.
+  macos-application:
+    name: macOS application and Rust bridge
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal-ffi
+      - name: Build universal Rust core
+        run: ./scripts/build-rust-universal.sh
+      - name: Verify universal architectures
+        run: |
+          archs=$(lipo -archs build/universal/libchronicle_ffi.a)
+          case " $archs " in *" arm64 "*) ;; *) echo "missing arm64: $archs" >&2; exit 1 ;; esac
+          case " $archs " in *" x86_64 "*) ;; *) echo "missing x86_64: $archs" >&2; exit 1 ;; esac
+      - name: Test native macOS application
+        run: |
+          xcodebuild -project macos/OpenChronicle.xcodeproj \
+            -scheme OpenChronicle \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO test

@@ -1,0 +1,194 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* OpenChronicleApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* OpenChronicleApp.swift */; };
+		A10000000000000000000002 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* AppModel.swift */; };
+		A10000000000000000000003 /* NavigationModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* NavigationModel.swift */; };
+		A10000000000000000000004 /* ChronicleCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* ChronicleCore.swift */; };
+		A10000000000000000000005 /* ChronicleFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* ChronicleFFI.swift */; };
+		A10000000000000000000006 /* ChronicleTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* ChronicleTypes.swift */; };
+		A10000000000000000000007 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* PrivacyInfo.xcprivacy */; };
+		A10000000000000000000008 /* BridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* BridgeTests.swift */; };
+		A10000000000000000000009 /* FixtureParityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* FixtureParityTests.swift */; };
+		A1000000000000000000000A /* shared-response-v1.json in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* shared-response-v1.json */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A30000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A90000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A70000000000000000000001;
+			remoteInfo = OpenChronicle;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A20000000000000000000001 /* OpenChronicleApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenChronicleApp.swift; sourceTree = "<group>"; };
+		A20000000000000000000002 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		A20000000000000000000003 /* NavigationModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigationModel.swift; sourceTree = "<group>"; };
+		A20000000000000000000004 /* ChronicleCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChronicleCore.swift; sourceTree = "<group>"; };
+		A20000000000000000000005 /* ChronicleFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChronicleFFI.swift; sourceTree = "<group>"; };
+		A20000000000000000000006 /* ChronicleTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChronicleTypes.swift; sourceTree = "<group>"; };
+		A20000000000000000000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A20000000000000000000008 /* OpenChronicle.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OpenChronicle.entitlements; sourceTree = "<group>"; };
+		A20000000000000000000009 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		A2000000000000000000000A /* OpenChronicle-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "OpenChronicle-Bridging-Header.h"; sourceTree = "<group>"; };
+		A2000000000000000000000B /* BridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000000C /* FixtureParityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureParityTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000000D /* shared-response-v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "shared-response-v1.json"; sourceTree = "<group>"; };
+		A2000000000000000000000E /* Open Chronicle.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Open Chronicle.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2000000000000000000000F /* OpenChronicleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenChronicleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A40000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000006 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A50000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				A50000000000000000000002 /* OpenChronicle */,
+				A50000000000000000000006 /* OpenChronicleTests */,
+				A50000000000000000000008 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A50000000000000000000002 /* OpenChronicle */ = {
+			isa = PBXGroup;
+			children = (
+				A50000000000000000000003 /* App */,
+				A50000000000000000000004 /* Engine */,
+				A50000000000000000000005 /* Resources */,
+				A2000000000000000000000A /* OpenChronicle-Bridging-Header.h */,
+			);
+			path = OpenChronicle;
+			sourceTree = "<group>";
+		};
+		A50000000000000000000003 /* App */ = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003); path = App; sourceTree = "<group>"; };
+		A50000000000000000000004 /* Engine */ = {isa = PBXGroup; children = (A20000000000000000000004, A20000000000000000000005, A20000000000000000000006); path = Engine; sourceTree = "<group>"; };
+		A50000000000000000000005 /* Resources */ = {isa = PBXGroup; children = (A20000000000000000000007, A20000000000000000000008, A20000000000000000000009); path = Resources; sourceTree = "<group>"; };
+		A50000000000000000000006 /* OpenChronicleTests */ = {
+			isa = PBXGroup;
+			children = (
+				A2000000000000000000000B /* BridgeTests.swift */,
+				A2000000000000000000000C /* FixtureParityTests.swift */,
+				A50000000000000000000007 /* Fixtures */,
+			);
+			path = OpenChronicleTests;
+			sourceTree = "<group>";
+		};
+		A50000000000000000000007 /* Fixtures */ = {isa = PBXGroup; children = (A2000000000000000000000D); path = Fixtures; sourceTree = "<group>"; };
+		A50000000000000000000008 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000E, A2000000000000000000000F); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A70000000000000000000001 /* OpenChronicle */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A80000000000000000000002 /* Build configuration list for PBXNativeTarget "OpenChronicle" */;
+			buildPhases = (
+				A40000000000000000000001 /* Build Rust Core */,
+				A40000000000000000000003 /* Sources */,
+				A40000000000000000000002 /* Frameworks */,
+				A40000000000000000000004 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = OpenChronicle;
+			productName = OpenChronicle;
+			productReference = A2000000000000000000000E /* Open Chronicle.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A70000000000000000000002 /* OpenChronicleTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A80000000000000000000003 /* Build configuration list for PBXNativeTarget "OpenChronicleTests" */;
+			buildPhases = (A40000000000000000000005 /* Sources */, A40000000000000000000006 /* Frameworks */, A40000000000000000000007 /* Resources */);
+			buildRules = ();
+			dependencies = (A30000000000000000000002 /* PBXTargetDependency */);
+			name = OpenChronicleTests;
+			productName = OpenChronicleTests;
+			productReference = A2000000000000000000000F /* OpenChronicleTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A90000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					A70000000000000000000001 = {CreatedOnToolsVersion = 15.0; };
+					A70000000000000000000002 = {CreatedOnToolsVersion = 15.0; TestTargetID = A70000000000000000000001; };
+				};
+			};
+			buildConfigurationList = A80000000000000000000001 /* Build configuration list for PBXProject "OpenChronicle" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base);
+			mainGroup = A50000000000000000000001;
+			productRefGroup = A50000000000000000000008 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (A70000000000000000000001 /* OpenChronicle */, A70000000000000000000002 /* OpenChronicleTests */);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A40000000000000000000004 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000007 /* PrivacyInfo.xcprivacy in Resources */); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000007 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A /* shared-response-v1.json in Resources */); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A40000000000000000000001 /* Build Rust Core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputFileListPaths = ();
+			inputPaths = ();
+			name = "Build Rust Core";
+			outputFileListPaths = ();
+			outputPaths = ("$(SRCROOT)/../build/universal/libchronicle_ffi.a");
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/../scripts/build-rust-universal.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A40000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000005 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008, A10000000000000000000009); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A30000000000000000000002 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = A70000000000000000000001 /* OpenChronicle */; targetProxy = A30000000000000000000001 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		B10000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_CXX_LANGUAGE_STANDARD = "gnu++20"; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; MACOSX_DEPLOYMENT_TARGET = 14.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = macosx; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+		B10000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_CXX_LANGUAGE_STANDARD = "gnu++20"; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; }; name = Release; };
+		B10000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = OpenChronicle/Resources/OpenChronicle.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; HEADER_SEARCH_PATHS = "$(SRCROOT)/../include"; INFOPLIST_FILE = OpenChronicle/Resources/Info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../build/universal"; MARKETING_VERSION = 0.1.0; OTHER_LDFLAGS = ("$(inherited)", "-lchronicle_ffi", "-framework", Security, "-framework", SystemConfiguration, "-liconv", "-lz"); PRODUCT_BUNDLE_IDENTIFIER = com.screenata.openchronicle; PRODUCT_MODULE_NAME = OpenChronicle; PRODUCT_NAME = "Open Chronicle"; SWIFT_OBJC_BRIDGING_HEADER = OpenChronicle/OpenChronicle-Bridging-Header.h; SWIFT_VERSION = 5.0; }; name = Debug; };
+		B10000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = OpenChronicle/Resources/OpenChronicle.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEAD_CODE_STRIPPING = YES; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; HEADER_SEARCH_PATHS = "$(SRCROOT)/../include"; INFOPLIST_FILE = OpenChronicle/Resources/Info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../build/universal"; MARKETING_VERSION = 0.1.0; OTHER_LDFLAGS = ("$(inherited)", "-lchronicle_ffi", "-framework", Security, "-framework", SystemConfiguration, "-liconv", "-lz"); PRODUCT_BUNDLE_IDENTIFIER = com.screenata.openchronicle; PRODUCT_MODULE_NAME = OpenChronicle; PRODUCT_NAME = "Open Chronicle"; SWIFT_OBJC_BRIDGING_HEADER = OpenChronicle/OpenChronicle-Bridging-Header.h; SWIFT_VERSION = 5.0; }; name = Release; };
+		B10000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.screenata.openchronicle.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Open Chronicle.app/Contents/MacOS/Open Chronicle"; }; name = Debug; };
+		B10000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.screenata.openchronicle.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Open Chronicle.app/Contents/MacOS/Open Chronicle"; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A80000000000000000000001 /* Build configuration list for PBXProject "OpenChronicle" */ = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000001 /* Debug */, B10000000000000000000002 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A80000000000000000000002 /* Build configuration list for PBXNativeTarget "OpenChronicle" */ = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000003 /* Debug */, B10000000000000000000004 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A80000000000000000000003 /* Build configuration list for PBXNativeTarget "OpenChronicleTests" */ = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000005 /* Debug */, B10000000000000000000006 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = A90000000000000000000001 /* Project object */;
+}

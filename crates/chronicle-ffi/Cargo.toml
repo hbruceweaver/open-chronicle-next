@@ -11,8 +11,16 @@ repository.workspace = true
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
+chrono.workspace = true
+chronicle-domain = { path = "../chronicle-domain" }
 chronicle-engine = { path = "../chronicle-engine" }
+chronicle-store = { path = "../chronicle-store" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
-
