@@ -160,7 +160,7 @@ struct ChunkSummary: Decodable, Equatable, Sendable {
     }
 }
 
-struct EvidenceSeconds: Decodable, Equatable, Sendable {
+struct EvidenceSeconds: Codable, Equatable, Sendable {
     let captured: UInt32
     let protected: UInt32
     let paused: UInt32
@@ -169,7 +169,7 @@ struct EvidenceSeconds: Decodable, Equatable, Sendable {
     let gap: UInt32
 }
 
-struct PresenceSeconds: Decodable, Equatable, Sendable {
+struct PresenceSeconds: Codable, Equatable, Sendable {
     let active: UInt32
     let idle: UInt32
     let unknown: UInt32

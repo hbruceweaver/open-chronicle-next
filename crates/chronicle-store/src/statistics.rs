@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chronicle_domain::{
-    ChunkGap, ChunkGapKind, ChunkId, ChunkRevisionId, DimensionKind, EvidenceSeconds, FactualTotal,
-    PresenceSeconds, QueryCoverage, Transition, UtcRange,
+    ChunkGap, ChunkGapKind, ChunkId, ChunkRevision, ChunkRevisionId, DimensionKind,
+    EvidenceSeconds, FactualTotal, PresenceSeconds, QueryCoverage, Transition, UtcRange,
 };
 use chrono::Duration;
 
@@ -16,6 +16,10 @@ pub struct StatisticsReport {
     pub factual_totals: Vec<FactualTotal>,
     pub transitions: Vec<Transition>,
     pub source_chunk_revision_ids: Vec<ChunkRevisionId>,
+    /// Current chunk revisions read from the same pinned query source as the
+    /// aggregate fields. App-private report projections may derive slim
+    /// activity buckets from these without issuing a second, racy query.
+    pub activity_chunks: Vec<ChunkRevision>,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +142,7 @@ impl FactualStatistics {
             factual_totals,
             transitions,
             source_chunk_revision_ids: revision_ids,
+            activity_chunks: chunks,
         })
     }
 }

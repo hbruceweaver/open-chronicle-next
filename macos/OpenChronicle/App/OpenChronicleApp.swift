@@ -74,17 +74,13 @@ private struct ShellView: View {
     var body: some View {
         if onboardingModel.isComplete {
             NavigationStack(path: $navigation.path) {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Open Chronicle")
-                        .font(.largeTitle)
-                    Text(statusText)
-                        .foregroundStyle(statusColor)
-                    Text(captureStatusText)
-                        .foregroundStyle(.secondary)
-                    HealthView(viewModel: appModel.healthViewModel)
-                    Spacer()
-                }
-                .padding(32)
+                HomeView(
+                    model: appModel.homeViewModel,
+                    captureStatus: appModel.captureStatus,
+                    health: appModel.health,
+                    onChunk: { navigation.show(.chunk($0)) },
+                    onEvent: { navigation.show(.event($0)) }
+                )
                 .navigationDestination(for: AppRoute.self) { route in
                     if route == .health {
                         HealthView(viewModel: appModel.healthViewModel)
@@ -98,39 +94,6 @@ private struct ShellView: View {
             }
         } else {
             OnboardingView(model: onboardingModel)
-        }
-    }
-
-    private var statusText: String {
-        switch appModel.health.status {
-        case .connecting: "Connecting to the local Chronicle core…"
-        case .ready: "Local Chronicle core ready"
-        case let .repairRequired(message): "Core repair required: \(message)"
-        }
-    }
-
-    private var statusColor: Color {
-        switch appModel.health.status {
-        case .connecting: .secondary
-        case .ready: .green
-        case .repairRequired: .orange
-        }
-    }
-
-    private var captureStatusText: String {
-        switch appModel.captureStatus {
-        case .setupRequired: "Complete setup before observation starts"
-        case .starting: "Observation engine starting…"
-        case .recording: "Observation is active"
-        case .paused: "Observation is paused"
-        case .protected: "The current surface is protected; no pixels or text were retained"
-        case let .unavailable(reason): "Observation is unavailable: \(reason.displayName)"
-        case .sleeping: "Observation is suspended while this Mac sleeps"
-        case .studyNotStarted: "The configured study has not started"
-        case .studyExpired: "The configured study has ended"
-        case .storageBlocked: "Observation is paused until storage recovers"
-        case .stopped: "Observation engine stopped"
-        case let .repairRequired(message): "Observation repair required: \(message)"
         }
     }
 
@@ -201,25 +164,6 @@ private struct ChronicleMenu: View {
             case .stopped: return "Observation stopped"
             case .repairRequired: return "Observation repair required"
             }
-        }
-    }
-}
-
-private extension CaptureDenial {
-    var displayName: String {
-        switch self {
-        case .permissionDenied: "Screen Recording permission is unavailable"
-        case .asleep: "this Mac is asleep"
-        case .noExactWindow: "no exact foreground window was found"
-        case .ambiguousWindow: "the foreground window could not be identified safely"
-        case .foregroundChanged: "the foreground window changed during observation"
-        case .userPaused: "observation is paused"
-        case .studyExpired: "the study has ended"
-        case .locked: "the session is locked"
-        case .secureInput: "secure input is active"
-        case .applicationExcluded: "the current application is excluded"
-        case .titleExcluded: "the current window is excluded"
-        case .chronicleSelf: "Open Chronicle excludes itself"
         }
     }
 }

@@ -13,6 +13,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var captureStatus: CapturePresentationState = .starting
     @Published private(set) var operationalStorageState: OperationalStorageState = .healthy
     let healthViewModel = HealthViewModel()
+    let homeViewModel = HomeViewModel()
     private var core: (any CoreService)?
     private var runtime: AppCaptureRuntime?
     private var lifecycleMonitor: LifecycleMonitor?
@@ -155,6 +156,7 @@ final class AppModel: ObservableObject {
         lifecycleMonitor = nil
         await storageMonitor?.stop()
         storageMonitor = nil
+        homeViewModel.detach()
         if let runtime {
             try? await runtime.shutdown()
         }
@@ -194,6 +196,7 @@ final class AppModel: ObservableObject {
             } else {
                 captureStatus = .setupRequired
             }
+            homeViewModel.attach(client: CoreFactualReportClient(core: opened))
             let diagnosticClient = CoreDiagnosticHealthClient(core: opened)
             healthViewModel.attach(fetcher: diagnosticClient)
             let monitor = StorageMonitor(fetcher: diagnosticClient) { [weak self] update in
@@ -282,6 +285,9 @@ final class AppModel: ObservableObject {
             latestDiagnosticHealth = snapshot
             operationalStorageState = OperationalStoragePolicy.state(for: snapshot)
             healthViewModel.apply(snapshot)
+            homeViewModel.observe(
+                latestProjectionAt: snapshot.latest.lastProjectionAt.flatMap(ChronicleTimestamp.date)
+            )
             await notificationService.evaluate(
                 captureStatus: captureStatus,
                 health: snapshot

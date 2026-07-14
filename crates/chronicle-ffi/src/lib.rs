@@ -4,7 +4,7 @@
 //! caller-visible Rust pointers. This makes stale/double close and free calls
 //! ordinary typed failures instead of use-after-free undefined behavior.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use chronicle_domain::{
-    CaptureCadence, ClientId, DeviceId, DisclosureGrant, EventEnvelope, EventPayload, GrantId,
-    GrantState, ImageArtifactId, ObservationContent, ReceiptId, ScreenshotProjectedState,
-    ScreenshotRetention, SharedServiceRequest, parse_versioned, validate_schema_version,
+    CaptureCadence, ChunkGap, ChunkId, ChunkRevisionId, ClientId, DeviceId, DimensionKind,
+    DisclosureGrant, DurationEstimate, EventEnvelope, EventId, EventPayload, EvidenceSeconds,
+    GrantId, GrantState, ImageArtifactId, ObservationContent, PresenceSeconds, QueryCoverage,
+    ReceiptId, ScreenshotProjectedState, ScreenshotRetention, SharedServiceRequest, Transition,
+    UtcRange, parse_versioned, validate_schema_version,
 };
 use chronicle_engine::{
     CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator,
@@ -23,8 +25,8 @@ use chronicle_engine::{
     StartupReconcileRequest, StudyBoundary,
 };
 use chronicle_store::{
-    CaptureOwnerGuard, FaultInjector, LockManager, ManagedRoot, SqliteStore, StoreError,
-    StoreGeneration,
+    CaptureOwnerGuard, FactualStatistics, FaultInjector, LockManager, ManagedRoot, SqliteStore,
+    StoreError, StoreGeneration, StoreQueries,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
@@ -37,6 +39,8 @@ const MAX_CALL_REQUEST_BYTES: usize = chronicle_domain::MAX_SHARED_REQUEST_BYTES
 const MAX_INGEST_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IMAGE_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_ENCODED_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FACTUAL_REPORT_RANGE_SECONDS: i64 = 31 * 24 * 60 * 60;
+const MAX_FACTUAL_REPORT_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A registry-owned byte allocation. Callers must copy bytes before freeing.
 #[repr(C)]
@@ -492,6 +496,9 @@ struct CallRequest {
 enum AppControl {
     RuntimeState,
     StorageHealth,
+    FactualReport {
+        range: UtcRange,
+    },
     SetRecordingPreference {
         enabled: bool,
     },
@@ -532,6 +539,236 @@ enum AppControl {
         client_id: ClientId,
         receipt_id: ReceiptId,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct FactualReportSnapshot {
+    schema_version: &'static str,
+    generated_at: DateTime<Utc>,
+    stable_cutoff: DateTime<Utc>,
+    store_generation: u64,
+    range: UtcRange,
+    coverage: QueryCoverage,
+    factual_totals: Vec<FactualReportTotal>,
+    activity_buckets: Vec<FactualReportActivityBucket>,
+    transitions: Vec<Transition>,
+    domain_context_available: bool,
+    provenance: FactualReportProvenance,
+}
+
+#[derive(Debug, Serialize)]
+struct FactualReportTotal {
+    dimension: DimensionKind,
+    key: String,
+    label: String,
+    parent_key: Option<String>,
+    estimated_seconds: u32,
+    supporting_chunk_ids: Vec<ChunkId>,
+    supporting_event_ids: Vec<EventId>,
+}
+
+#[derive(Debug, Serialize)]
+struct FactualReportActivityBucket {
+    chunk_id: ChunkId,
+    revision_id: ChunkRevisionId,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    display_timezone: String,
+    evidence_seconds: EvidenceSeconds,
+    presence_seconds: PresenceSeconds,
+    duration_estimates: Vec<DurationEstimate>,
+    gaps: Vec<ChunkGap>,
+    transitions: Vec<Transition>,
+    late_input: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FactualReportProvenance {
+    query_engine_version: &'static str,
+    projection_build_id: &'static str,
+    sqlite_version: &'static str,
+    sqlite_source_id: &'static str,
+    source_event_ids: Vec<EventId>,
+    source_chunk_revision_ids: Vec<ChunkRevisionId>,
+}
+
+#[derive(Debug, Default)]
+struct FactualReportTotalMetadata {
+    label: String,
+    parent_key: Option<String>,
+    estimated_seconds: u32,
+    supporting_event_ids: BTreeSet<EventId>,
+}
+
+fn validate_factual_report_range(range: &UtcRange, now: DateTime<Utc>) -> Result<(), FfiError> {
+    let duration = range.end.signed_duration_since(range.start).num_seconds();
+    let utc_aligned = range.start.timestamp().rem_euclid(300) == 0
+        && range.end.timestamp().rem_euclid(300) == 0
+        && range.start.timestamp_subsec_nanos() == 0
+        && range.end.timestamp_subsec_nanos() == 0;
+    if range.validate().is_err()
+        || !utc_aligned
+        || duration > MAX_FACTUAL_REPORT_RANGE_SECONDS
+        || range.end > now
+    {
+        return Err(FfiError::new(
+            ChronicleStatus::Contract,
+            "invalid-factual-report-range",
+            "factual report range must be a past, UTC five-minute-aligned interval of at most 31 days",
+        ));
+    }
+    Ok(())
+}
+
+fn build_factual_report_snapshot(
+    range: UtcRange,
+    now: DateTime<Utc>,
+    store_generation: u64,
+    report: chronicle_store::StatisticsReport,
+) -> Result<FactualReportSnapshot, FfiError> {
+    if report.coverage.range != range {
+        return Err(factual_report_inconsistent());
+    }
+
+    let mut metadata = BTreeMap::<(DimensionKind, String), FactualReportTotalMetadata>::new();
+    let mut source_event_ids = BTreeSet::new();
+    for chunk in &report.activity_chunks {
+        source_event_ids.extend(chunk.supporting_event_ids.iter().cloned());
+        for estimate in &chunk.duration_estimates {
+            let parent_key = report_parent_key(&chunk.duration_estimates, estimate);
+            let entry = metadata
+                .entry((estimate.dimension, estimate.key.clone()))
+                .or_default();
+            if entry.parent_key.is_some() && entry.parent_key != parent_key {
+                return Err(factual_report_inconsistent());
+            }
+            entry.label.clone_from(&estimate.label);
+            entry.parent_key = parent_key;
+            entry.estimated_seconds = entry
+                .estimated_seconds
+                .checked_add(estimate.estimated_seconds)
+                .ok_or_else(factual_report_inconsistent)?;
+            entry
+                .supporting_event_ids
+                .extend(estimate.supporting_event_ids.iter().cloned());
+        }
+    }
+
+    let mut factual_totals = Vec::with_capacity(report.factual_totals.len());
+    for total in report.factual_totals {
+        let total_metadata = metadata
+            .remove(&(total.dimension, total.key.clone()))
+            .ok_or_else(factual_report_inconsistent)?;
+        if total_metadata.label.is_empty()
+            || total_metadata.estimated_seconds != total.estimated_seconds
+        {
+            return Err(factual_report_inconsistent());
+        }
+        factual_totals.push(FactualReportTotal {
+            dimension: total.dimension,
+            key: total.key,
+            label: total_metadata.label,
+            parent_key: total_metadata.parent_key,
+            estimated_seconds: total.estimated_seconds,
+            supporting_chunk_ids: total.supporting_chunk_ids,
+            supporting_event_ids: total_metadata.supporting_event_ids.into_iter().collect(),
+        });
+    }
+    if !metadata.is_empty() {
+        return Err(factual_report_inconsistent());
+    }
+    let domain_context_available = factual_totals
+        .iter()
+        .any(|total| total.dimension == DimensionKind::AuthorizedDomain);
+    let activity_buckets = report
+        .activity_chunks
+        .into_iter()
+        .map(|chunk| FactualReportActivityBucket {
+            chunk_id: chunk.chunk_id,
+            revision_id: chunk.revision_id,
+            start: chunk.window.start,
+            end: chunk.window.end,
+            display_timezone: chunk.display_timezone,
+            evidence_seconds: chunk.evidence_seconds,
+            presence_seconds: chunk.presence_seconds,
+            duration_estimates: chunk.duration_estimates,
+            gaps: chunk.gaps,
+            transitions: chunk.transitions,
+            late_input: chunk.late_input,
+        })
+        .collect();
+    Ok(FactualReportSnapshot {
+        schema_version: ABI_SCHEMA_VERSION,
+        generated_at: now,
+        stable_cutoff: now,
+        store_generation,
+        range,
+        coverage: report.coverage,
+        factual_totals,
+        activity_buckets,
+        transitions: report.transitions,
+        domain_context_available,
+        provenance: FactualReportProvenance {
+            query_engine_version: env!("CARGO_PKG_VERSION"),
+            projection_build_id: chronicle_store::STORE_BUILD_ID,
+            sqlite_version: chronicle_store::SQLITE_BUNDLED_VERSION,
+            sqlite_source_id: chronicle_store::SQLITE_BUNDLED_SOURCE_ID,
+            source_event_ids: source_event_ids.into_iter().collect(),
+            source_chunk_revision_ids: report.source_chunk_revision_ids,
+        },
+    })
+}
+
+fn report_parent_key(
+    estimates: &[DurationEstimate],
+    estimate: &DurationEstimate,
+) -> Option<String> {
+    if estimate.dimension != DimensionKind::Window {
+        return None;
+    }
+    estimates
+        .iter()
+        .filter(|candidate| candidate.dimension == DimensionKind::Application)
+        .filter(|candidate| {
+            estimate
+                .key
+                .strip_prefix(&candidate.key)
+                .is_some_and(|suffix| suffix.starts_with(':'))
+        })
+        .max_by_key(|candidate| candidate.key.len())
+        .map(|candidate| candidate.key.clone())
+        .or_else(|| {
+            estimate
+                .key
+                .split_once(':')
+                .map(|(parent, _)| parent.to_owned())
+        })
+}
+
+fn factual_report_inconsistent() -> FfiError {
+    FfiError::new(
+        ChronicleStatus::Internal,
+        "factual-report-inconsistent",
+        "Chronicle could not reconcile the factual report snapshot",
+    )
+}
+
+fn serialize_bounded_factual_report(
+    snapshot: FactualReportSnapshot,
+    max_bytes: usize,
+) -> Result<Value, FfiError> {
+    let value = serialize_value(snapshot)?;
+    let size = serde_json::to_vec(&value)
+        .map_err(|_| factual_report_inconsistent())?
+        .len();
+    if size > max_bytes {
+        return Err(FfiError::new(
+            ChronicleStatus::TooLarge,
+            "factual-report-too-large",
+            "factual report exceeds the app response budget; choose a shorter range",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Serialize)]
@@ -698,6 +935,7 @@ impl CoreHandle {
                     .screenshot_storage_health()
                     .map_err(FfiError::from)?,
             ),
+            AppControl::FactualReport { range } => self.factual_report(range, now),
             AppControl::SetRecordingPreference { enabled } => self
                 .coordinator
                 .set_recording_preference(enabled)
@@ -780,6 +1018,19 @@ impl CoreHandle {
                 receipt_id,
             } => self.revoke_disclosure_grant(grant_id, client_id, receipt_id, now),
         }
+    }
+
+    fn factual_report(&self, range: UtcRange, now: DateTime<Utc>) -> Result<Value, FfiError> {
+        validate_factual_report_range(&range, now)?;
+        self.ensure_generation(self.opened_generation)?;
+        let queries = StoreQueries::new(self.sqlite.clone())
+            .snapshot()
+            .map_err(FfiError::from)?;
+        let report = FactualStatistics::new(queries)
+            .range(&range)
+            .map_err(FfiError::from)?;
+        let snapshot = build_factual_report_snapshot(range, now, self.opened_generation, report)?;
+        serialize_bounded_factual_report(snapshot, MAX_FACTUAL_REPORT_RESPONSE_BYTES)
     }
 
     fn install_disclosure_grant(
@@ -1315,7 +1566,8 @@ pub unsafe extern "C" fn chronicle_buffer_free(buffer: *mut ChronicleBuffer) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronicle_domain::QueryResponse;
+    use chronicle_domain::{ChunkRevision, DurationEstimate, QueryResponse};
+    use chronicle_store::{CanonicalJournal, Projector};
     use std::sync::{Arc, Barrier};
 
     fn response_bytes(buffer: ChronicleBuffer) -> Vec<u8> {
@@ -1464,6 +1716,60 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_str(line).expect("valid fixture event"))
             .collect()
+    }
+
+    fn seed_report_chunk(handle: u64, include_domain: bool) {
+        let mut chunk = include_str!("../../../fixtures/synthetic/session-v1/chunks.jsonl")
+            .lines()
+            .last()
+            .map(ChunkRevision::parse)
+            .expect("fixture chunk line")
+            .expect("valid fixture chunk");
+        chunk.prior_revision_id = None;
+        chunk.supersedes_revision_id = None;
+        chunk.duration_estimates.push(DurationEstimate {
+            dimension: DimensionKind::Window,
+            key: "com.example.writer:Quarterly notes".to_owned(),
+            label: "Quarterly notes".to_owned(),
+            estimated_seconds: 60,
+            supporting_event_ids: vec![
+                EventId::new("evt-090015").expect("event ID"),
+                EventId::new("evt-090045").expect("event ID"),
+            ],
+        });
+        if include_domain {
+            chunk.duration_estimates.push(DurationEstimate {
+                dimension: DimensionKind::AuthorizedDomain,
+                key: "example.test".to_owned(),
+                label: "example.test".to_owned(),
+                estimated_seconds: 30,
+                supporting_event_ids: vec![EventId::new("evt-090015").expect("event ID")],
+            });
+        }
+        chunk.validate().expect("augmented report chunk is valid");
+        with_handle(handle, |core| {
+            let record = CanonicalJournal::new(core.root.clone())
+                .append_chunk(&chunk, FaultInjector::none())
+                .map_err(FfiError::from)?;
+            Projector::new(core.sqlite.clone())
+                .project_record(&record, FaultInjector::none())
+                .map_err(FfiError::from)
+        })
+        .expect("seed report chunk");
+    }
+
+    fn factual_report_control(handle: u64) -> (u32, Value) {
+        control(
+            handle,
+            "2026-07-13T09:07:00Z",
+            json!({
+                "type": "factual-report",
+                "range": {
+                    "start": "2026-07-13T09:00:00Z",
+                    "end": "2026-07-13T09:05:00Z"
+                }
+            }),
+        )
     }
 
     fn image_request(artifact_id: &str, generation: u64, max_bytes: u64) -> Vec<u8> {
@@ -1786,6 +2092,316 @@ mod tests {
                 .to_string()
                 .contains("SECRET_COLLISION_CLIENT_MUST_NOT_BE_ECHOED")
         );
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn factual_report_is_one_factual_snapshot_with_hierarchy_gaps_and_no_private_payloads() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+        seed_report_chunk(handle, true);
+
+        let (status, response) = factual_report_control(handle);
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        let report = &response["result"];
+        assert_eq!(report["schema_version"], "1.0");
+        assert_eq!(report["generated_at"], "2026-07-13T09:07:00Z");
+        assert_eq!(report["stable_cutoff"], report["generated_at"]);
+        assert_eq!(report["store_generation"], 1);
+        assert_eq!(report["coverage"]["evidence_seconds"]["captured"], 150);
+        assert_eq!(report["coverage"]["evidence_seconds"]["protected"], 30);
+        assert_eq!(report["coverage"]["evidence_seconds"]["unavailable"], 30);
+        assert_eq!(report["coverage"]["evidence_seconds"]["gap"], 90);
+        let evidence = &report["coverage"]["evidence_seconds"];
+        let evidence_total: u64 = [
+            "captured",
+            "protected",
+            "paused",
+            "unavailable",
+            "error",
+            "gap",
+        ]
+        .into_iter()
+        .map(|key| evidence[key].as_u64().expect("evidence seconds"))
+        .sum();
+        assert_eq!(evidence_total, 300);
+        assert_eq!(report["coverage"]["gaps"].as_array().map(Vec::len), Some(4));
+
+        let totals = report["factual_totals"].as_array().expect("factual totals");
+        let writer = totals
+            .iter()
+            .find(|total| {
+                total["dimension"] == "application" && total["key"] == "com.example.writer"
+            })
+            .expect("writer total");
+        assert_eq!(writer["label"], "Synthetic Writer");
+        assert_eq!(writer["estimated_seconds"], 60);
+        assert_eq!(
+            writer["supporting_chunk_ids"],
+            json!(["chunk-20260713T0900Z"])
+        );
+        assert_eq!(
+            writer["supporting_event_ids"],
+            json!(["evt-090015", "evt-090045"])
+        );
+        let window = totals
+            .iter()
+            .find(|total| total["dimension"] == "window")
+            .expect("window total");
+        assert_eq!(window["label"], "Quarterly notes");
+        assert_eq!(window["parent_key"], "com.example.writer");
+        assert_eq!(report["domain_context_available"], true);
+        assert!(
+            totals
+                .iter()
+                .any(|total| total["dimension"] == "authorized-domain")
+        );
+
+        let buckets = report["activity_buckets"]
+            .as_array()
+            .expect("activity buckets");
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0]["revision_id"], "chunk-rev-002");
+        assert_eq!(buckets[0]["late_input"], true);
+        assert_eq!(buckets[0]["transitions"].as_array().map(Vec::len), Some(2));
+        assert_eq!(report["transitions"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            report["provenance"]["source_chunk_revision_ids"],
+            json!(["chunk-rev-002"])
+        );
+
+        let bucket_application_seconds: u64 = buckets[0]["duration_estimates"]
+            .as_array()
+            .expect("bucket estimates")
+            .iter()
+            .filter(|estimate| estimate["dimension"] == "application")
+            .map(|estimate| {
+                estimate["estimated_seconds"]
+                    .as_u64()
+                    .expect("bucket seconds")
+            })
+            .sum();
+        let total_application_seconds: u64 = totals
+            .iter()
+            .filter(|total| total["dimension"] == "application")
+            .map(|total| total["estimated_seconds"].as_u64().expect("total seconds"))
+            .sum();
+        assert_eq!(bucket_application_seconds, total_application_seconds);
+
+        let query_golden: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/synthetic/session-v1/query-results-v1.json"
+        ))
+        .expect("language-neutral query golden");
+        let mut expected_applications = query_golden["statistics"]["data"]["factual_totals"]
+            .as_array()
+            .expect("golden factual totals")
+            .clone();
+        let mut actual_applications: Vec<Value> = totals
+            .iter()
+            .filter(|total| total["dimension"] == "application")
+            .map(|total| {
+                json!({
+                    "dimension": total["dimension"],
+                    "key": total["key"],
+                    "estimated_seconds": total["estimated_seconds"],
+                    "supporting_chunk_ids": total["supporting_chunk_ids"],
+                })
+            })
+            .collect();
+        expected_applications
+            .sort_by_key(|total| total["key"].as_str().unwrap_or_default().to_owned());
+        actual_applications
+            .sort_by_key(|total| total["key"].as_str().unwrap_or_default().to_owned());
+        assert_eq!(actual_applications, expected_applications);
+
+        let encoded = response.to_string();
+        for forbidden in [
+            "ignore previous instructions",
+            "ocr_extracts",
+            "managed_relative_path",
+            "image_bytes",
+            "screenshot_bytes",
+            "grant_id",
+            "receipt_id",
+            "disclosed_bytes",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn factual_report_is_app_only_and_does_not_meter_disclosure_grants() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, opened) = open(&temporary);
+        let generation = opened["result"]["store_generation"]
+            .as_u64()
+            .expect("generation");
+        seed_report_chunk(handle, false);
+        let grant_id = GrantId::new("grant-ffi-report-meter").expect("grant ID");
+        let grant = disclosure_grant(
+            generation,
+            grant_id.as_str(),
+            "client-ffi-report-meter",
+            "receipt-ffi-report-meter",
+        );
+        let (status, installed) = control(
+            handle,
+            "2026-07-13T09:00:01Z",
+            json!({ "type": "install-disclosure-grant", "grant": grant }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{installed}");
+        let before = with_handle(handle, |core| {
+            core.service.grant(&grant_id).map_err(FfiError::from)
+        })
+        .expect("grant before report");
+
+        let (status, response) = factual_report_control(handle);
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        assert_eq!(response["result"]["domain_context_available"], false);
+        let after = with_handle(handle, |core| {
+            core.service.grant(&grant_id).map_err(FfiError::from)
+        })
+        .expect("grant after report");
+        assert_eq!(before, after);
+        assert_eq!(after.disclosed_bytes, 0);
+
+        let shared_private_call = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:07:00Z",
+            "request": {
+                "schema_version": "1.0",
+                "request_id": "req-shared-private-report",
+                "store_generation": generation,
+                "operation": {
+                    "type": "factual-report",
+                    "data": {
+                        "range": {
+                            "start": "2026-07-13T09:00:00Z",
+                            "end": "2026-07-13T09:05:00Z"
+                        }
+                    }
+                }
+            }
+        });
+        let (status, rejected) = call_raw(
+            handle,
+            &serde_json::to_vec(&shared_private_call).expect("shared private report request"),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
+
+        let shared_statistics = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:07:00Z",
+            "request": {
+                "schema_version": "1.0",
+                "request_id": "req-shared-statistics-after-report",
+                "store_generation": generation,
+                "operation": {
+                    "type": "query",
+                    "data": {
+                        "schema_version": "1.0",
+                        "request_id": "req-shared-statistics-after-report",
+                        "client_id": "client-ffi-report-meter",
+                        "grant_id": "grant-ffi-report-meter",
+                        "store_generation": generation,
+                        "operation": {
+                            "type": "statistics",
+                            "data": {
+                                "filter": {
+                                    "range": {
+                                        "start": "2026-07-13T09:00:00Z",
+                                        "end": "2026-07-13T09:05:00Z"
+                                    },
+                                    "application_bundle_id": null,
+                                    "window_text": null,
+                                    "authorized_domain": null,
+                                    "evidence_states": []
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (status, shared) = call_raw(
+            handle,
+            &serde_json::to_vec(&shared_statistics).expect("shared statistics request"),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{shared}");
+        let shared_result = &shared["result"]["result"]["data"]["result"];
+        assert_eq!(shared_result["type"], "statistics");
+        let shared_data = shared_result["data"].as_object().expect("statistics data");
+        assert_eq!(shared_data.len(), 1);
+        assert!(shared_data.contains_key("factual_totals"));
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn factual_report_rejects_invalid_ranges_and_enforces_its_response_budget() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+        seed_report_chunk(handle, false);
+
+        for (now, range) in [
+            (
+                "2026-07-13T09:07:00Z",
+                json!({
+                    "start": "2026-07-13T09:00:01Z",
+                    "end": "2026-07-13T09:05:00Z"
+                }),
+            ),
+            (
+                "2026-07-13T09:07:00Z",
+                json!({
+                    "start": "2026-07-13T09:00:00Z",
+                    "end": "2026-07-13T09:10:00Z"
+                }),
+            ),
+            (
+                "2026-09-01T00:00:00Z",
+                json!({
+                    "start": "2026-07-01T00:00:00Z",
+                    "end": "2026-08-01T00:05:00Z"
+                }),
+            ),
+            (
+                "2026-07-13T09:07:00Z",
+                json!({
+                    "start": "2026-07-13T09:05:00Z",
+                    "end": "2026-07-13T09:05:00Z"
+                }),
+            ),
+        ] {
+            let (status, rejected) = control(
+                handle,
+                now,
+                json!({ "type": "factual-report", "range": range }),
+            );
+            assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
+            assert_eq!(rejected["error"]["code"], "invalid-factual-report-range");
+        }
+
+        let range = UtcRange {
+            start: "2026-07-13T09:00:00Z".parse().expect("range start"),
+            end: "2026-07-13T09:05:00Z".parse().expect("range end"),
+        };
+        let now = "2026-07-13T09:07:00Z".parse().expect("report now");
+        let error = with_handle(handle, |core| {
+            let report = FactualStatistics::new(
+                StoreQueries::new(core.sqlite.clone())
+                    .snapshot()
+                    .map_err(FfiError::from)?,
+            )
+            .range(&range)
+            .map_err(FfiError::from)?;
+            let snapshot =
+                build_factual_report_snapshot(range.clone(), now, core.opened_generation, report)?;
+            serialize_bounded_factual_report(snapshot, 1)
+        })
+        .expect_err("one-byte report budget must fail");
+        assert_eq!(error.status, ChronicleStatus::TooLarge);
+        assert_eq!(error.code, "factual-report-too-large");
         let _ = close(handle);
     }
 
