@@ -270,12 +270,13 @@ final class AppRuntimeTests: XCTestCase {
         try await model.completeOnboarding(testOnboardingConfiguration())
 
         let controls = await core.controlTypesValue()
-        XCTAssertEqual(controls, [
+        XCTAssertEqual(controls.filter { $0 != "factual-report" }, [
             "set-cadence",
             "set-screenshot-retention",
             "use-personal-mode",
             "set-recording-preference",
         ])
+        XCTAssertEqual(controls.filter { $0 == "factual-report" }.count, 1)
         let runtimeCalls = await runtimeFactory.callsValue()
         XCTAssertEqual(runtimeCalls, 1)
         XCTAssertEqual(model.captureStatus, .recording)
@@ -303,7 +304,13 @@ final class AppRuntimeTests: XCTestCase {
         let runtimeCalls = await runtimeFactory.callsValue()
         XCTAssertEqual(runtimeCalls, 1)
         let controls = await core.controlTypesValue()
-        XCTAssertEqual(controls.count, 4)
+        XCTAssertEqual(controls.filter { $0 != "factual-report" }, [
+            "set-cadence",
+            "set-screenshot-retention",
+            "use-personal-mode",
+            "set-recording-preference",
+        ])
+        XCTAssertEqual(controls.filter { $0 == "factual-report" }.count, 1)
         await model.shutdown()
     }
 
