@@ -266,9 +266,9 @@ fn search_events() -> Result<Vec<EventEnvelope>, Box<dyn Error>> {
             return Err("fixture is not captured".into());
         };
         content.content_hash = format!("hash-fts-{index}");
-        if let Some(image) = &mut content.image {
-            image.content_hash = content.content_hash.clone();
-        }
+        // FTS coverage is about OCR/query behavior, not managed-image
+        // identity. Avoid manufacturing four canonical owners for one image.
+        content.image = None;
         let ocr = content.ocr.as_mut().ok_or("fixture OCR missing")?;
         ocr.text = text;
         event.validate()?;

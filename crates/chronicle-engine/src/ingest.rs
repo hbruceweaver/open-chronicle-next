@@ -27,6 +27,10 @@ pub enum EngineError {
     Configuration(String),
     #[error("cadence failure: {0}")]
     Cadence(String),
+    #[error("study has not started")]
+    StudyNotStarted,
+    #[error("study has expired")]
+    StudyExpired,
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -117,7 +121,7 @@ impl IngestEngine {
     pub fn open_at(root: ManagedRoot, chunker: ChunkerConfig, now: DateTime<Utc>) -> Result<Self> {
         chunker.validate()?;
         let journal = CanonicalJournal::new(root.clone());
-        chronicle_store::RecoveryManager::new(root.clone()).recover_startup()?;
+        chronicle_store::RecoveryManager::new(root.clone()).recover_startup_at(now)?;
         let sqlite = SqliteStore::open(root.clone())?;
         AggregationReconciler::new(root.clone(), sqlite.clone(), chunker.clone())
             .reconcile_recovered_startup(now)?;
@@ -146,7 +150,7 @@ impl IngestEngine {
         chunk_faults: FaultInjector,
     ) -> Result<IngestOutcome> {
         if self.projection_lagging {
-            self.recover_projection()?;
+            self.recover_projection(now)?;
         }
         let store_guard = self.locks.shared_request()?;
         let snapshot_guard = self.locks.query_snapshot()?;
@@ -213,6 +217,40 @@ impl IngestEngine {
         }
         drop(snapshot_guard);
         drop(store_guard);
+        self.reconcile_durable_event(now, chunk_faults)
+    }
+
+    pub(crate) fn prepare_transactional_image(
+        &mut self,
+        event: &EventEnvelope,
+        cadence: &CadenceStamp,
+    ) -> Result<()> {
+        event.validate().map_err(EngineError::Aggregation)?;
+        if !matches!(
+            &event.payload,
+            EventPayload::ObservationAttempt(attempt)
+                if matches!(&attempt.content, ObservationContent::Captured(content) if content.image.is_some())
+        ) {
+            return Err(EngineError::Aggregation(
+                "transactional image ingestion requires an image-bearing observation".to_owned(),
+            ));
+        }
+        self.cadence.observe_event(cadence, &event.event_id)
+    }
+
+    pub(crate) fn reconcile_transactional_image(
+        &mut self,
+        now: DateTime<Utc>,
+        chunk_faults: FaultInjector,
+    ) -> Result<IngestOutcome> {
+        self.reconcile_durable_event(now, chunk_faults)
+    }
+
+    fn reconcile_durable_event(
+        &mut self,
+        now: DateTime<Utc>,
+        chunk_faults: FaultInjector,
+    ) -> Result<IngestOutcome> {
         let aggregation = match AggregationReconciler::new(
             self.root.clone(),
             self.sqlite.clone(),
@@ -248,12 +286,16 @@ impl IngestEngine {
         }
     }
 
-    fn recover_projection(&mut self) -> Result<()> {
-        chronicle_store::RecoveryManager::new(self.root.clone()).recover_startup()?;
+    pub(crate) fn recover_projection(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<chronicle_store::RecoveryReport> {
+        let report =
+            chronicle_store::RecoveryManager::new(self.root.clone()).recover_startup_at(now)?;
         self.sqlite = SqliteStore::open(self.root.clone())?;
         self.projector = Projector::new(self.sqlite.clone());
         self.projection_lagging = false;
-        Ok(())
+        Ok(report)
     }
 }
 

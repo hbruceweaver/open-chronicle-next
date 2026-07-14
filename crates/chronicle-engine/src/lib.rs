@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod policy;
 pub mod reconcile;
 pub mod service;
+pub mod study;
 
 pub use chunker::*;
 pub use coverage::*;
@@ -19,3 +20,4 @@ pub use ingest::*;
 pub use policy::*;
 pub use reconcile::*;
 pub use service::*;
+pub use study::*;

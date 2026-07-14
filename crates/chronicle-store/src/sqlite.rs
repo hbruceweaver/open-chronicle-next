@@ -62,7 +62,7 @@ impl SqliteStore {
             .optional()?;
         let user_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if identity != Some((3, STORE_BUILD_ID.to_owned())) || user_version != 3 {
+        if identity != Some((4, STORE_BUILD_ID.to_owned())) || user_version != 4 {
             return Err(StoreError::SqliteIdentity(
                 "projection migration/build identity mismatch".to_owned(),
             ));
@@ -291,13 +291,26 @@ impl SqliteStore {
             transaction.commit()?;
             user_version = 3;
         }
-        if user_version != 3 {
+        if user_version == 3 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !retention_state_has_expiry(&transaction)? {
+                transaction
+                    .execute("ALTER TABLE retention_state ADD COLUMN expires_at TEXT", [])?;
+            }
+            transaction.execute_batch(include_str!("../migrations/0004_retention_health.sql"))?;
+            backfill_retention_state(&transaction, &self.root)?;
+            transaction.pragma_update(None, "user_version", 4)?;
+            transaction.commit()?;
+            user_version = 4;
+        }
+        if user_version != 4 {
             return Err(StoreError::SqliteIdentity(format!(
                 "unsupported projection schema version {user_version}"
             )));
         }
         connection.execute(
-            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 3, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
+            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 4, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
             [STORE_BUILD_ID],
         )?;
         let generation_number = i64::try_from(self.generation.generation).map_err(|_| {
@@ -309,6 +322,69 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+}
+
+fn retention_state_has_expiry(transaction: &Transaction<'_>) -> Result<bool> {
+    let mut statement = transaction.prepare("PRAGMA table_info(retention_state)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "expires_at" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn backfill_retention_state(transaction: &Transaction<'_>, root: &ManagedRoot) -> Result<()> {
+    transaction.execute("DELETE FROM retention_state", [])?;
+    let journal = crate::CanonicalJournal::new(root.clone());
+    for record in journal.scan_all(JournalFamily::Events, false)?.records {
+        let event = EventEnvelope::parse(
+            std::str::from_utf8(record.body_bytes())
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?,
+        )?;
+        match &event.payload {
+            EventPayload::ObservationAttempt(attempt) => {
+                if let chronicle_domain::ObservationContent::Captured(content) = &attempt.content
+                    && let Some(image) = &content.image
+                {
+                    transaction.execute(
+                        "INSERT INTO retention_state(artifact_id, state, updated_at, expires_at)
+                         VALUES(?1, 'write-pending', ?2, ?3)
+                         ON CONFLICT(artifact_id) DO UPDATE SET
+                           state=excluded.state,
+                           updated_at=excluded.updated_at,
+                           expires_at=excluded.expires_at",
+                        params![
+                            image.artifact_id.as_str(),
+                            event.recorded_at.to_rfc3339(),
+                            image.expires_at.to_rfc3339()
+                        ],
+                    )?;
+                }
+            }
+            EventPayload::ScreenshotLifecycle(lifecycle) => {
+                transaction.execute(
+                    "INSERT INTO retention_state(artifact_id, state, updated_at, expires_at)
+                     VALUES(?1, ?2, ?3, NULL)
+                     ON CONFLICT(artifact_id) DO UPDATE SET
+                       state=excluded.state,
+                       updated_at=excluded.updated_at",
+                    params![
+                        lifecycle.artifact_id.as_str(),
+                        serde_json::to_value(lifecycle.projected_state)?
+                            .as_str()
+                            .ok_or_else(|| StoreError::SqliteIdentity(
+                                "screenshot state did not serialize as text".to_owned()
+                            ))?,
+                        event.recorded_at.to_rfc3339()
+                    ],
+                )?;
+            }
+            EventPayload::RecordingGap(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn backfill_health_operation_facts(transaction: &Transaction<'_>) -> Result<()> {
@@ -478,7 +554,7 @@ fn projection_digest(connection: &Connection) -> Result<String> {
             "SELECT * FROM artifact_evidence_refs ORDER BY revision_id, evidence_kind, evidence_id",
             3,
         ),
-        ("SELECT * FROM retention_state ORDER BY artifact_id", 3),
+        ("SELECT * FROM retention_state ORDER BY artifact_id", 4),
         ("SELECT * FROM store_generation ORDER BY singleton", 3),
         ("SELECT * FROM aggregation_watermark ORDER BY singleton", 3),
         (

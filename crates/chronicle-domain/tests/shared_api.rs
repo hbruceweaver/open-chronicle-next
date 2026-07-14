@@ -1,7 +1,8 @@
 use chronicle_domain::{
     DiagnosticHealthSnapshot, DurableAcknowledgement, HealthOperationTimes, McpHealthSummary,
-    ProjectionHealth, RequestId, SharedServiceOperation, SharedServiceRequest,
-    SharedServiceResponse, SharedServiceResult, StorageHealthSummary,
+    ProjectionHealth, RequestId, ScreenshotRetentionHealthSummary, SharedServiceOperation,
+    SharedServiceRequest, SharedServiceResponse, SharedServiceResult, StorageHealthSummary,
+    StudyHealthState, StudyHealthSummary,
 };
 use chrono::Utc;
 
@@ -21,6 +22,13 @@ fn healthy_snapshot(observed_at: chrono::DateTime<Utc>) -> DiagnosticHealthSnaps
             managed_bytes: 0,
             available_bytes: 1,
         },
+        study: StudyHealthSummary {
+            state: StudyHealthState::Personal,
+            start: None,
+            end: None,
+            expired_at: None,
+        },
+        screenshot_retention: ScreenshotRetentionHealthSummary::default(),
         mcp: McpHealthSummary {
             active_grants: 0,
             revoked_grants: 0,
@@ -68,7 +76,8 @@ fn diagnostic_health_contract_has_no_user_content_fields() {
         "ocr_text",
         "window_title",
         "managed_relative_path",
-        "screenshot",
+        "image_artifact_id",
+        ".heic",
         "application_bundle_id",
         "/Users/",
     ] {

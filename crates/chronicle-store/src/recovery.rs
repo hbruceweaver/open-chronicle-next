@@ -4,7 +4,7 @@ use chronicle_domain::{
     DeviceId, EventEnvelope, EventId, EventKind, EventPayload, EvidenceSource, ObservationContent,
     ScreenshotLifecycle, ScreenshotLifecycleAction, ScreenshotProjectedState,
 };
-use chrono::Duration as ChronoDuration;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -55,21 +55,33 @@ impl RecoveryManager {
     }
 
     pub fn recover_startup(&self) -> Result<RecoveryReport> {
-        self.recover_startup_with_faults(FaultInjector::none())
+        self.recover_startup_at(chrono::Utc::now())
     }
 
     pub fn recover_startup_with_faults(&self, faults: FaultInjector) -> Result<RecoveryReport> {
+        self.recover_startup_with_faults_at(chrono::Utc::now(), faults)
+    }
+
+    pub fn recover_startup_at(&self, now: DateTime<Utc>) -> Result<RecoveryReport> {
+        self.recover_startup_with_faults_at(now, FaultInjector::none())
+    }
+
+    pub fn recover_startup_with_faults_at(
+        &self,
+        now: DateTime<Utc>,
+        faults: FaultInjector,
+    ) -> Result<RecoveryReport> {
         let _exclusive = self.locks.exclusive_maintenance()?;
         match SqliteStore::open(self.root.clone()) {
-            Ok(sqlite) => match self.project_canonical(&sqlite, faults) {
+            Ok(sqlite) => match self.project_canonical(&sqlite, now, faults) {
                 Ok(report) => Ok(report),
                 Err(error) if projection_is_rebuildable(&error) => self
-                    .rebuild_index_locked(faults)
+                    .rebuild_index_locked(now, faults)
                     .map(|(report, _snapshot)| report),
                 Err(error) => Err(error),
             },
             Err(crate::StoreError::Sqlite(_)) | Err(crate::StoreError::SqliteIdentity(_)) => self
-                .rebuild_index_locked(faults)
+                .rebuild_index_locked(now, faults)
                 .map(|(report, _snapshot)| report),
             Err(error) => Err(error),
         }
@@ -78,6 +90,7 @@ impl RecoveryManager {
     fn project_canonical(
         &self,
         sqlite: &SqliteStore,
+        now: DateTime<Utc>,
         faults: FaultInjector,
     ) -> Result<RecoveryReport> {
         let projector = Projector::new(sqlite.clone());
@@ -88,6 +101,7 @@ impl RecoveryManager {
             &self.root,
             &journal,
             &events.records,
+            now,
             faults,
         )?);
         project_unindexed(sqlite, &projector, events.records.iter())?;
@@ -146,11 +160,12 @@ impl RecoveryManager {
 
     pub fn rebuild_index(&self) -> Result<(RecoveryReport, ProjectionSnapshot)> {
         let _exclusive = self.locks.exclusive_maintenance()?;
-        self.rebuild_index_locked(FaultInjector::none())
+        self.rebuild_index_locked(chrono::Utc::now(), FaultInjector::none())
     }
 
     fn rebuild_index_locked(
         &self,
+        now: DateTime<Utc>,
         faults: FaultInjector,
     ) -> Result<(RecoveryReport, ProjectionSnapshot)> {
         let temp_name = format!("index.rebuild-{}.sqlite3", Uuid::now_v7());
@@ -163,6 +178,7 @@ impl RecoveryManager {
             &self.root,
             &journal,
             &events.records,
+            now,
             faults,
         )?);
         for record in events.records.iter().chain(chunks.records.iter()) {
@@ -323,6 +339,7 @@ fn reconcile_screenshots(
     root: &ManagedRoot,
     journal: &CanonicalJournal,
     records: &[crate::VerifiedRecord],
+    now: DateTime<Utc>,
     faults: FaultInjector,
 ) -> Result<Vec<crate::VerifiedRecord>> {
     let mut observations = std::collections::HashMap::new();
@@ -362,7 +379,10 @@ fn reconcile_screenshots(
                     ScreenshotLifecycleAction::WriteCompleted
                     | ScreenshotLifecycleAction::Missing
                     | ScreenshotLifecycleAction::WriteFailed => {
-                        terminals.insert(lifecycle.artifact_id.to_string(), lifecycle.action);
+                        terminals.insert(
+                            lifecycle.artifact_id.to_string(),
+                            (lifecycle.action, event.clone()),
+                        );
                     }
                     ScreenshotLifecycleAction::DeleteRequested => {
                         delete_requests.insert(lifecycle.artifact_id.to_string(), event.clone());
@@ -392,7 +412,7 @@ fn reconcile_screenshots(
 
     let mut appended = Vec::new();
     for (artifact_id, (observation, image)) in &observations {
-        if let Some(terminal) = terminals.get(artifact_id) {
+        if let Some((terminal, terminal_event)) = terminals.get(artifact_id) {
             if let Some(provisional) = provisional_paths.remove(artifact_id) {
                 match root.unlink(&provisional) {
                     Ok(()) => {}
@@ -406,17 +426,20 @@ fn reconcile_screenshots(
                 && !delete_completions.contains(artifact_id)
                 && !root.exists(image.managed_relative_path.as_str())?
             {
+                ensure_recovery_time(terminal_event, now)?;
                 let missing = recovery_lifecycle_event(
                     observation,
                     ScreenshotLifecycleAction::Missing,
                     ScreenshotProjectedState::Missing,
                     None,
+                    now,
                 )?;
                 appended.push(journal.append_event(&missing, FaultInjector::none())?);
             }
             continue;
         }
         let final_path = image.managed_relative_path.as_str();
+        ensure_recovery_time(observation, now)?;
         if !root.exists(final_path)?
             && let Some(provisional) = provisional_paths.remove(artifact_id)
         {
@@ -444,6 +467,7 @@ fn reconcile_screenshots(
                 ScreenshotProjectedState::WriteFailed
             },
             None,
+            now,
         )?;
         appended.push(journal.append_event(&completion, FaultInjector::none())?);
     }
@@ -474,6 +498,7 @@ fn reconcile_screenshots(
                 "delete request source observation does not match".to_owned(),
             ));
         }
+        ensure_recovery_time(&request, now)?;
         let managed_relative_path = image.managed_relative_path.as_str();
         match root.unlink(managed_relative_path) {
             Ok(()) => {}
@@ -500,6 +525,7 @@ fn reconcile_screenshots(
             ScreenshotLifecycleAction::DeleteCompleted,
             state,
             requested.deletion_cause,
+            now,
         )?;
         appended.push(journal.append_event(&completion, FaultInjector::none())?);
     }
@@ -612,7 +638,9 @@ fn recovery_lifecycle_event(
     action: ScreenshotLifecycleAction,
     projected_state: ScreenshotProjectedState,
     deletion_cause: Option<chronicle_domain::ScreenshotDeletionCause>,
+    now: DateTime<Utc>,
 ) -> Result<EventEnvelope> {
+    ensure_recovery_time(source, now)?;
     let source_lifecycle = match &source.payload {
         EventPayload::ScreenshotLifecycle(lifecycle) => Some(lifecycle),
         _ => None,
@@ -638,7 +666,7 @@ fn recovery_lifecycle_event(
     let digest = crate::checksum::checksum_bytes(format!("{action:?}:{artifact_id}").as_bytes());
     let event_id = EventId::new(format!("recovery-image-{}", &digest[..32]))
         .map_err(|error| crate::StoreError::InvalidPath(error.to_string()))?;
-    let completed_at = source.recorded_at + ChronoDuration::milliseconds(1);
+    let completed_at = now;
     let event = EventEnvelope {
         schema_version: chronicle_domain::CONTRACT_VERSION.to_owned(),
         event_id,
@@ -666,6 +694,15 @@ fn recovery_lifecycle_event(
         crate::StoreError::Contract(chronicle_domain::ContractError::Validation(reason))
     })?;
     Ok(event)
+}
+
+fn ensure_recovery_time(source: &EventEnvelope, now: DateTime<Utc>) -> Result<()> {
+    if now < source.recorded_at {
+        return Err(crate::StoreError::InvalidPath(
+            "recovery time precedes its pending source event".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn screenshot_date_directories(root: &ManagedRoot) -> Result<Vec<String>> {

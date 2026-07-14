@@ -73,6 +73,10 @@ A changed screenshot uses an additive transaction:
 The final path is derived only from the canonical observation date and artifact
 ID (`screenshots/YYYY-MM-DD/<artifact-id>.heic`). Caller-provided paths must match
 that derivation exactly. Existing final or provisional files are never overwritten.
+An image artifact ID has one permanent canonical observation owner even after its
+bytes are missing, expired, deleted, or its write failed. The journal's bounded
+incremental owner index is refreshed under the journal lock before append, and
+ScreenshotStore preflights it before writing provisional bytes.
 Deletion resolves the path from the canonical source observation rather than
 accepting a filesystem path from the caller.
 
@@ -81,6 +85,14 @@ is alive. Startup removes an orphaned provisional with no canonical observation.
 If an observation is durable, startup promotes its provisional or recognizes the
 promoted final file, then appends a deterministic completion. If neither exists it
 appends `write-failed`; it never manufactures a retained acknowledgement.
+The app-internal coordinator runs the same recovery on startup and on a bounded live
+timer, then reconciles aggregation cadence, so a handled fault does not require an
+app restart before the next capture.
+Recovered terminal evidence uses the exact injected recovery wall time, including
+its current-day journal shard. If that time precedes the pending source/request
+envelope, recovery defers without promoting or unlinking bytes; it never fabricates
+a later historical timestamp. Deterministic recovery event identity makes a retry
+idempotent.
 If a previously `write-completed` final file is later absent, startup appends the
 additive `missing` lifecycle transition. Lifecycle projection verifies stable source
 provenance and matching delete request/cause/timestamps before accepting completion.
@@ -88,6 +100,16 @@ provenance and matching delete request/cause/timestamps before accepting complet
 Deletion is likewise additive: append `delete-requested`, unlink and sync the
 directory, then append `delete-completed`. Startup finishes an interrupted request.
 The original observation is not rewritten.
+
+Retention preview/apply is generation- and inventory-bound. Preview records the UTC
+cutoff, exact eligible artifact IDs and bytes, and a checksum of the complete image
+inventory. Apply holds one per-store in-process and cross-process screenshot lock
+from inventory recheck through every lifecycle completion. Any intervening capture,
+missing-file transition, or deletion makes the preview stale. A batch failure can
+therefore leave only already completed deletions and a recoverable pending request;
+it cannot absorb a newly captured image. Remaining retained images require a fresh
+preview. OCR, event journals, and chunk journals are never candidates for screenshot
+retention.
 
 ## Projection
 
@@ -121,7 +143,10 @@ aggregation watermark, and registration receipts.
 `locks/store.lock` is a stable inode. Normal app/MCP requests take it shared.
 Rebuild, evidence deletion, and reset take it exclusive. A derived write takes its
 artifact lock only after the shared store lock; lock upgrades are not supported.
-All acquisitions use bounded waits.
+Screenshot transactions additionally take a per-store process mutex and
+`locks/screenshots.lock`; authoritative configuration read-modify-write operations
+similarly use a per-store process mutex and `locks/configuration.lock`. All
+acquisitions use bounded waits.
 
 `store-generation` is an authoritative, atomically replaced JSON document with a
 monotonic generation and a UUID epoch. Destructive maintenance increments both.

@@ -2,12 +2,19 @@ mod common;
 
 use std::sync::{Arc, Barrier};
 
-use chronicle_domain::{ArtifactRevisionId, ArtifactStatus};
-use chronicle_domain::{EventPayload, ObservationContent};
+use chronicle_domain::{
+    ArtifactRevisionId, ArtifactStatus, DeviceId, EventId, ManagedRelativePath,
+};
+use chronicle_domain::{EventEnvelope, EventPayload, ObservationContent};
 use chronicle_store::{
     ArtifactStore, CanonicalJournal, FaultInjector, FaultPoint, RecoveryManager, ScreenshotStore,
     StoreError,
 };
+use chrono::{DateTime, Utc};
+
+fn at(value: &str) -> DateTime<Utc> {
+    value.parse().expect("valid UTC test timestamp")
+}
 
 #[test]
 fn immutable_artifact_is_restored_by_rebuild() -> chronicle_store::Result<()> {
@@ -64,6 +71,8 @@ fn two_writers_from_one_prior_have_one_winner() -> chronicle_store::Result<()> {
 fn interrupted_image_retention_never_leaves_false_acknowledgement() -> chronicle_store::Result<()> {
     for point in [
         FaultPoint::AfterProvisionalImageSync,
+        FaultPoint::AfterJournalAppend,
+        FaultPoint::AfterJournalSync,
         FaultPoint::AfterObservationAppend,
         FaultPoint::AfterImagePromotion,
         FaultPoint::AfterImagePromotionDirectorySync,
@@ -95,11 +104,27 @@ fn interrupted_image_retention_never_leaves_false_acknowledgement() -> chronicle
             ),
             Err(StoreError::InjectedFault(actual)) if actual == point
         ));
-        RecoveryManager::new(root.clone()).recover_startup()?;
+        if matches!(
+            point,
+            FaultPoint::AfterJournalAppend | FaultPoint::AfterJournalSync
+        ) {
+            assert!(!root.exists("screenshots/2026-07-13/.img-001.provisional")?);
+            assert!(!root.exists(final_path)?);
+        }
+        RecoveryManager::new(root.clone()).recover_startup_at(at("2026-07-14T09:00:19Z"))?;
         let snapshot = sqlite.snapshot_ids()?;
         if point == FaultPoint::AfterProvisionalImageSync {
             assert!(!root.exists(final_path)?);
             assert!(snapshot.screenshot_lifecycle.is_empty());
+        } else if matches!(
+            point,
+            FaultPoint::AfterJournalAppend | FaultPoint::AfterJournalSync
+        ) {
+            assert!(!root.exists(final_path)?);
+            assert_eq!(
+                snapshot.screenshot_lifecycle,
+                vec![("img-001".to_owned(), "write-failed".to_owned())]
+            );
         } else {
             assert!(root.exists(final_path)?);
             assert_eq!(
@@ -112,6 +137,128 @@ fn interrupted_image_retention_never_leaves_false_acknowledgement() -> chronicle
             .join("screenshots/2026-07-13/.img-001.provisional");
         assert!(!provisional.exists());
     }
+    Ok(())
+}
+
+#[test]
+fn retain_rejects_pair_inconsistent_completion_before_provisional_or_canonical_mutation()
+-> chronicle_store::Result<()> {
+    for mismatch in ["schema", "device", "timezone", "observed-at"] {
+        let (_temporary, root, sqlite, projector) = common::store()?;
+        let events = common::events()?;
+        let observation = &events[0];
+        let mut completion = events[1].clone();
+        match mismatch {
+            "schema" => completion.schema_version = "0.9".to_owned(),
+            "device" => {
+                completion.device_id = DeviceId::new("dev-other")
+                    .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            }
+            "timezone" => completion.display_timezone = "America/New_York".to_owned(),
+            "observed-at" => {
+                completion.observed_at =
+                    observation.recorded_at - chrono::Duration::milliseconds(1);
+            }
+            _ => unreachable!(),
+        }
+        if mismatch != "schema" {
+            completion
+                .validate()
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        }
+        let store =
+            ScreenshotStore::new(root.clone(), CanonicalJournal::new(root.clone()), projector)?;
+        assert!(matches!(
+            store.retain(
+                observation,
+                b"synthetic-image-bytes",
+                &completion,
+                FaultInjector::none(),
+            ),
+            Err(StoreError::InvalidPath(message))
+                if message == "write completion does not match its observation envelope"
+        ));
+        assert!(!root.exists("screenshots/2026-07-13/.img-001.provisional")?);
+        assert!(!root.exists("screenshots/2026-07-13/img-001.heic")?);
+        assert!(
+            CanonicalJournal::new(root)
+                .scan_all(chronicle_store::JournalFamily::Events, false)?
+                .records
+                .is_empty()
+        );
+        assert!(sqlite.snapshot_ids()?.event_ids.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn retain_rejects_reuse_of_a_canonical_image_intent_without_bytes() -> chronicle_store::Result<()> {
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    let events = common::events()?;
+    CanonicalJournal::new(root.clone()).append_event(&events[0], FaultInjector::none())?;
+    RecoveryManager::new(root.clone()).recover_startup()?;
+    assert_eq!(
+        sqlite.snapshot_ids()?.screenshot_lifecycle,
+        vec![("img-001".to_owned(), "write-failed".to_owned())]
+    );
+
+    let mut reused_observation = events[0].clone();
+    reused_observation.event_id = EventId::new("evt-image-reused-next-day")
+        .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+    reused_observation.scheduled_at = reused_observation
+        .scheduled_at
+        .map(|value| value + chrono::Duration::days(1));
+    reused_observation.observed_at += chrono::Duration::days(1);
+    reused_observation.recorded_at += chrono::Duration::days(1);
+    if let EventPayload::ObservationAttempt(attempt) = &mut reused_observation.payload
+        && let ObservationContent::Captured(content) = &mut attempt.content
+        && let Some(image) = &mut content.image
+    {
+        image.managed_relative_path =
+            ManagedRelativePath::new("screenshots/2026-07-14/img-001.heic")
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        image.expires_at += chrono::Duration::days(1);
+    }
+    let mut reused_completion = events[1].clone();
+    reused_completion.event_id = EventId::new("evt-image-reused-next-day-write")
+        .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+    reused_completion.observed_at += chrono::Duration::days(1);
+    reused_completion.recorded_at += chrono::Duration::days(1);
+    if let EventPayload::ScreenshotLifecycle(lifecycle) = &mut reused_completion.payload {
+        lifecycle.source_event_id = reused_observation.event_id.clone();
+        lifecycle.completed_at = Some(reused_completion.recorded_at);
+    }
+    reused_observation
+        .validate()
+        .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+    reused_completion
+        .validate()
+        .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+
+    let before = CanonicalJournal::new(root.clone())
+        .scan_all(chronicle_store::JournalFamily::Events, false)?
+        .records
+        .len();
+    let store = ScreenshotStore::new(root.clone(), CanonicalJournal::new(root.clone()), projector)?;
+    assert!(matches!(
+        store.retain(
+            &reused_observation,
+            b"reused-image-bytes",
+            &reused_completion,
+            FaultInjector::none(),
+        ),
+        Err(StoreError::StableIdConflict { id }) if id == "img-001"
+    ));
+    assert!(!root.exists("screenshots/2026-07-14/.img-001.provisional")?);
+    assert!(!root.exists("screenshots/2026-07-14/img-001.heic")?);
+    assert_eq!(
+        CanonicalJournal::new(root.clone())
+            .scan_all(chronicle_store::JournalFamily::Events, false)?
+            .records
+            .len(),
+        before
+    );
+    RecoveryManager::new(root).recover_startup()?;
     Ok(())
 }
 
@@ -163,13 +310,138 @@ fn interrupted_two_phase_image_deletion_completes_on_recovery() -> chronicle_sto
             ),
             Err(StoreError::InjectedFault(actual)) if actual == point
         ));
-        RecoveryManager::new(root.clone()).recover_startup()?;
+        RecoveryManager::new(root.clone()).recover_startup_at(at("2026-07-14T09:00:19Z"))?;
         assert!(!root.exists("screenshots/2026-07-13/img-001.heic")?);
         assert_eq!(
             sqlite.snapshot_ids()?.screenshot_lifecycle,
             vec![("img-001".to_owned(), "expired".to_owned())]
         );
     }
+    Ok(())
+}
+
+#[test]
+fn delayed_delete_recovery_uses_actual_recovery_day_and_is_idempotent()
+-> chronicle_store::Result<()> {
+    let (_temporary, root, _sqlite, projector) = common::store()?;
+    let events = common::events()?;
+    let store = ScreenshotStore::new(root.clone(), CanonicalJournal::new(root.clone()), projector)?;
+    store.retain(
+        &events[0],
+        b"synthetic-image-bytes",
+        &events[1],
+        FaultInjector::none(),
+    )?;
+    let request = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ScreenshotLifecycle(lifecycle)
+                    if lifecycle.action
+                        == chronicle_domain::ScreenshotLifecycleAction::DeleteRequested
+                        && lifecycle.artifact_id.as_str() == "img-001"
+            )
+        })
+        .cloned()
+        .ok_or_else(|| StoreError::InvalidPath("missing delete request fixture".to_owned()))?;
+    let completion = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ScreenshotLifecycle(lifecycle)
+                    if lifecycle.action
+                        == chronicle_domain::ScreenshotLifecycleAction::DeleteCompleted
+                        && lifecycle.artifact_id.as_str() == "img-001"
+            )
+        })
+        .ok_or_else(|| StoreError::InvalidPath("missing delete completion fixture".to_owned()))?;
+    assert!(matches!(
+        store.delete(
+            &request,
+            completion,
+            FaultInjector::at(FaultPoint::AfterDeleteRequest),
+        ),
+        Err(StoreError::InjectedFault(FaultPoint::AfterDeleteRequest))
+    ));
+
+    let rollback = request.recorded_at - chrono::Duration::seconds(1);
+    assert!(matches!(
+        RecoveryManager::new(root.clone()).recover_startup_at(rollback),
+        Err(StoreError::InvalidPath(message))
+            if message == "recovery time precedes its pending source event"
+    ));
+    assert!(root.exists("screenshots/2026-07-13/img-001.heic")?);
+    assert_eq!(
+        CanonicalJournal::new(root.clone())
+            .scan_all(chronicle_store::JournalFamily::Events, false)?
+            .records
+            .len(),
+        3
+    );
+
+    let recovery_now: chrono::DateTime<chrono::Utc> = "2026-07-15T12:00:00Z"
+        .parse()
+        .map_err(|error| StoreError::InvalidPath(format!("invalid recovery test time: {error}")))?;
+    RecoveryManager::new(root.clone()).recover_startup_at(recovery_now)?;
+    let records = CanonicalJournal::new(root.clone())
+        .scan_all(chronicle_store::JournalFamily::Events, false)?
+        .records;
+    let recovered_record = records
+        .iter()
+        .find(|record| {
+            EventEnvelope::parse(
+                std::str::from_utf8(record.body_bytes()).expect("canonical event is UTF-8"),
+            )
+            .is_ok_and(|event| {
+                matches!(
+                    event.payload,
+                    EventPayload::ScreenshotLifecycle(lifecycle)
+                        if lifecycle.action
+                            == chronicle_domain::ScreenshotLifecycleAction::DeleteCompleted
+                            && lifecycle.artifact_id.as_str() == "img-001"
+                )
+            })
+        })
+        .ok_or_else(|| StoreError::InvalidPath("recovered completion missing".to_owned()))?;
+    assert!(recovered_record.shard().starts_with("2026-07-15"));
+    let recovered = EventEnvelope::parse(
+        std::str::from_utf8(recovered_record.body_bytes())
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?,
+    )?;
+    assert_eq!(recovered.observed_at, recovery_now);
+    assert_eq!(recovered.recorded_at, recovery_now);
+    let EventPayload::ScreenshotLifecycle(lifecycle) = recovered.payload else {
+        return Err(StoreError::InvalidPath(
+            "recovered event was not lifecycle evidence".to_owned(),
+        ));
+    };
+    assert_eq!(lifecycle.completed_at, Some(recovery_now));
+    assert_eq!(
+        lifecycle.requested_at,
+        match &request.payload {
+            EventPayload::ScreenshotLifecycle(requested) => requested.requested_at,
+            _ => unreachable!(),
+        }
+    );
+    assert_eq!(
+        lifecycle.source_event_id,
+        match &request.payload {
+            EventPayload::ScreenshotLifecycle(requested) => requested.source_event_id.clone(),
+            _ => unreachable!(),
+        }
+    );
+
+    RecoveryManager::new(root.clone())
+        .recover_startup_at(recovery_now + chrono::Duration::days(1))?;
+    assert_eq!(
+        CanonicalJournal::new(root)
+            .scan_all(chronicle_store::JournalFamily::Events, false)?
+            .records
+            .len(),
+        records.len()
+    );
     Ok(())
 }
 
@@ -303,9 +575,10 @@ fn deletion_recovery_syncs_directory_before_completion() -> chronicle_store::Res
         Err(StoreError::InjectedFault(FaultPoint::AfterImageUnlink))
     ));
     assert!(matches!(
-        RecoveryManager::new(root.clone()).recover_startup_with_faults(FaultInjector::at(
-            FaultPoint::AfterImageUnlinkDirectorySync
-        )),
+        RecoveryManager::new(root.clone()).recover_startup_with_faults_at(
+            at("2026-07-14T09:00:19Z"),
+            FaultInjector::at(FaultPoint::AfterImageUnlinkDirectorySync),
+        ),
         Err(StoreError::InjectedFault(
             FaultPoint::AfterImageUnlinkDirectorySync
         ))
@@ -315,7 +588,7 @@ fn deletion_recovery_syncs_directory_before_completion() -> chronicle_store::Res
         .records
         .len();
     assert_eq!(records_before_completion, 3);
-    RecoveryManager::new(root.clone()).recover_startup()?;
+    RecoveryManager::new(root.clone()).recover_startup_at(at("2026-07-14T09:00:20Z"))?;
     assert_eq!(
         CanonicalJournal::new(root)
             .scan_all(chronicle_store::JournalFamily::Events, false)?
@@ -449,6 +722,146 @@ fn delete_rejects_completion_with_wrong_source_provenance() -> chronicle_store::
             .len(),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn delete_rejects_pair_inconsistent_completion_before_any_destructive_step()
+-> chronicle_store::Result<()> {
+    let (_temporary, root, _sqlite, projector) = common::store()?;
+    let events = common::events()?;
+    let store = ScreenshotStore::new(root.clone(), CanonicalJournal::new(root.clone()), projector)?;
+    store.retain(
+        &events[0],
+        b"synthetic-image-bytes",
+        &events[1],
+        FaultInjector::none(),
+    )?;
+    let request = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ScreenshotLifecycle(lifecycle)
+                    if lifecycle.action
+                        == chronicle_domain::ScreenshotLifecycleAction::DeleteRequested
+                        && lifecycle.artifact_id.as_str() == "img-001"
+            )
+        })
+        .ok_or_else(|| StoreError::InvalidPath("missing delete request fixture".to_owned()))?;
+    let mut inconsistent = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ScreenshotLifecycle(lifecycle)
+                    if lifecycle.action
+                        == chronicle_domain::ScreenshotLifecycleAction::DeleteCompleted
+                        && lifecycle.artifact_id.as_str() == "img-001"
+            )
+        })
+        .cloned()
+        .ok_or_else(|| StoreError::InvalidPath("missing delete completion fixture".to_owned()))?;
+    if let EventPayload::ScreenshotLifecycle(lifecycle) = &mut inconsistent.payload {
+        lifecycle.requested_at = lifecycle
+            .requested_at
+            .map(|value| value + chrono::Duration::seconds(1));
+    }
+    let before = CanonicalJournal::new(root.clone())
+        .scan_all(chronicle_store::JournalFamily::Events, false)?
+        .records
+        .len();
+    assert!(matches!(
+        store.delete(request, &inconsistent, FaultInjector::none()),
+        Err(StoreError::InvalidPath(message)) if message == "invalid delete completion"
+    ));
+    assert!(root.exists("screenshots/2026-07-13/img-001.heic")?);
+    assert_eq!(
+        CanonicalJournal::new(root.clone())
+            .scan_all(chronicle_store::JournalFamily::Events, false)?
+            .records
+            .len(),
+        before
+    );
+    RecoveryManager::new(root).recover_startup()?;
+    Ok(())
+}
+
+#[test]
+fn delete_rejects_out_of_envelope_lifecycle_times_before_request_or_unlink()
+-> chronicle_store::Result<()> {
+    for mismatch in ["request-time", "completion-time"] {
+        let (_temporary, root, _sqlite, projector) = common::store()?;
+        let events = common::events()?;
+        let store =
+            ScreenshotStore::new(root.clone(), CanonicalJournal::new(root.clone()), projector)?;
+        store.retain(
+            &events[0],
+            b"synthetic-image-bytes",
+            &events[1],
+            FaultInjector::none(),
+        )?;
+        let mut request = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::ScreenshotLifecycle(lifecycle)
+                        if lifecycle.action
+                            == chronicle_domain::ScreenshotLifecycleAction::DeleteRequested
+                            && lifecycle.artifact_id.as_str() == "img-001"
+                )
+            })
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidPath("missing delete request fixture".to_owned()))?;
+        let mut completion = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::ScreenshotLifecycle(lifecycle)
+                        if lifecycle.action
+                            == chronicle_domain::ScreenshotLifecycleAction::DeleteCompleted
+                            && lifecycle.artifact_id.as_str() == "img-001"
+                )
+            })
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::InvalidPath("missing delete completion fixture".to_owned())
+            })?;
+        match mismatch {
+            "request-time" => {
+                if let EventPayload::ScreenshotLifecycle(lifecycle) = &mut request.payload {
+                    lifecycle.requested_at =
+                        Some(request.recorded_at + chrono::Duration::seconds(1));
+                }
+            }
+            "completion-time" => {
+                if let EventPayload::ScreenshotLifecycle(lifecycle) = &mut completion.payload {
+                    lifecycle.completed_at =
+                        Some(completion.recorded_at + chrono::Duration::seconds(1));
+                }
+            }
+            _ => unreachable!(),
+        }
+        let before = CanonicalJournal::new(root.clone())
+            .scan_all(chronicle_store::JournalFamily::Events, false)?
+            .records
+            .len();
+        assert!(matches!(
+            store.delete(&request, &completion, FaultInjector::none()),
+            Err(StoreError::Contract(_))
+        ));
+        assert!(root.exists("screenshots/2026-07-13/img-001.heic")?);
+        assert_eq!(
+            CanonicalJournal::new(root.clone())
+                .scan_all(chronicle_store::JournalFamily::Events, false)?
+                .records
+                .len(),
+            before
+        );
+        RecoveryManager::new(root).recover_startup()?;
+    }
     Ok(())
 }
 
@@ -713,11 +1126,42 @@ fn retained_image_missing_on_startup_adds_missing_lifecycle_and_rebuilds()
         FaultInjector::none(),
     )?;
     root.unlink("screenshots/2026-07-13/img-001.heic")?;
-    RecoveryManager::new(root.clone()).recover_startup()?;
+    let rollback = events[0].recorded_at + chrono::Duration::milliseconds(500);
+    assert!(rollback < events[1].recorded_at);
+    assert!(matches!(
+        RecoveryManager::new(root.clone()).recover_startup_at(rollback),
+        Err(StoreError::InvalidPath(message))
+            if message == "recovery time precedes its pending source event"
+    ));
+    assert_eq!(
+        CanonicalJournal::new(root.clone())
+            .scan_all(chronicle_store::JournalFamily::Events, false)?
+            .records
+            .len(),
+        2
+    );
+    assert!(!root.exists("screenshots/2026-07-13/img-001.heic")?);
+
+    let recovered_at = at("2026-07-14T12:00:00Z");
+    RecoveryManager::new(root.clone()).recover_startup_at(recovered_at)?;
     assert_eq!(
         sqlite.snapshot_ids()?.screenshot_lifecycle,
         vec![("img-001".to_owned(), "missing".to_owned())]
     );
+    let records = CanonicalJournal::new(root.clone())
+        .scan_all(chronicle_store::JournalFamily::Events, false)?
+        .records;
+    let missing = records
+        .iter()
+        .find(|record| record.stable_id().starts_with("recovery-image-"))
+        .ok_or_else(|| StoreError::InvalidPath("missing recovery event absent".to_owned()))?;
+    assert!(missing.shard().starts_with("2026-07-14"));
+    let missing = EventEnvelope::parse(
+        std::str::from_utf8(missing.body_bytes())
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?,
+    )?;
+    assert_eq!(missing.recorded_at, recovered_at);
+    assert!(missing.recorded_at > events[1].recorded_at);
     let before = sqlite.snapshot_ids()?;
     let (_report, rebuilt) = RecoveryManager::new(root).rebuild_index()?;
     assert_eq!(before, rebuilt);

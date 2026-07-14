@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chronicle_domain::{
     ChunkRevision, DeviceId, EventEnvelope, EventId, EventKind, EventPayload, EvidenceSource,
-    GapReason, RecordingGap,
+    GapReason, ObservationContent, RecordingGap,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -215,6 +215,50 @@ struct JournalIndex {
     manifest_identities: HashMap<JournalFamily, ManifestIdentity>,
     full_scan_count: HashMap<JournalFamily, u64>,
     directory_enumeration_count: HashMap<JournalFamily, u64>,
+    image_intent_owners: HashMap<String, String>,
+}
+
+fn image_intent_identity(
+    family: JournalFamily,
+    body_bytes: &[u8],
+) -> Result<Option<(String, String)>> {
+    if family != JournalFamily::Events {
+        return Ok(None);
+    }
+    let event = EventEnvelope::parse(
+        std::str::from_utf8(body_bytes)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?,
+    )?;
+    let artifact_id = match &event.payload {
+        EventPayload::ObservationAttempt(attempt) => match &attempt.content {
+            ObservationContent::Captured(content) => content
+                .image
+                .as_ref()
+                .map(|image| image.artifact_id.to_string()),
+            ObservationContent::Unchanged(_)
+            | ObservationContent::Protected(_)
+            | ObservationContent::NoEvidence(_) => None,
+        },
+        EventPayload::RecordingGap(_) | EventPayload::ScreenshotLifecycle(_) => None,
+    };
+    Ok(artifact_id.map(|artifact_id| (artifact_id, event.event_id.to_string())))
+}
+
+fn register_image_intent(index: &mut JournalIndex, record: &VerifiedRecord) -> Result<()> {
+    let Some((artifact_id, owner_event_id)) =
+        image_intent_identity(record.family, record.body_bytes())?
+    else {
+        return Ok(());
+    };
+    if let Some(existing_owner) = index.image_intent_owners.get(&artifact_id)
+        && existing_owner != &owner_event_id
+    {
+        return Err(StoreError::StableIdConflict { id: artifact_id });
+    }
+    index
+        .image_intent_owners
+        .insert(artifact_id, owner_event_id);
+    Ok(())
 }
 
 fn shared_journal_index(root: &ManagedRoot) -> Arc<Mutex<JournalIndex>> {
@@ -274,6 +318,19 @@ impl CanonicalJournal {
         let _writer =
             LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
         self.scan_all_locked(family, repair_partial)
+    }
+
+    pub(crate) fn image_intent_owner(&self, artifact_id: &str) -> Result<Option<String>> {
+        let _writer = LockManager::new(self.root.clone(), Duration::from_secs(1))
+            .journal(JournalFamily::Events)?;
+        self.refresh_index(JournalFamily::Events)?;
+        Ok(self
+            .index
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .image_intent_owners
+            .get(artifact_id)
+            .cloned())
     }
 
     /// Returns canonical records that are durable beyond the projection cursor.
@@ -414,7 +471,11 @@ impl CanonicalJournal {
             index
                 .active_shards
                 .retain(|(entry_family, _), _| *entry_family != family);
+            if family == JournalFamily::Events {
+                index.image_intent_owners.clear();
+            }
             for record in &records {
+                register_image_intent(&mut index, record)?;
                 index.records.insert(
                     (family, record.stable_id.clone()),
                     JournalIndexEntry::from(record),
@@ -705,6 +766,15 @@ impl CanonicalJournal {
             .cloned()
             .unwrap_or_else(|| format!("{date}.jsonl"));
         self.refresh_changed_shard(family, &shard, &mut index)?;
+        let image_intent = image_intent_identity(family, &body_bytes)?;
+        if let Some((artifact_id, owner_event_id)) = &image_intent
+            && let Some(existing_owner) = index.image_intent_owners.get(artifact_id)
+            && existing_owner != owner_event_id
+        {
+            return Err(StoreError::StableIdConflict {
+                id: artifact_id.clone(),
+            });
+        }
         if let Some(entry) = index.records.get(&(family, stable_id.to_owned())).cloned() {
             if entry.checksum != checksum {
                 return Err(StoreError::StableIdConflict {
@@ -750,6 +820,11 @@ impl CanonicalJournal {
             (family, stable_id.to_owned()),
             JournalIndexEntry::from(&record),
         );
+        if let Some((artifact_id, owner_event_id)) = image_intent {
+            index
+                .image_intent_owners
+                .insert(artifact_id, owner_event_id);
+        }
         index
             .shard_sizes
             .insert((family, shard.clone()), end_offset);
@@ -972,6 +1047,7 @@ impl CanonicalJournal {
             .active_shards
             .insert((family, date), indexed.shard.clone());
         index.manifested_records.insert(key.clone());
+        register_image_intent(index, &verified)?;
         index
             .records
             .insert(key, JournalIndexEntry::from(&verified));
@@ -1003,10 +1079,22 @@ impl CanonicalJournal {
                 "journal shard {shard} has an incomplete external tail"
             )));
         }
+        let removed_stable_ids = index
+            .records
+            .iter()
+            .filter(|((entry_family, _), entry)| *entry_family == family && entry.shard == shard)
+            .map(|((_, stable_id), _)| stable_id.clone())
+            .collect::<HashSet<_>>();
         index
             .records
             .retain(|(entry_family, _), entry| *entry_family != family || entry.shard != shard);
+        if family == JournalFamily::Events {
+            index
+                .image_intent_owners
+                .retain(|_, owner| !removed_stable_ids.contains(owner));
+        }
         for record in &report.records {
+            register_image_intent(index, record)?;
             let entry = JournalIndexEntry::from(record);
             let key = (family, entry.stable_id.clone());
             if let Some(existing) = index.records.get(&key)

@@ -73,6 +73,68 @@ pub struct McpHealthSummary {
     pub stale_generation_grants: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StudyHealthState {
+    Personal,
+    Scheduled,
+    Active,
+    Expired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StudyHealthSummary {
+    pub state: StudyHealthState,
+    pub start: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<Utc>>,
+    pub expired_at: Option<DateTime<Utc>>,
+}
+
+impl StudyHealthSummary {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.state {
+            StudyHealthState::Personal
+                if self.start.is_none() && self.end.is_none() && self.expired_at.is_none() =>
+            {
+                Ok(())
+            }
+            StudyHealthState::Scheduled | StudyHealthState::Active
+                if self
+                    .start
+                    .zip(self.end)
+                    .is_some_and(|(start, end)| start < end)
+                    && self.expired_at.is_none() =>
+            {
+                Ok(())
+            }
+            StudyHealthState::Expired
+                if self
+                    .start
+                    .zip(self.end)
+                    .is_some_and(|(start, end)| start < end)
+                    && self
+                        .expired_at
+                        .is_none_or(|expired_at| self.end.is_some_and(|end| expired_at >= end)) =>
+            {
+                Ok(())
+            }
+            _ => Err("study health state and boundaries are inconsistent".to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenshotRetentionHealthSummary {
+    pub write_pending: u64,
+    pub retained: u64,
+    pub delete_pending: u64,
+    pub expired: u64,
+    pub user_deleted: u64,
+    pub missing: u64,
+    pub write_failed: u64,
+    pub next_expiry_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthIssue {
     pub severity: HealthSeverity,
@@ -94,6 +156,8 @@ pub struct DiagnosticHealthSnapshot {
     pub projection_lag_seconds: u64,
     pub projection_pending_records: u64,
     pub storage: StorageHealthSummary,
+    pub study: StudyHealthSummary,
+    pub screenshot_retention: ScreenshotRetentionHealthSummary,
     pub mcp: McpHealthSummary,
     pub issues: Vec<HealthIssue>,
 }
@@ -103,6 +167,7 @@ impl DiagnosticHealthSnapshot {
         if self.store_generation == 0 {
             return Err("diagnostic health requires a nonzero store generation".to_owned());
         }
+        self.study.validate()?;
         match self.projection {
             ProjectionHealth::Current => {
                 if self.acknowledgement != DurableAcknowledgement::Durable

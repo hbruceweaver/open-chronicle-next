@@ -9,7 +9,8 @@ use chronicle_domain::{
     QueryCapability, QueryCoverage, QueryEvent, QueryEventPayload, QueryObservationContent,
     QueryOperation, QueryProvenance, QueryRequest, QueryResponse, QueryResult, QueryScope,
     QueryStatus, SchemaDescriptor, SharedServiceOperation, SharedServiceRequest,
-    SharedServiceResponse, SharedServiceResult, StorageHealthSummary, UtcRange,
+    SharedServiceResponse, SharedServiceResult, StorageHealthSummary, StudyHealthState,
+    StudyHealthSummary, UtcRange,
 };
 use chronicle_store::{
     ActivitySearch, ArtifactStore, FactualStatistics, FaultInjector, GrantQuerySession,
@@ -23,7 +24,7 @@ use thiserror::Error;
 
 use crate::{
     PolicyDecision, PolicyError, authorize_query, authorize_query_content,
-    operation_requires_full_range,
+    operation_requires_full_range, study_health_summary,
 };
 
 const LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(2);
@@ -157,8 +158,10 @@ impl SharedService {
                 // runs before the short health consistency lock so capture is
                 // never delayed by storage accounting.
                 let storage = storage_health_summary(&self.root).map_err(map_store)?;
+                let study = study_health_summary(self.root.clone(), now)
+                    .map_err(|error| SharedServiceError::Contract(error.to_string()))?;
                 let _snapshot_guard = self.locks.query_snapshot().map_err(map_store)?;
-                let health = self.health(now, current.generation, mcp, storage)?;
+                let health = self.health(now, current.generation, mcp, storage, study)?;
                 let response = SharedServiceResponse {
                     schema_version: "1.0".to_owned(),
                     request_id: request.request_id,
@@ -1111,6 +1114,7 @@ impl SharedService {
         store_generation: u64,
         mcp: McpHealthSummary,
         storage: StorageHealthSummary,
+        study: StudyHealthSummary,
     ) -> Result<DiagnosticHealthSnapshot, SharedServiceError> {
         let metrics = store_health_metrics(&self.root, &self.sqlite, now).map_err(map_store)?;
         let mut issues = Vec::new();
@@ -1124,6 +1128,12 @@ impl SharedService {
             issues.push(HealthIssue {
                 severity: HealthSeverity::Warning,
                 code: HealthCode::ProjectionLag,
+            });
+        }
+        if study.state == StudyHealthState::Expired {
+            issues.push(HealthIssue {
+                severity: HealthSeverity::Info,
+                code: HealthCode::StudyExpired,
             });
         }
         let health = DiagnosticHealthSnapshot {
@@ -1146,6 +1156,8 @@ impl SharedService {
             projection_lag_seconds: metrics.projection_lag_seconds,
             projection_pending_records: metrics.projection_pending_records,
             storage,
+            study,
+            screenshot_retention: metrics.screenshot_retention,
             mcp,
             issues,
         };

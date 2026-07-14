@@ -95,8 +95,9 @@ current-pointer, watermark, cursor, and commit crash boundaries therefore conver
 on one active current revision. SQLite current pointers, pending buckets, build
 state, and the aggregation watermark are rebuildable indexes, not canonical state.
 The disposable projection schema adds aggregation indexes through migration
-`0002` and indexed health-operation facts through migration `0003`; opening an
-existing v1 or v2 store upgrades it in place to schema/user version 3.
+`0002`, indexed health-operation facts through migration `0003`, and screenshot
+expiry facts through migration `0004`; opening an existing v1, v2, or v3 store
+upgrades it in place to schema/user version 4.
 
 Canonical journal writers share a process-wide per-root stable-ID index seeded by
 the single startup replay. Under the per-family writer lock, steady append reads an

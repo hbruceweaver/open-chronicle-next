@@ -166,11 +166,11 @@ pub fn scan_artifact_revisions(root: &ManagedRoot) -> Result<Vec<DerivedArtifact
 
 #[derive(Clone, Debug)]
 pub struct ScreenshotStore {
-    root: ManagedRoot,
-    journal: CanonicalJournal,
-    projector: Projector,
-    locks: LockManager,
-    generation: StoreGeneration,
+    pub(crate) root: ManagedRoot,
+    pub(crate) journal: CanonicalJournal,
+    pub(crate) projector: Projector,
+    pub(crate) locks: LockManager,
+    pub(crate) generation: StoreGeneration,
 }
 
 impl ScreenshotStore {
@@ -194,7 +194,23 @@ impl ScreenshotStore {
     ) -> Result<()> {
         let _shared = self.locks.shared_request()?;
         self.generation.ensure_current(&self.root)?;
+        let _screenshots = _shared.screenshots()?;
         let _snapshot = self.locks.query_snapshot()?;
+        observation.validate().map_err(|reason| {
+            StoreError::Contract(chronicle_domain::ContractError::Validation(reason))
+        })?;
+        if completion.schema_version != observation.schema_version
+            || completion.device_id != observation.device_id
+            || completion.display_timezone != observation.display_timezone
+            || completion.observed_at < observation.recorded_at
+        {
+            return Err(StoreError::InvalidPath(
+                "write completion does not match its observation envelope".to_owned(),
+            ));
+        }
+        completion.validate().map_err(|reason| {
+            StoreError::Contract(chronicle_domain::ContractError::Validation(reason))
+        })?;
         if encoded_image.is_empty() || encoded_image.len() > 4 * 1024 * 1024 {
             return Err(StoreError::InvalidPath(
                 "encoded screenshot must be between 1 byte and 4 MiB".to_owned(),
@@ -224,6 +240,13 @@ impl ScreenshotStore {
                 ));
             }
         };
+        if completion.recorded_at < observation.recorded_at
+            || lifecycle.completed_at != Some(completion.recorded_at)
+        {
+            return Err(StoreError::InvalidPath(
+                "write completion timestamp does not follow its observation".to_owned(),
+            ));
+        }
         let final_path = derived_screenshot_path(observation, image.artifact_id.as_str());
         if image.managed_relative_path.as_str() != final_path {
             return Err(StoreError::InvalidPath(
@@ -240,12 +263,24 @@ impl ScreenshotStore {
                 id: lifecycle.artifact_id.to_string(),
             });
         }
+        if self
+            .journal
+            .image_intent_owner(lifecycle.artifact_id.as_str())?
+            .is_some()
+        {
+            return Err(StoreError::StableIdConflict {
+                id: lifecycle.artifact_id.to_string(),
+            });
+        }
         self.root.atomic_write(&provisional, encoded_image)?;
-        faults.check(FaultPoint::AfterProvisionalImageSync)?;
+        if let Err(error) = faults.check(FaultPoint::AfterProvisionalImageSync) {
+            self.root.unlink(&provisional)?;
+            return Err(error);
+        }
         let observation_record = match self.journal.append_event(observation, faults) {
             Ok(record) => record,
             Err(error) => {
-                let _ = self.root.unlink(&provisional);
+                self.root.unlink(&provisional)?;
                 return Err(error);
             }
         };
@@ -270,9 +305,35 @@ impl ScreenshotStore {
         completion: &EventEnvelope,
         faults: FaultInjector,
     ) -> Result<()> {
-        let _shared = self.locks.shared_request()?;
+        let shared = self.locks.shared_request()?;
         self.generation.ensure_current(&self.root)?;
+        let _screenshots = shared.screenshots()?;
         let _snapshot = self.locks.query_snapshot()?;
+        self.delete_locked(request, completion, faults)
+    }
+
+    pub(crate) fn delete_locked(
+        &self,
+        request: &EventEnvelope,
+        completion: &EventEnvelope,
+        faults: FaultInjector,
+    ) -> Result<()> {
+        self.delete_locked_at_occurrence(request, completion, faults, 0)
+    }
+
+    pub(crate) fn delete_locked_at_occurrence(
+        &self,
+        request: &EventEnvelope,
+        completion: &EventEnvelope,
+        faults: FaultInjector,
+        occurrence: usize,
+    ) -> Result<()> {
+        request.validate().map_err(|reason| {
+            StoreError::Contract(chronicle_domain::ContractError::Validation(reason))
+        })?;
+        completion.validate().map_err(|reason| {
+            StoreError::Contract(chronicle_domain::ContractError::Validation(reason))
+        })?;
         let requested = match &request.payload {
             EventPayload::ScreenshotLifecycle(lifecycle)
                 if lifecycle.action == ScreenshotLifecycleAction::DeleteRequested =>
@@ -286,7 +347,14 @@ impl ScreenshotStore {
                 if lifecycle.action == ScreenshotLifecycleAction::DeleteCompleted
                     && lifecycle.artifact_id == requested.artifact_id
                     && lifecycle.source_event_id == requested.source_event_id
-                    && lifecycle.deletion_cause == requested.deletion_cause =>
+                    && lifecycle.deletion_cause == requested.deletion_cause
+                    && lifecycle.requested_at == requested.requested_at
+                    && completion.schema_version == request.schema_version
+                    && completion.device_id == request.device_id
+                    && completion.display_timezone == request.display_timezone
+                    && completion.source == request.source
+                    && completion.observed_at >= request.observed_at
+                    && completion.recorded_at >= request.recorded_at =>
             {
                 lifecycle
             }
@@ -303,9 +371,9 @@ impl ScreenshotStore {
         let request_record = self.journal.append_event(request, faults)?;
         self.projector
             .project_record(&request_record, FaultInjector::none())?;
-        faults.check(FaultPoint::AfterDeleteRequest)?;
+        faults.check_occurrence(FaultPoint::AfterDeleteRequest, occurrence)?;
         match self.root.unlink_with_boundary(&managed_relative_path, || {
-            faults.check(FaultPoint::AfterImageUnlink)
+            faults.check_occurrence(FaultPoint::AfterImageUnlink, occurrence)
         }) {
             Ok(()) => {}
             Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -317,16 +385,20 @@ impl ScreenshotStore {
             }
             Err(error) => return Err(error),
         }
-        faults.check(FaultPoint::AfterImageUnlinkDirectorySync)?;
+        faults.check_occurrence(FaultPoint::AfterImageUnlinkDirectorySync, occurrence)?;
         let completion_record = self.journal.append_event(completion, faults)?;
-        faults.check(FaultPoint::AfterDeleteCompletion)?;
+        faults.check_occurrence(FaultPoint::AfterDeleteCompletion, occurrence)?;
         self.projector
             .project_record(&completion_record, FaultInjector::none())?;
         let _ = completed;
         Ok(())
     }
 
-    fn resolve_screenshot_path(&self, artifact_id: &str, source_event_id: &str) -> Result<String> {
+    pub(crate) fn resolve_screenshot_path(
+        &self,
+        artifact_id: &str,
+        source_event_id: &str,
+    ) -> Result<String> {
         let records = self.journal.scan_all(crate::JournalFamily::Events, false)?;
         for record in records.records {
             if record.stable_id() != source_event_id {

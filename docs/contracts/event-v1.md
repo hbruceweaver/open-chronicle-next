@@ -54,8 +54,10 @@ events. Both retention expiry and user deletion are two phase: a
 `delete-requested` record carries `deletion_cause=retention-expired` or
 `user-requested` and projects `delete-pending`; a later `delete-completed` record
 preserves that cause and projects `expired` or `user-deleted`. Request/completion
-timestamps and causes must agree. An observation is never rewritten when the
-projected image state changes.
+timestamps and causes must agree. A delete-request payload time is within its
+request envelope's observed/recorded interval, and every terminal completion time
+is within its terminal envelope's interval. An observation is never rewritten when
+the projected image state changes.
 
 ## Compatibility
 

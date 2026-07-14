@@ -12,6 +12,21 @@ fn canonical_sources_rebuild_to_identical_projection() -> chronicle_store::Resul
     root.atomic_write("config.json", br#"{"capture_interval_seconds":30}"#)?;
     common::seed_canonical(&root, &projector)?;
     RecoveryManager::new(root.clone()).recover_startup()?;
+    let canonical_projection = sqlite.snapshot_ids()?;
+    let retained_expiry: String = sqlite.connection()?.query_row(
+        "SELECT expires_at FROM retention_state WHERE artifact_id='img-001'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retained_expiry, "2026-07-14T09:00:16+00:00");
+    sqlite.connection()?.execute(
+        "UPDATE retention_state SET expires_at='2099-01-01T00:00:00+00:00'
+         WHERE artifact_id='img-001'",
+        [],
+    )?;
+    assert_ne!(sqlite.snapshot_ids()?, canonical_projection);
+    let (_report, repaired_projection) = RecoveryManager::new(root.clone()).rebuild_index()?;
+    assert_eq!(repaired_projection, canonical_projection);
     let connection = sqlite.connection()?;
     let ocr_rows: i64 =
         connection.query_row("SELECT count(*) FROM ocr_fts", [], |row| row.get(0))?;

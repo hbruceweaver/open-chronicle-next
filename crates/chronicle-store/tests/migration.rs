@@ -4,7 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use chronicle_store::{ManagedRoot, SqliteStore};
 
 #[test]
-fn committed_v2_database_migrates_to_v3_with_indexed_health_facts() -> Result<(), Box<dyn Error>> {
+fn committed_v2_database_migrates_to_v4_with_health_and_retention_facts()
+-> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = ManagedRoot::initialize(temporary.path().join("store"))?;
     let path = root.path().join("index.sqlite3");
@@ -15,6 +16,15 @@ fn committed_v2_database_migrates_to_v3_with_indexed_health_facts() -> Result<()
          VALUES('store', 1, 'v1-test')",
         [],
     )?;
+    let screenshot_events = include_str!("../../../fixtures/synthetic/session-v1/events.jsonl")
+        .lines()
+        .take(2)
+        .map(chronicle_domain::EventEnvelope::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let journal = chronicle_store::CanonicalJournal::new(root.clone());
+    for event in screenshot_events {
+        journal.append_event(&event, chronicle_store::FaultInjector::none())?;
+    }
     let body =
         include_str!("../../../fixtures/synthetic/session-v1/ae4-ten-scheduled-events.jsonl")
             .lines()
@@ -40,13 +50,13 @@ fn committed_v2_database_migrates_to_v3_with_indexed_health_facts() -> Result<()
     let connection = store.connection()?;
     let user_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(user_version, 3);
+    assert_eq!(user_version, 4);
     let schema_version: i64 = connection.query_row(
         "SELECT version FROM schema_versions WHERE component='store'",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(schema_version, 3);
+    assert_eq!(schema_version, 4);
     let preserved: i64 = connection.query_row(
         "SELECT count(*) FROM events WHERE event_id='ae4-evt-01'",
         [],
@@ -82,6 +92,13 @@ fn committed_v2_database_migrates_to_v3_with_indexed_health_facts() -> Result<()
         |row| row.get(0),
     )?;
     assert_eq!(health_facts, 3);
+    let retention: (String, String) = connection.query_row(
+        "SELECT state, expires_at FROM retention_state WHERE artifact_id='img-001'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(retention.0, "retained");
+    assert_eq!(retention.1, "2026-07-14T09:00:16+00:00");
     let mut plan = connection.prepare(
         "EXPLAIN QUERY PLAN
          SELECT occurred_at FROM health_operation_facts
@@ -97,6 +114,20 @@ fn committed_v2_database_migrates_to_v3_with_indexed_health_facts() -> Result<()
             .iter()
             .any(|detail| detail.contains("health_operation_facts_latest")),
         "latest health lookup did not use its bounded index: {details:?}"
+    );
+    let mut retention_plan = connection.prepare(
+        "EXPLAIN QUERY PLAN
+         SELECT min(expires_at) FROM retention_state
+         WHERE state='retained' AND expires_at IS NOT NULL",
+    )?;
+    let retention_details = retention_plan
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        retention_details
+            .iter()
+            .any(|detail| detail.contains("retention_state_health")),
+        "retention health lookup did not use its index: {retention_details:?}"
     );
     Ok(())
 }

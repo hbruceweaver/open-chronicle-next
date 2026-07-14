@@ -2,9 +2,11 @@
 
 Open Chronicle exposes one additive, versioned Rust request/response contract to
 the future Swift bridge and bundled MCP server. U5b adds bounded `write-derived`
-and `export` operations to U5a's `health` and `query` operations. It has no
-operation that pauses capture, changes
-privacy settings, deletes evidence, or mutates canonical events or chunks.
+and `export` operations to U5a's `health` and `query` operations. U5c adds separate
+app-internal recording, study-boundary, provisional-image, and retention services;
+it does not add variants to the shared agent-facing enum. That enum has no operation
+that pauses capture, changes privacy or study settings, retains or deletes images,
+or mutates canonical events or chunks.
 
 ## Protocol boundary
 
@@ -13,7 +15,8 @@ privacy settings, deletes evidence, or mutates canonical events or chunks.
 - Every request carries an opaque request ID and nonzero store generation.
 - Nested query identity and generation must equal the outer request.
 - A stale generation fails before any evidence or receipt mutation.
-- Health is content-free and does not require an evidence disclosure grant.
+- Health is content-free, observational only, and does not require an evidence
+  disclosure grant; it cannot latch or extend a study.
 - Every agent query, including status and schema discovery, requires an active
   per-client grant.
 
@@ -164,8 +167,10 @@ from obsolete store generations. Writes use same-directory
 temporary-file sync, atomic rename, and parent-directory sync under a dedicated
 grant-receipt lock. SQLite remains a disposable evidence projection, so the service does
 not put disclosure receipts in SQLite. Additive projection migration `0003`
-contains only rebuildable, indexed health-operation facts; it backfills v2 once
-and avoids whole-history health scans. Migrations `0001` and `0002` are unchanged.
+contains only rebuildable, indexed health-operation facts; migration `0004` adds
+rebuildable screenshot expiry facts for typed retention health and backfills them
+from canonical events. Existing v3 stores upgrade once without rewriting canonical
+evidence. Migrations `0001` through `0003` are unchanged.
 
 Receipt mutation lock order is always shared store lock, current generation read,
 then exclusive grant-receipt lock. A reset takes the exclusive store lock. An old

@@ -31,7 +31,7 @@ impl AggregationReconciler {
     }
 
     pub fn reconcile_startup(&self, now: DateTime<Utc>) -> Result<ReconcileReport> {
-        RecoveryManager::new(self.root.clone()).recover_startup()?;
+        RecoveryManager::new(self.root.clone()).recover_startup_at(now)?;
         self.reconcile_recovered_startup(now)
     }
 

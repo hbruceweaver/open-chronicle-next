@@ -212,6 +212,23 @@ fn project_event(
                 scheduled_at,
                 attempt.cadence_seconds,
             )?;
+            if let ObservationContent::Captured(content) = &attempt.content
+                && let Some(image) = &content.image
+            {
+                transaction.execute(
+                    "INSERT INTO retention_state(artifact_id, state, updated_at, expires_at)
+                     VALUES(?1, 'write-pending', ?2, ?3)
+                     ON CONFLICT(artifact_id) DO UPDATE SET
+                       state=excluded.state,
+                       updated_at=excluded.updated_at,
+                       expires_at=excluded.expires_at",
+                    params![
+                        image.artifact_id.as_str(),
+                        event.recorded_at.to_rfc3339(),
+                        image.expires_at.to_rfc3339()
+                    ],
+                )?;
+            }
             let (application, process, title, domain, hash, ocr) = match &attempt.content {
                 ObservationContent::Captured(content) => (
                     Some(content.context.application_bundle_id.as_str()),
@@ -278,6 +295,18 @@ fn project_event(
                     lifecycle.deletion_cause.as_ref().map(enum_value).transpose()?,
                     lifecycle.requested_at.map(|value| value.to_rfc3339()),
                     lifecycle.completed_at.map(|value| value.to_rfc3339()),
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO retention_state(artifact_id, state, updated_at, expires_at)
+                 VALUES(?1, ?2, ?3, NULL)
+                 ON CONFLICT(artifact_id) DO UPDATE SET
+                   state=excluded.state,
+                   updated_at=excluded.updated_at",
+                params![
+                    lifecycle.artifact_id.as_str(),
+                    enum_value(&lifecycle.projected_state)?,
+                    event.recorded_at.to_rfc3339()
                 ],
             )?;
         }

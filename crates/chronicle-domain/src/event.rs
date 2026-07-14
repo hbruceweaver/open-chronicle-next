@@ -603,6 +603,23 @@ impl EventEnvelope {
             {
                 return Err("delete completion cannot precede its request".to_owned());
             }
+            if lifecycle.action == ScreenshotLifecycleAction::DeleteRequested
+                && lifecycle.requested_at.is_some_and(|requested_at| {
+                    requested_at < self.observed_at || requested_at > self.recorded_at
+                })
+            {
+                return Err(
+                    "delete request time must be within its event observation interval".to_owned(),
+                );
+            }
+            if lifecycle.completed_at.is_some_and(|completed_at| {
+                completed_at < self.observed_at || completed_at > self.recorded_at
+            }) {
+                return Err(
+                    "lifecycle completion time must be within its event observation interval"
+                        .to_owned(),
+                );
+            }
         }
         if self.display_timezone.is_empty()
             || self.source.adapter.is_empty()

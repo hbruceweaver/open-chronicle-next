@@ -13,6 +13,7 @@ pub mod projection;
 pub mod queries;
 pub mod receipts;
 pub mod recovery;
+pub mod retention;
 pub mod search;
 pub mod sqlite;
 pub mod statistics;
@@ -36,6 +37,7 @@ pub use projection::*;
 pub use queries::*;
 pub use receipts::*;
 pub use recovery::*;
+pub use retention::*;
 pub use search::*;
 pub use sqlite::*;
 pub use statistics::*;
@@ -94,6 +96,10 @@ pub enum StoreError {
     RepairNotConfirmed,
     #[error("journal repair is incomplete: {0}")]
     RepairIncomplete(String),
+    #[error("screenshot retention requires explicit confirmation")]
+    RetentionNotConfirmed,
+    #[error("screenshot retention preview is stale")]
+    RetentionPreviewStale,
     #[error("injected crash boundary: {0:?}")]
     InjectedFault(FaultPoint),
 }
@@ -144,6 +150,7 @@ pub enum FaultPoint {
 pub struct FaultInjector {
     point: Option<FaultPoint>,
     abort_process: bool,
+    occurrence: usize,
 }
 
 impl FaultInjector {
@@ -151,6 +158,15 @@ impl FaultInjector {
         Self {
             point: Some(point),
             abort_process: false,
+            occurrence: 0,
+        }
+    }
+
+    pub const fn at_occurrence(point: FaultPoint, occurrence: usize) -> Self {
+        Self {
+            point: Some(point),
+            abort_process: false,
+            occurrence,
         }
     }
 
@@ -158,6 +174,7 @@ impl FaultInjector {
         Self {
             point: Some(point),
             abort_process: true,
+            occurrence: 0,
         }
     }
 
@@ -165,11 +182,16 @@ impl FaultInjector {
         Self {
             point: None,
             abort_process: false,
+            occurrence: 0,
         }
     }
 
     pub fn check(self, point: FaultPoint) -> Result<()> {
-        if self.point == Some(point) {
+        self.check_occurrence(point, 0)
+    }
+
+    pub fn check_occurrence(self, point: FaultPoint, occurrence: usize) -> Result<()> {
+        if self.point == Some(point) && self.occurrence == occurrence {
             if self.abort_process {
                 std::process::abort();
             }

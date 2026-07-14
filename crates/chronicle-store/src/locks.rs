@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs::File;
-use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use crate::{JournalFamily, ManagedRoot, Result, StoreError};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 static DERIVED_REVISION_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static NAMED_PROCESS_LOCKS: OnceLock<(Mutex<HashSet<String>>, Condvar)> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct LockManager {
@@ -102,6 +104,41 @@ impl SharedStoreGuard {
         lock_bounded(&file, true, self.timeout, "artifact")?;
         Ok(ArtifactGuard { file })
     }
+
+    /// Serializes the image inventory, provisional promotion, and deletion
+    /// lifecycle across both threads and processes.
+    pub fn screenshots(&self) -> Result<ScreenshotGuard> {
+        let process = lock_named_process(
+            format!("{}:screenshots", self.root.path().display()),
+            self.timeout,
+            "screenshot inventory",
+        )?;
+        let file = self
+            .root
+            .open_file("locks/screenshots.lock", true, false, false)?;
+        lock_bounded(&file, true, self.timeout, "screenshot inventory")?;
+        Ok(ScreenshotGuard {
+            _process: process,
+            _file: file,
+        })
+    }
+
+    /// Serializes authoritative config.json read-modify-write operations.
+    pub fn configuration(&self) -> Result<ConfigurationGuard> {
+        let process = lock_named_process(
+            format!("{}:configuration", self.root.path().display()),
+            self.timeout,
+            "configuration",
+        )?;
+        let file = self
+            .root
+            .open_file("locks/configuration.lock", true, false, false)?;
+        lock_bounded(&file, true, self.timeout, "configuration")?;
+        Ok(ConfigurationGuard {
+            _process: process,
+            _file: file,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +154,18 @@ pub struct ArtifactGuard {
 #[derive(Debug)]
 pub struct DerivedRevisionGuard {
     _process: MutexGuard<'static, ()>,
+    _file: File,
+}
+
+#[derive(Debug)]
+pub struct ScreenshotGuard {
+    _process: ProcessNamedGuard,
+    _file: File,
+}
+
+#[derive(Debug)]
+pub struct ConfigurationGuard {
+    _process: ProcessNamedGuard,
     _file: File,
 }
 
@@ -175,6 +224,48 @@ fn lock_derived_revision_process(timeout: Duration) -> Result<MutexGuard<'static
     }
 }
 
+#[derive(Debug)]
+struct ProcessNamedGuard {
+    key: String,
+}
+
+fn lock_named_process(key: String, timeout: Duration, label: &str) -> Result<ProcessNamedGuard> {
+    let (registry, wake) =
+        NAMED_PROCESS_LOCKS.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
+    let started = Instant::now();
+    let mut active = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        if active.insert(key.clone()) {
+            return Ok(ProcessNamedGuard { key });
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(StoreError::LockTimeout(label.to_owned()));
+        }
+        let (next, timeout_result) = wake
+            .wait_timeout(active, RETRY_INTERVAL.min(remaining))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active = next;
+        if timeout_result.timed_out() && started.elapsed() >= timeout {
+            return Err(StoreError::LockTimeout(label.to_owned()));
+        }
+    }
+}
+
+impl Drop for ProcessNamedGuard {
+    fn drop(&mut self) {
+        let (registry, wake) =
+            NAMED_PROCESS_LOCKS.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
+        let mut active = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.remove(&self.key);
+        wake.notify_all();
+    }
+}
+
 macro_rules! unlock_on_drop {
     ($type:ty) => {
         impl Drop for $type {
@@ -189,6 +280,16 @@ unlock_on_drop!(SharedStoreGuard);
 unlock_on_drop!(ExclusiveStoreGuard);
 unlock_on_drop!(ArtifactGuard);
 impl Drop for DerivedRevisionGuard {
+    fn drop(&mut self) {
+        let _ = flock(&self._file, FlockOperation::Unlock);
+    }
+}
+impl Drop for ScreenshotGuard {
+    fn drop(&mut self) {
+        let _ = flock(&self._file, FlockOperation::Unlock);
+    }
+}
+impl Drop for ConfigurationGuard {
     fn drop(&mut self) {
         let _ = flock(&self._file, FlockOperation::Unlock);
     }
