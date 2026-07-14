@@ -300,6 +300,68 @@ fn concurrent_expected_prior_revision_has_exactly_one_winner() -> Result<(), Box
 }
 
 #[test]
+fn stale_expected_prior_is_a_conflict_even_when_the_winner_has_a_later_timestamp()
+-> Result<(), Box<dyn Error>> {
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    common::seed_events(&root, &projector, &common::fixture_events("events.jsonl")?)?;
+    common::seed_chunks(&root, &projector)?;
+    let service = SharedService::open(root.clone(), sqlite)?;
+    service.install_grant(grant("artifact-stale-prior"))?;
+    let created = at("2026-07-13T09:08:00Z");
+    service.execute(
+        write_request(
+            "artifact-stale-prior-base-request",
+            "artifact-stale-prior",
+            revision(
+                "artifact-stale-prior-value",
+                "artifact-stale-prior-base",
+                None,
+                ArtifactStatus::Draft,
+                created,
+            ),
+        ),
+        created,
+    )?;
+
+    let winner_time = created + chrono::Duration::seconds(30);
+    service.execute(
+        write_request(
+            "artifact-stale-prior-winner-request",
+            "artifact-stale-prior",
+            revision(
+                "artifact-stale-prior-value",
+                "artifact-stale-prior-winner",
+                Some("artifact-stale-prior-base"),
+                ArtifactStatus::Accepted,
+                winner_time,
+            ),
+        ),
+        winner_time,
+    )?;
+
+    let stale_time = created + chrono::Duration::seconds(10);
+    assert!(matches!(
+        service.execute(
+            write_request(
+                "artifact-stale-prior-loser-request",
+                "artifact-stale-prior",
+                revision(
+                    "artifact-stale-prior-value",
+                    "artifact-stale-prior-loser",
+                    Some("artifact-stale-prior-base"),
+                    ArtifactStatus::Accepted,
+                    stale_time,
+                ),
+            ),
+            stale_time,
+        ),
+        Err(SharedServiceError::ArtifactConflict)
+    ));
+    assert_eq!(ArtifactStore::new(root, projector).scan_all()?.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn new_revision_rejects_wall_clock_regression_but_chain_order_remains_prior_linked()
 -> Result<(), Box<dyn Error>> {
     let (_temporary, root, sqlite, projector) = common::store()?;

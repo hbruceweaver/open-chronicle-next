@@ -303,6 +303,13 @@ impl SharedService {
             request.revision.created_at = now;
             if canonical_current
                 .as_ref()
+                .map(|current| &current.revision_id)
+                != request.revision.expected_prior_revision_id.as_ref()
+            {
+                return Err(SharedServiceError::ArtifactConflict);
+            }
+            if canonical_current
+                .as_ref()
                 .is_some_and(|current| current.created_at > request.revision.created_at)
             {
                 return Err(SharedServiceError::InvalidArtifactTransition);
