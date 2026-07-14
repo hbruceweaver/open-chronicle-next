@@ -4,13 +4,18 @@ Open Chronicle is a local-first macOS work-observability application. It turns p
 
 This repository is the productized successor to the original [`Screenata/open-chronicle`](https://github.com/Screenata/open-chronicle) proof of concept. It combines that project's SwiftUI product shell with the stronger evidence, privacy, health, and retention substrate proven in the Rust Chronicle implementation.
 
-The MVP is currently in planning and initial implementation.
+The MVP is under active staged implementation. Its versioned evidence store,
+five-minute factual engine, privacy-safe macOS capture pipeline, lifecycle/onboarding
+foundation, and grant-bounded MCP server are implemented and continuously tested;
+the report/timeline, integration setup, data-lifecycle UI, and distributable DMG
+remain in progress.
 
 ## Start here
 
 - [Product context](context.md)
 - [MVP product requirements](docs/PRD.md)
 - [Implementation plan](docs/plans/2026-07-13-001-feat-open-chronicle-mvp-plan.md)
+- [Local MCP contract](docs/mcp-contract.md)
 
 ## MVP boundary
 

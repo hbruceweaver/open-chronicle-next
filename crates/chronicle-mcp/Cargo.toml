@@ -20,11 +20,12 @@ schemars = "1.2.1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1.49.0", features = ["io-std", "macros", "rt-multi-thread"] }
+tokio = { version = "1.49.0", features = ["io-std", "macros", "rt-multi-thread", "time"] }
 uuid.workspace = true
 
 [dev-dependencies]
 chronicle-store = { path = "../chronicle-store" }
+rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-child-process"] }
 tempfile.workspace = true
 
 [lints]
