@@ -47,6 +47,24 @@ impl LockManager {
         lock_bounded(&file, true, self.timeout, "journal writer")?;
         Ok(JournalGuard { file })
     }
+
+    pub fn grant_receipts(&self) -> Result<GrantReceiptGuard> {
+        let file = self
+            .root
+            .open_file("locks/grant-receipts.lock", true, false, false)?;
+        lock_bounded(&file, true, self.timeout, "grant receipts")?;
+        Ok(GrantReceiptGuard { file })
+    }
+
+    /// Serializes a projection-changing operation with a multi-statement shared
+    /// service read so result, coverage, and provenance observe one stable state.
+    pub fn query_snapshot(&self) -> Result<QuerySnapshotGuard> {
+        let file = self
+            .root
+            .open_file("locks/query-snapshot.lock", true, false, false)?;
+        lock_bounded(&file, true, self.timeout, "query snapshot")?;
+        Ok(QuerySnapshotGuard { file })
+    }
 }
 
 #[derive(Debug)]
@@ -87,6 +105,16 @@ pub struct JournalGuard {
     file: File,
 }
 
+#[derive(Debug)]
+pub struct GrantReceiptGuard {
+    file: File,
+}
+
+#[derive(Debug)]
+pub struct QuerySnapshotGuard {
+    file: File,
+}
+
 fn lock_bounded(file: &File, exclusive: bool, timeout: Duration, label: &str) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -124,3 +152,5 @@ unlock_on_drop!(SharedStoreGuard);
 unlock_on_drop!(ExclusiveStoreGuard);
 unlock_on_drop!(ArtifactGuard);
 unlock_on_drop!(JournalGuard);
+unlock_on_drop!(GrantReceiptGuard);
+unlock_on_drop!(QuerySnapshotGuard);

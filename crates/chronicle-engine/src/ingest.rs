@@ -5,7 +5,8 @@ use chronicle_domain::{
     ObservationContent, ProjectionHealth,
 };
 use chronicle_store::{
-    CanonicalJournal, FaultInjector, FaultPoint, ManagedRoot, Projector, SqliteStore, StoreError,
+    CanonicalJournal, FaultInjector, FaultPoint, LockManager, ManagedRoot, Projector, SqliteStore,
+    StoreError,
 };
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -105,6 +106,7 @@ pub struct IngestEngine {
     chunker: ChunkerConfig,
     cadence: CadenceGuard,
     projection_lagging: bool,
+    locks: LockManager,
 }
 
 impl IngestEngine {
@@ -119,6 +121,7 @@ impl IngestEngine {
         let sqlite = SqliteStore::open(root.clone())?;
         AggregationReconciler::new(root.clone(), sqlite.clone(), chunker.clone())
             .reconcile_recovered_startup(now)?;
+        let locks = LockManager::new(root.clone(), std::time::Duration::from_secs(2));
         Ok(Self {
             journal,
             projector: Projector::new(sqlite.clone()),
@@ -127,6 +130,7 @@ impl IngestEngine {
             chunker,
             cadence: CadenceGuard::default(),
             projection_lagging: false,
+            locks,
         })
     }
 
@@ -144,6 +148,8 @@ impl IngestEngine {
         if self.projection_lagging {
             self.recover_projection()?;
         }
+        let store_guard = self.locks.shared_request()?;
+        let snapshot_guard = self.locks.query_snapshot()?;
         request.event.validate().map_err(EngineError::Aggregation)?;
         reject_transactional_event(&request.event)?;
         let event_value = serde_json::to_value(&request.event).map_err(StoreError::from)?;
@@ -205,6 +211,8 @@ impl IngestEngine {
                 aggregation: None,
             });
         }
+        drop(snapshot_guard);
+        drop(store_guard);
         let aggregation = match AggregationReconciler::new(
             self.root.clone(),
             self.sqlite.clone(),

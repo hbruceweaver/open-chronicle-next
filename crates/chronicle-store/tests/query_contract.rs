@@ -2,7 +2,7 @@ mod common;
 
 use std::error::Error;
 
-use chronicle_domain::{ChunkRevision, EventEnvelope, QueryResponse, UtcRange};
+use chronicle_domain::{ActivityFilter, ChunkRevision, EventEnvelope, QueryResponse, UtcRange};
 use chronicle_store::{CanonicalJournal, FaultInjector, StoreQueries};
 
 #[test]
@@ -67,6 +67,61 @@ fn query_projection_omits_managed_paths_and_can_redact_ocr_payload() -> Result<(
     response["result"]["data"]["events"][0]["payload"]["data"]["content"]["data"]["ocr"] =
         serde_json::Value::Null;
     QueryResponse::parse(&serde_json::to_string(&response)?)?;
+    Ok(())
+}
+
+#[test]
+fn shared_chunk_pages_apply_keyset_and_limit_before_materialization() -> Result<(), Box<dyn Error>>
+{
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    common::seed_canonical(&root, &projector)?;
+    let chunks = common::chunks()?;
+    let mut later = chunks.last().cloned().ok_or("chunk fixture missing")?;
+    let shift = chrono::Duration::minutes(5);
+    later.chunk_id = chronicle_domain::ChunkId::new("chunk-page-later")?;
+    later.revision_id = chronicle_domain::ChunkRevisionId::new("chunk-page-later-rev")?;
+    later.prior_revision_id = None;
+    later.supersedes_revision_id = None;
+    later.window.start += shift;
+    later.window.end += shift;
+    later.generated_at += shift;
+    later.input_digest = "chunk-page-later-input".to_owned();
+    for gap in &mut later.gaps {
+        gap.start += shift;
+        gap.end += shift;
+    }
+    for transition in &mut later.transitions {
+        transition.at += shift;
+    }
+    let record = CanonicalJournal::new(root).append_chunk(&later, FaultInjector::none())?;
+    projector.project_record(&record, FaultInjector::none())?;
+    let range = UtcRange {
+        start: chunks
+            .iter()
+            .map(|chunk| chunk.window.start)
+            .min()
+            .ok_or("chunk fixture missing")?,
+        end: chunks
+            .iter()
+            .map(|chunk| chunk.window.end)
+            .max()
+            .ok_or("chunk fixture missing")?
+            + shift,
+    };
+    let queries = StoreQueries::new(sqlite).snapshot()?;
+    let filter = ActivityFilter {
+        range,
+        application_bundle_id: None,
+        window_text: None,
+        authorized_domain: None,
+        evidence_states: Vec::new(),
+    };
+    let (first, truncated) = queries.current_chunk_page(&filter, None, 1)?;
+    assert_eq!(first.len(), 1);
+    assert!(truncated);
+    let (second, _) = queries.current_chunk_page(&filter, Some(first[0].chunk_id.as_str()), 1)?;
+    assert_eq!(second.len(), 1);
+    assert_ne!(first[0].chunk_id, second[0].chunk_id);
     Ok(())
 }
 

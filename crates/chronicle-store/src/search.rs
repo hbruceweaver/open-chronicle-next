@@ -25,12 +25,18 @@ pub struct SearchPage {
 
 #[derive(Clone, Debug)]
 pub struct ActivitySearch {
-    sqlite: SqliteStore,
+    queries: StoreQueries,
 }
 
 impl ActivitySearch {
     pub const fn new(sqlite: SqliteStore) -> Self {
-        Self { sqlite }
+        Self {
+            queries: StoreQueries::new(sqlite),
+        }
+    }
+
+    pub const fn from_queries(queries: StoreQueries) -> Self {
+        Self { queries }
     }
 
     pub fn search(
@@ -62,38 +68,38 @@ impl ActivitySearch {
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let connection = self.sqlite.connection()?;
-        let cursor_position = page
-            .cursor
-            .as_deref()
-            .map(|cursor| {
-                let projected: Option<(String, String)> = connection
-                    .query_row(
-                        "SELECT json_extract(body_json, '$.observed_at'), body_json
+        self.queries.with_connection(|connection| {
+            let cursor_position = page
+                .cursor
+                .as_deref()
+                .map(|cursor| {
+                    let projected: Option<(String, String)> = connection
+                        .query_row(
+                            "SELECT json_extract(body_json, '$.observed_at'), body_json
                          FROM events WHERE event_id=?1",
-                        [cursor],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                let (raw_observed_at, body) = projected.ok_or_else(|| {
-                    StoreError::InvalidPath("search cursor event is missing".to_owned())
-                })?;
-                EventEnvelope::parse(&body)?;
-                Ok::<_, StoreError>((raw_observed_at, cursor.to_owned()))
-            })
-            .transpose()?;
-        let (cursor_at, cursor_id) = cursor_position
-            .map(|(at, id)| (Some(at), Some(id)))
-            .unwrap_or((None, None));
-        let evidence_states = serde_json::to_string(&filter.evidence_states)?;
-        let evidence_state_count = i64::try_from(filter.evidence_states.len())
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let limit = usize::try_from(page.limit)
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let sql_limit =
-            i64::try_from(limit + 1).map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let mut statement = connection.prepare(
-            "SELECT events.body_json, ocr_fts.text
+                            [cursor],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    let (raw_observed_at, body) = projected.ok_or_else(|| {
+                        StoreError::InvalidPath("search cursor event is missing".to_owned())
+                    })?;
+                    EventEnvelope::parse(&body)?;
+                    Ok::<_, StoreError>((raw_observed_at, cursor.to_owned()))
+                })
+                .transpose()?;
+            let (cursor_at, cursor_id) = cursor_position
+                .map(|(at, id)| (Some(at), Some(id)))
+                .unwrap_or((None, None));
+            let evidence_states = serde_json::to_string(&filter.evidence_states)?;
+            let evidence_state_count = i64::try_from(filter.evidence_states.len())
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let limit = usize::try_from(page.limit)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let sql_limit = i64::try_from(limit + 1)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let mut statement = connection.prepare(
+                "SELECT events.body_json, ocr_fts.text
              FROM ocr_fts
              JOIN events ON events.event_id=ocr_fts.event_id
              JOIN observations ON observations.event_id=events.event_id
@@ -112,58 +118,58 @@ impl ActivitySearch {
                     OR observations.evidence_state IN (SELECT value FROM json_each(?10)))
              ORDER BY json_extract(events.body_json, '$.observed_at'), events.event_id
              LIMIT ?11",
-        )?;
-        let rows = statement.query_map(
-            params![
-                expression,
-                filter.range.start.to_rfc3339(),
-                filter.range.end.to_rfc3339(),
-                cursor_at,
-                cursor_id,
-                filter.application_bundle_id,
-                filter.window_text,
-                filter.authorized_domain,
-                evidence_state_count,
-                evidence_states,
-                sql_limit,
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?;
-        let candidates = rows
-            .map(|row| {
-                let (body, text) = row?;
-                Ok((EventEnvelope::parse(&body)?, text))
+            )?;
+            let rows = statement.query_map(
+                params![
+                    expression,
+                    filter.range.start.to_rfc3339(),
+                    filter.range.end.to_rfc3339(),
+                    cursor_at,
+                    cursor_id,
+                    filter.application_bundle_id,
+                    filter.window_text,
+                    filter.authorized_domain,
+                    evidence_state_count,
+                    evidence_states,
+                    sql_limit,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            let candidates = rows
+                .map(|row| {
+                    let (body, text) = row?;
+                    Ok((EventEnvelope::parse(&body)?, text))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let end = limit.min(candidates.len());
+            let truncated = end < candidates.len();
+            let next_cursor = if truncated {
+                candidates
+                    .get(end.saturating_sub(1))
+                    .map(|(event, _)| event.event_id.to_string())
+            } else {
+                None
+            };
+            let mut hits = Vec::with_capacity(end);
+            for (event, text) in &candidates[..end] {
+                let event = self
+                    .queries
+                    .query_event(connection, event.clone(), include_ocr)?;
+                hits.push(SearchHit {
+                    event,
+                    highlight_html: include_ocr.then(|| bounded_highlight(text, &tokens)),
+                });
+            }
+            let returned_items = u32::try_from(hits.len())
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            Ok(SearchPage {
+                hits,
+                page: PageInfo {
+                    next_cursor,
+                    returned_items,
+                    truncated,
+                },
             })
-            .collect::<Result<Vec<_>>>()?;
-        let end = limit.min(candidates.len());
-        let truncated = end < candidates.len();
-        let next_cursor = if truncated {
-            candidates
-                .get(end.saturating_sub(1))
-                .map(|(event, _)| event.event_id.to_string())
-        } else {
-            None
-        };
-        let queries = StoreQueries::new(self.sqlite.clone());
-        let mut hits = Vec::with_capacity(end);
-        for (event, text) in &candidates[..end] {
-            let event = queries
-                .event(&event.event_id, include_ocr)?
-                .ok_or_else(|| StoreError::SqliteIdentity("FTS event disappeared".to_owned()))?;
-            hits.push(SearchHit {
-                event,
-                highlight_html: include_ocr.then(|| bounded_highlight(text, &tokens)),
-            });
-        }
-        let returned_items = u32::try_from(hits.len())
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        Ok(SearchPage {
-            hits,
-            page: PageInfo {
-                next_cursor,
-                returned_items,
-                truncated,
-            },
         })
     }
 }

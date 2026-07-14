@@ -46,6 +46,7 @@ impl ArtifactStore {
         let shared = self.locks.shared_request()?;
         generation.ensure_current(&self.root)?;
         let _artifact = shared.artifact(revision.artifact_id.as_str())?;
+        let _snapshot = self.locks.query_snapshot()?;
         let directory = format!("derived/{}", revision.artifact_id);
         self.root.ensure_directory(&directory)?;
         let relative = format!("{directory}/{}.json", revision.revision_id);
@@ -138,6 +139,7 @@ impl ScreenshotStore {
     ) -> Result<()> {
         let _shared = self.locks.shared_request()?;
         self.generation.ensure_current(&self.root)?;
+        let _snapshot = self.locks.query_snapshot()?;
         if encoded_image.is_empty() || encoded_image.len() > 4 * 1024 * 1024 {
             return Err(StoreError::InvalidPath(
                 "encoded screenshot must be between 1 byte and 4 MiB".to_owned(),
@@ -215,6 +217,7 @@ impl ScreenshotStore {
     ) -> Result<()> {
         let _shared = self.locks.shared_request()?;
         self.generation.ensure_current(&self.root)?;
+        let _snapshot = self.locks.query_snapshot()?;
         let requested = match &request.payload {
             EventPayload::ScreenshotLifecycle(lifecycle)
                 if lifecycle.action == ScreenshotLifecycleAction::DeleteRequested =>

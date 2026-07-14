@@ -1,8 +1,9 @@
 use chronicle_domain::{
-    ChunkRevision, DerivedArtifactRevision, EventEnvelope, EventPayload, ObservationContent,
-    ScreenshotLifecycle, ScreenshotLifecycleAction, ScreenshotProjectedState,
+    ChunkRevision, DerivedArtifactRevision, EventEnvelope, EventPayload, EvidenceState,
+    ObservationContent, OcrState, ScreenshotLifecycle, ScreenshotLifecycleAction,
+    ScreenshotProjectedState,
 };
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
@@ -163,6 +164,12 @@ fn project_event(
         ],
     )?;
     faults.check(FaultPoint::AfterRowInsert)?;
+    insert_health_fact(
+        transaction,
+        "event-projected",
+        event.event_id.as_str(),
+        event.recorded_at,
+    )?;
     match &event.payload {
         EventPayload::ObservationAttempt(attempt) => {
             let scheduled_at = event.scheduled_at.ok_or_else(|| {
@@ -170,6 +177,34 @@ fn project_event(
                     "projected observation attempt has no scheduled_at".to_owned(),
                 )
             })?;
+            insert_health_fact(
+                transaction,
+                "scheduled-attempt",
+                event.event_id.as_str(),
+                scheduled_at,
+            )?;
+            if matches!(
+                attempt.evidence_state,
+                EvidenceState::CapturedNew | EvidenceState::CapturedUnchanged
+            ) {
+                insert_health_fact(
+                    transaction,
+                    "successful-capture",
+                    event.event_id.as_str(),
+                    event.observed_at,
+                )?;
+            }
+            if matches!(
+                attempt.ocr_state,
+                OcrState::Complete | OcrState::Empty | OcrState::Partial
+            ) {
+                insert_health_fact(
+                    transaction,
+                    "successful-ocr",
+                    event.event_id.as_str(),
+                    event.observed_at,
+                )?;
+            }
             mark_pending_bucket(
                 transaction,
                 &event.device_id,
@@ -465,6 +500,12 @@ fn project_chunk(
         ],
     )?;
     faults.check(FaultPoint::AfterRowInsert)?;
+    insert_health_fact(
+        transaction,
+        "chunk-projected",
+        chunk.revision_id.as_str(),
+        chunk.generated_at,
+    )?;
     for (ordinal, event_id) in chunk.supporting_event_ids.iter().enumerate() {
         let ordinal = i64::try_from(ordinal)
             .map_err(|_| StoreError::InvalidPath("chunk evidence ordinal overflow".to_owned()))?;
@@ -548,6 +589,27 @@ fn project_chunk(
             ],
         )?;
     }
+    Ok(())
+}
+
+fn insert_health_fact(
+    transaction: &Transaction<'_>,
+    fact_type: &str,
+    stable_id: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO health_operation_facts(
+             fact_type, stable_id, occurred_at, occurred_epoch, occurred_subsec_nanos)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![
+            fact_type,
+            stable_id,
+            occurred_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            occurred_at.timestamp(),
+            occurred_at.timestamp_subsec_nanos(),
+        ],
+    )?;
     Ok(())
 }
 

@@ -144,6 +144,7 @@ impl QueryRequest {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        crate::validate_schema_version(&self.schema_version)?;
         if self.store_generation == 0 {
             return Err("query request requires a nonzero store generation".to_owned());
         }
@@ -1057,6 +1058,7 @@ impl QueryResponse {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        crate::validate_schema_version(&self.schema_version)?;
         if self.store_generation == 0
             || self.grant.store_generation != self.store_generation
             || self.grant.remaining_cumulative_bytes > self.grant.limits.max_cumulative_bytes

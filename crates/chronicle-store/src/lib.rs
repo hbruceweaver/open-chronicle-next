@@ -3,12 +3,14 @@
 pub mod artifacts;
 pub mod checksum;
 pub mod generation;
+pub mod health;
 pub mod journal;
 pub mod layout;
 pub mod locks;
 pub mod permissions;
 pub mod projection;
 pub mod queries;
+pub mod receipts;
 pub mod recovery;
 pub mod search;
 pub mod sqlite;
@@ -24,11 +26,13 @@ use thiserror::Error;
 
 pub use artifacts::*;
 pub use generation::*;
+pub use health::*;
 pub use journal::*;
 pub use layout::*;
 pub use locks::*;
 pub use projection::*;
 pub use queries::*;
+pub use receipts::*;
 pub use recovery::*;
 pub use search::*;
 pub use sqlite::*;
@@ -62,6 +66,20 @@ pub enum StoreError {
     StableIdConflict { id: String },
     #[error("artifact expected prior revision conflict")]
     ArtifactConflict,
+    #[error("disclosure grant already exists")]
+    GrantAlreadyExists,
+    #[error("disclosure grant was not found")]
+    GrantNotFound,
+    #[error("disclosure grant belongs to another client")]
+    GrantClientMismatch,
+    #[error("disclosure grant is inactive")]
+    GrantInactive,
+    #[error("disclosure cursor was not found or expired")]
+    CursorNotFound,
+    #[error("disclosure cursor does not match this query scope")]
+    CursorScopeMismatch,
+    #[error("disclosure response exceeds its byte budget")]
+    DisclosureByteLimit,
     #[error("store handle is stale; expected generation {expected}, found {actual}")]
     StaleGeneration { expected: u64, actual: u64 },
     #[error("runtime SQLite identity mismatch: {0}")]

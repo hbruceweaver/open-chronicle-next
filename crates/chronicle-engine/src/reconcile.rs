@@ -1,7 +1,7 @@
 use chronicle_domain::ChunkRevisionId;
 use chronicle_store::{
-    CanonicalJournal, FaultInjector, ManagedRoot, Projector, RecoveryManager, SqliteStore,
-    StoreGeneration, StoreQueries,
+    CanonicalJournal, FaultInjector, LockManager, ManagedRoot, Projector, RecoveryManager,
+    SqliteStore, StoreGeneration, StoreQueries,
 };
 use chrono::{DateTime, Utc};
 
@@ -58,6 +58,9 @@ impl AggregationReconciler {
         now: DateTime<Utc>,
         faults: FaultInjector,
     ) -> Result<ReconcileReport> {
+        let locks = LockManager::new(self.root.clone(), std::time::Duration::from_secs(2));
+        let _store_guard = locks.shared_request()?;
+        let _snapshot_guard = locks.query_snapshot()?;
         self.config.validate()?;
         let queries = StoreQueries::new(self.sqlite.clone());
         let generation = StoreGeneration::load(&self.root)?;

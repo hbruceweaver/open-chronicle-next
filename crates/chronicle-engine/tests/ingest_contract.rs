@@ -5,7 +5,8 @@ use std::error::Error;
 use chronicle_domain::{DurableAcknowledgement, ProjectionHealth, UtcRange};
 use chronicle_engine::{CadenceStamp, ChunkerConfig, IngestEngine, IngestRequest};
 use chronicle_store::{
-    CanonicalJournal, FaultInjector, FaultPoint, JournalFamily, SqliteStore, StoreQueries,
+    CanonicalJournal, FaultInjector, FaultPoint, JournalFamily, LockManager, SqliteStore,
+    StoreQueries,
 };
 use chrono::{DateTime, Utc};
 
@@ -82,6 +83,84 @@ fn ingest_is_journal_first_and_finalizes_only_after_boundary_plus_cadence()
     })?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].evidence_seconds.captured, 300);
+    Ok(())
+}
+
+#[test]
+fn ingest_waits_for_an_active_shared_service_snapshot() -> Result<(), Box<dyn Error>> {
+    let (_temporary, root, _, _) = common::store()?;
+    let event = common::fixture_events("ae4-ten-scheduled-events.jsonl")?
+        .into_iter()
+        .next()
+        .ok_or("fixture empty")?;
+    let mut engine = IngestEngine::open(
+        root.clone(),
+        ChunkerConfig {
+            aggregator_version: "query-snapshot-serialization-1".to_owned(),
+            max_cadence_seconds: 30,
+        },
+    )?;
+    let snapshot = LockManager::new(root, std::time::Duration::from_secs(2)).query_snapshot()?;
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let now = event.recorded_at;
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("signal ingest start");
+        let result = engine.ingest(
+            IngestRequest {
+                event,
+                cadence: cadence("query-snapshot", 1),
+            },
+            now,
+        );
+        result_tx.send(result).expect("send ingest result");
+    });
+    started_rx.recv()?;
+    assert!(matches!(
+        result_rx.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(snapshot);
+    let outcome = result_rx.recv_timeout(std::time::Duration::from_secs(2))??;
+    assert_eq!(outcome.acknowledgement, DurableAcknowledgement::Durable);
+    worker.join().map_err(|_| "ingest thread panicked")?;
+    Ok(())
+}
+
+#[test]
+fn sqlite_read_snapshot_stays_stable_without_blocking_capture() -> Result<(), Box<dyn Error>> {
+    let (_temporary, root, _, _) = common::store()?;
+    let event = common::fixture_events("ae4-ten-scheduled-events.jsonl")?
+        .into_iter()
+        .next()
+        .ok_or("fixture empty")?;
+    let mut engine = IngestEngine::open(
+        root.clone(),
+        ChunkerConfig {
+            aggregator_version: "sqlite-snapshot-capture-1".to_owned(),
+            max_cadence_seconds: 30,
+        },
+    )?;
+    let snapshot = StoreQueries::new(SqliteStore::open(root.clone())?).snapshot()?;
+    assert!(snapshot.event(&event.event_id, false)?.is_none());
+    let outcome = engine.ingest(
+        IngestRequest {
+            event: event.clone(),
+            cadence: cadence("sqlite-snapshot", 1),
+        },
+        event.recorded_at,
+    )?;
+    assert_eq!(outcome.acknowledgement, DurableAcknowledgement::Durable);
+    assert!(
+        snapshot.event(&event.event_id, false)?.is_none(),
+        "pinned read snapshot changed after concurrent capture"
+    );
+    assert!(
+        StoreQueries::new(SqliteStore::open(root)?)
+            .event(&event.event_id, false)?
+            .is_some(),
+        "fresh reader did not see captured event"
+    );
     Ok(())
 }
 

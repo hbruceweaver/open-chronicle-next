@@ -1,7 +1,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ClientId, ContractError, GrantId, ReceiptId, parse_versioned};
+use crate::{
+    ClientId, ContractError, GrantId, ReceiptId, parse_versioned, validate_schema_version,
+};
+
+pub const MAX_DISCLOSURE_PAGE_ITEMS: u32 = 100;
+pub const MAX_DISCLOSURE_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_DISCLOSURE_CUMULATIVE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -108,6 +114,7 @@ impl DisclosureGrant {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        validate_schema_version(&self.schema_version)?;
         if self.created_at >= self.expires_at {
             return Err("grant expiry must follow creation".to_owned());
         }
@@ -123,8 +130,11 @@ impl DisclosureGrant {
             }
         }
         if self.limits.max_page_items == 0
+            || self.limits.max_page_items > MAX_DISCLOSURE_PAGE_ITEMS
             || self.limits.max_response_bytes == 0
+            || self.limits.max_response_bytes > MAX_DISCLOSURE_RESPONSE_BYTES
             || self.limits.max_cumulative_bytes < self.limits.max_response_bytes
+            || self.limits.max_cumulative_bytes > MAX_DISCLOSURE_CUMULATIVE_BYTES
             || self.disclosed_bytes > self.limits.max_cumulative_bytes
         {
             return Err("grant disclosure limits are inconsistent".to_owned());

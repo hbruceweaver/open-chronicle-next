@@ -4,6 +4,7 @@
 //! Storage, capture, projection, and transport code depend on this crate, never the
 //! other way around.
 
+pub mod api;
 pub mod artifact;
 pub mod chunk;
 pub mod config;
@@ -16,6 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 
+pub use api::*;
 pub use artifact::*;
 pub use chunk::*;
 pub use config::*;
@@ -71,4 +73,26 @@ pub fn parse_versioned<T: DeserializeOwned>(json: &str) -> Result<T, ContractErr
         });
     }
     serde_json::from_value(value).map_err(|error| ContractError::InvalidJson(error.to_string()))
+}
+
+pub fn validate_schema_version(version: &str) -> Result<(), String> {
+    let mut parts = version.split('.');
+    let major = parts
+        .next()
+        .and_then(|part| part.parse::<u16>().ok())
+        .ok_or_else(|| "schema version must contain numeric major and minor parts".to_owned())?;
+    let valid_minor = parts
+        .next()
+        .and_then(|part| part.parse::<u16>().ok())
+        .is_some()
+        && parts.next().is_none();
+    if !valid_minor {
+        return Err("schema version must contain numeric major and minor parts".to_owned());
+    }
+    if major != CONTRACT_MAJOR_VERSION {
+        return Err(format!(
+            "unsupported contract major version {major}; expected {CONTRACT_MAJOR_VERSION}"
+        ));
+    }
+    Ok(())
 }

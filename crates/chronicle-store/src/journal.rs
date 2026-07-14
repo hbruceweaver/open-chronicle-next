@@ -15,7 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::checksum::{canonical_json, checksum_bytes};
-use crate::{FaultInjector, FaultPoint, LockManager, ManagedRoot, Result, StoreError};
+use crate::{FaultInjector, FaultPoint, LockManager, ManagedRoot, Result, SqliteStore, StoreError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JournalFamily {
@@ -274,6 +274,93 @@ impl CanonicalJournal {
         let _writer =
             LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
         self.scan_all_locked(family, repair_partial)
+    }
+
+    /// Returns canonical records that are durable beyond the projection cursor.
+    /// This path enumerates shard metadata but reads only bytes after each
+    /// durable cursor; it never clones or scans the historical record index.
+    pub fn unprojected_records(
+        &self,
+        family: JournalFamily,
+        sqlite: &SqliteStore,
+    ) -> Result<Vec<VerifiedRecord>> {
+        let _writer =
+            LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
+        let mut shards = Vec::new();
+        for entry in std::fs::read_dir(self.root.path().join(family.directory()))? {
+            let name = entry?.file_name().into_string().map_err(|_| {
+                StoreError::InvalidPath("journal shard name is not valid UTF-8".to_owned())
+            })?;
+            if name.ends_with(".jsonl") {
+                validate_shard_name(&name)?;
+                shards.push(name);
+            }
+        }
+        shards.sort();
+        reject_multiple_active_shards(&shards)?;
+        let cursors = sqlite.projection_cursors(family)?;
+        let mut records = Vec::new();
+        for shard in shards {
+            let cursor = cursors.get(&shard).copied().unwrap_or_default();
+            let relative = format!("{}/{shard}", family.directory());
+            let size = self
+                .root
+                .open_file(&relative, false, false, false)?
+                .metadata()?
+                .len();
+            if cursor > size {
+                return Err(StoreError::SqliteIdentity(format!(
+                    "projection cursor exceeds canonical shard {shard}"
+                )));
+            }
+            if cursor < size {
+                records.extend(self.scan_shard_tail(family, &shard, cursor)?);
+            }
+        }
+        Ok(records)
+    }
+
+    fn scan_shard_tail(
+        &self,
+        family: JournalFamily,
+        shard: &str,
+        start_offset: u64,
+    ) -> Result<Vec<VerifiedRecord>> {
+        let relative = format!("{}/{shard}", family.directory());
+        let mut file = self.root.open_file(&relative, false, false, false)?;
+        file.seek(SeekFrom::Start(start_offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            return Err(StoreError::RepairIncomplete(format!(
+                "journal shard {shard} has an incomplete unprojected tail"
+            )));
+        }
+        let mut offset = start_offset;
+        let mut records = Vec::new();
+        for complete_line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if complete_line.is_empty() {
+                continue;
+            }
+            let line = &complete_line[..complete_line.len().saturating_sub(1)];
+            if line.is_empty() {
+                return Err(StoreError::CorruptRecord {
+                    shard: shard.to_owned(),
+                    offset,
+                    reason: "empty complete line".to_owned(),
+                });
+            }
+            let end_offset = offset
+                .checked_add(u64::try_from(complete_line.len()).map_err(|_| {
+                    StoreError::InvalidPath("journal tail exceeds supported length".to_owned())
+                })?)
+                .ok_or_else(|| StoreError::InvalidPath("journal offset overflow".to_owned()))?;
+            records.push(parse_verified_line(
+                family, shard, offset, end_offset, line,
+            )?);
+            offset = end_offset;
+        }
+        Ok(records)
     }
 
     fn scan_all_locked(&self, family: JournalFamily, repair_partial: bool) -> Result<ScanReport> {

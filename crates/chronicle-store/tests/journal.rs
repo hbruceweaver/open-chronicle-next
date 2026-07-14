@@ -135,6 +135,43 @@ fn steady_state_append_does_not_enumerate_growing_historical_shards() -> chronic
 }
 
 #[test]
+fn projection_health_reads_only_unprojected_shard_tails() -> chronicle_store::Result<()> {
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    let journal = CanonicalJournal::new(root.clone());
+    let base = common::events()?.remove(2);
+    for day in 0_i64..64 {
+        let mut event = base.clone();
+        event.event_id = chronicle_domain::EventId::new(format!("evt-health-history-{day:03}"))
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        let shift = chrono::Duration::days(day);
+        event.scheduled_at = event.scheduled_at.map(|value| value + shift);
+        event.observed_at += shift;
+        event.recorded_at += shift;
+        let record = journal.append_event(&event, FaultInjector::none())?;
+        projector.project_record(&record, FaultInjector::none())?;
+    }
+    let scans_before = journal.index_full_scan_count(JournalFamily::Events);
+    let mut pending = base;
+    pending.event_id = chronicle_domain::EventId::new("evt-health-pending")
+        .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+    let shift = chrono::Duration::days(64);
+    pending.scheduled_at = pending.scheduled_at.map(|value| value + shift);
+    pending.observed_at += shift;
+    pending.recorded_at += shift;
+    journal.append_event(&pending, FaultInjector::none())?;
+
+    let unprojected = journal.unprojected_records(JournalFamily::Events, &sqlite)?;
+    assert_eq!(unprojected.len(), 1);
+    assert_eq!(unprojected[0].stable_id(), pending.event_id.as_str());
+    assert_eq!(
+        journal.index_full_scan_count(JournalFamily::Events),
+        scans_before,
+        "health lag detection must not rescan historical records"
+    );
+    Ok(())
+}
+
+#[test]
 fn cross_process_manifest_tail_detects_conflict_without_directory_scan()
 -> chronicle_store::Result<()> {
     let temporary = tempfile::tempdir()?;

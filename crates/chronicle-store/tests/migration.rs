@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use chronicle_store::{ManagedRoot, SqliteStore};
 
 #[test]
-fn committed_v1_database_migrates_to_v2_without_reset() -> Result<(), Box<dyn Error>> {
+fn committed_v2_database_migrates_to_v3_with_indexed_health_facts() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = ManagedRoot::initialize(temporary.path().join("store"))?;
     let path = root.path().join("index.sqlite3");
@@ -26,6 +26,11 @@ fn committed_v1_database_migrates_to_v2_without_reset() -> Result<(), Box<dyn Er
                 '2026-07-13T09:00:16Z', ?1)",
         [body],
     )?;
+    connection.execute_batch(include_str!("../migrations/0002_aggregation_index.sql"))?;
+    connection.execute(
+        "UPDATE schema_versions SET version=2, build_id='v2-test' WHERE component='store'",
+        [],
+    )?;
     drop(connection);
     let mut permissions = std::fs::metadata(&path)?.permissions();
     permissions.set_mode(0o600);
@@ -35,13 +40,13 @@ fn committed_v1_database_migrates_to_v2_without_reset() -> Result<(), Box<dyn Er
     let connection = store.connection()?;
     let user_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(user_version, 2);
+    assert_eq!(user_version, 3);
     let schema_version: i64 = connection.query_row(
         "SELECT version FROM schema_versions WHERE component='store'",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(schema_version, 2);
+    assert_eq!(schema_version, 3);
     let preserved: i64 = connection.query_row(
         "SELECT count(*) FROM events WHERE event_id='ae4-evt-01'",
         [],
@@ -71,5 +76,27 @@ fn committed_v1_database_migrates_to_v2_without_reset() -> Result<(), Box<dyn Er
         |row| row.get(0),
     )?;
     assert_eq!(membership, 1);
+    let health_facts: i64 = connection.query_row(
+        "SELECT count(*) FROM health_operation_facts WHERE stable_id='ae4-evt-01'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(health_facts, 3);
+    let mut plan = connection.prepare(
+        "EXPLAIN QUERY PLAN
+         SELECT occurred_at FROM health_operation_facts
+         WHERE fact_type='scheduled-attempt'
+           AND (occurred_epoch, occurred_subsec_nanos) <= (unixepoch('now'), 999999999)
+         ORDER BY occurred_epoch DESC, occurred_subsec_nanos DESC, stable_id DESC LIMIT 1",
+    )?;
+    let details = plan
+        .query_map([], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("health_operation_facts_latest")),
+        "latest health lookup did not use its bounded index: {details:?}"
+    );
     Ok(())
 }

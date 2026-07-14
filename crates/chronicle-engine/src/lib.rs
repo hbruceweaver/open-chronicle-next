@@ -7,11 +7,15 @@ pub mod coverage;
 pub mod duration;
 pub mod health;
 pub mod ingest;
+pub mod policy;
 pub mod reconcile;
+pub mod service;
 
 pub use chunker::*;
 pub use coverage::*;
 pub use duration::*;
 pub use health::*;
 pub use ingest::*;
+pub use policy::*;
 pub use reconcile::*;
+pub use service::*;

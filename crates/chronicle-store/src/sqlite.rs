@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use chronicle_domain::{ChunkRevision, EventEnvelope, EventPayload, EvidenceState, OcrState};
+use chrono::{DateTime, SecondsFormat, Utc};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::checksum::checksum_bytes;
@@ -36,8 +40,8 @@ impl SqliteStore {
             file_name: file_name.to_owned(),
             generation,
         };
-        let connection = store.open_connection()?;
-        store.migrate(&connection)?;
+        let mut connection = store.open_connection()?;
+        store.migrate(&mut connection)?;
         drop(connection);
         let file = store
             .root
@@ -58,7 +62,7 @@ impl SqliteStore {
             .optional()?;
         let user_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if identity != Some((2, STORE_BUILD_ID.to_owned())) || user_version != 2 {
+        if identity != Some((3, STORE_BUILD_ID.to_owned())) || user_version != 3 {
             return Err(StoreError::SqliteIdentity(
                 "projection migration/build identity mismatch".to_owned(),
             ));
@@ -222,6 +226,25 @@ impl SqliteStore {
         })
     }
 
+    pub fn projection_cursors(&self, family: JournalFamily) -> Result<HashMap<String, u64>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT shard, byte_offset FROM projection_cursors WHERE family=?1")?;
+        let rows = statement.query_map([family.cursor_name()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (shard, cursor) = row?;
+            let cursor = u64::try_from(cursor).map_err(|_| {
+                StoreError::SqliteIdentity(
+                    "projection cursor is outside the supported range".to_owned(),
+                )
+            })?;
+            Ok((shard, cursor))
+        })
+        .collect()
+    }
+
     pub fn event_checksum(&self, event_id: &chronicle_domain::EventId) -> Result<Option<String>> {
         let connection = self.connection()?;
         Ok(connection
@@ -246,7 +269,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn migrate(&self, connection: &Connection) -> Result<()> {
+    fn migrate(&self, connection: &mut Connection) -> Result<()> {
         let mut user_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if user_version == 0 {
@@ -257,13 +280,24 @@ impl SqliteStore {
             connection.execute_batch(include_str!("../migrations/0002_aggregation_index.sql"))?;
             user_version = 2;
         }
-        if user_version != 2 {
+        if user_version == 2 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!(
+                "../migrations/0003_health_operation_facts.sql"
+            ))?;
+            backfill_health_operation_facts(&transaction)?;
+            transaction.pragma_update(None, "user_version", 3)?;
+            transaction.commit()?;
+            user_version = 3;
+        }
+        if user_version != 3 {
             return Err(StoreError::SqliteIdentity(format!(
                 "unsupported projection schema version {user_version}"
             )));
         }
         connection.execute(
-            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 2, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
+            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 3, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
             [STORE_BUILD_ID],
         )?;
         let generation_number = i64::try_from(self.generation.generation).map_err(|_| {
@@ -275,6 +309,97 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+}
+
+fn backfill_health_operation_facts(transaction: &Transaction<'_>) -> Result<()> {
+    {
+        let mut statement =
+            transaction.prepare("SELECT body_json FROM events ORDER BY event_id")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let body = row.get::<_, String>(0)?;
+            let event = EventEnvelope::parse(&body)?;
+            insert_health_operation_fact(
+                transaction,
+                "event-projected",
+                event.event_id.as_str(),
+                event.recorded_at,
+            )?;
+            if let EventPayload::ObservationAttempt(attempt) = event.payload {
+                let scheduled_at = event.scheduled_at.ok_or_else(|| {
+                    StoreError::SqliteIdentity(
+                        "projected observation attempt has no scheduled_at".to_owned(),
+                    )
+                })?;
+                insert_health_operation_fact(
+                    transaction,
+                    "scheduled-attempt",
+                    event.event_id.as_str(),
+                    scheduled_at,
+                )?;
+                if matches!(
+                    attempt.evidence_state,
+                    EvidenceState::CapturedNew | EvidenceState::CapturedUnchanged
+                ) {
+                    insert_health_operation_fact(
+                        transaction,
+                        "successful-capture",
+                        event.event_id.as_str(),
+                        event.observed_at,
+                    )?;
+                }
+                if matches!(
+                    attempt.ocr_state,
+                    OcrState::Complete | OcrState::Empty | OcrState::Partial
+                ) {
+                    insert_health_operation_fact(
+                        transaction,
+                        "successful-ocr",
+                        event.event_id.as_str(),
+                        event.observed_at,
+                    )?;
+                }
+            }
+        }
+    }
+
+    {
+        let mut statement =
+            transaction.prepare("SELECT body_json FROM chunk_revisions ORDER BY revision_id")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let body = row.get::<_, String>(0)?;
+            let chunk = ChunkRevision::parse(&body)?;
+            insert_health_operation_fact(
+                transaction,
+                "chunk-projected",
+                chunk.revision_id.as_str(),
+                chunk.generated_at,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_health_operation_fact(
+    transaction: &Transaction<'_>,
+    fact_type: &str,
+    stable_id: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO health_operation_facts(
+             fact_type, stable_id, occurred_at, occurred_epoch, occurred_subsec_nanos)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![
+            fact_type,
+            stable_id,
+            occurred_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            occurred_at.timestamp(),
+            occurred_at.timestamp_subsec_nanos(),
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +449,10 @@ fn projection_digest(connection: &Connection) -> Result<String> {
         ("SELECT * FROM projection_cursors ORDER BY family, shard", 3),
         ("SELECT * FROM events ORDER BY event_id", 5),
         ("SELECT * FROM observations ORDER BY event_id", 11),
+        (
+            "SELECT * FROM health_operation_facts ORDER BY fact_type, stable_id",
+            5,
+        ),
         (
             "SELECT event_id, text FROM ocr_fts ORDER BY event_id, text",
             2,

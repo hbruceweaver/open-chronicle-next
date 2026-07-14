@@ -4,13 +4,14 @@ use chronicle_domain::{
     QueryObservationContent, ScreenshotProjectedState, UtcRange,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Result, SqliteStore, StoreError};
 
 const MAX_EVENT_ROWS: usize = 100_000;
 const MAX_CHUNK_ROWS: usize = 105_408;
 const MAX_SUPPORTING_EVENTS: usize = 1_000;
+const MAX_SHARED_PAGE_ITEMS: u32 = 100;
 const AGGREGATION_BATCH_SIZE: usize = 1_024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,34 +26,80 @@ pub struct PendingAggregationBucket {
 /// the source of every returned fact; SQL is only an index and selection layer.
 #[derive(Clone, Debug)]
 pub struct StoreQueries {
-    sqlite: SqliteStore,
+    source: QuerySource,
+}
+
+#[derive(Clone, Debug)]
+enum QuerySource {
+    Store(SqliteStore),
+    Snapshot(Arc<Mutex<Connection>>),
 }
 
 impl StoreQueries {
     pub const fn new(sqlite: SqliteStore) -> Self {
-        Self { sqlite }
+        Self {
+            source: QuerySource::Store(sqlite),
+        }
+    }
+
+    /// Pins all reads from this clone family to one SQLite WAL snapshot. The
+    /// snapshot does not block projection writers and is released when the last
+    /// clone drops.
+    pub fn snapshot(&self) -> Result<Self> {
+        match &self.source {
+            QuerySource::Snapshot(_) => Ok(self.clone()),
+            QuerySource::Store(sqlite) => {
+                let connection = sqlite.connection()?;
+                connection.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+                let _: i64 =
+                    connection
+                        .query_row("SELECT count(*) FROM schema_versions", [], |row| row.get(0))?;
+                Ok(Self {
+                    source: QuerySource::Snapshot(Arc::new(Mutex::new(connection))),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        match &self.source {
+            QuerySource::Store(sqlite) => {
+                let connection = sqlite.connection()?;
+                operation(&connection)
+            }
+            QuerySource::Snapshot(connection) => {
+                let connection = connection
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                operation(&connection)
+            }
+        }
     }
 
     pub fn event(&self, event_id: &EventId, include_ocr: bool) -> Result<Option<QueryEvent>> {
-        let connection = self.sqlite.connection()?;
-        let body: Option<String> = connection
-            .query_row(
-                "SELECT body_json FROM events WHERE event_id=?1",
-                [event_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        body.map(|body| self.query_event_from_json(&connection, &body, include_ocr))
-            .transpose()
+        self.with_connection(|connection| {
+            let body: Option<String> = connection
+                .query_row(
+                    "SELECT body_json FROM events WHERE event_id=?1",
+                    [event_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            body.map(|body| self.query_event_from_json(connection, &body, include_ocr))
+                .transpose()
+        })
     }
 
     pub fn events_in_range(&self, range: &UtcRange) -> Result<Vec<EventEnvelope>> {
         range
             .validate()
             .map_err(|reason| StoreError::InvalidPath(reason.to_owned()))?;
-        let connection = self.sqlite.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT body_json FROM events
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT body_json FROM events
              WHERE (json_extract(body_json, '$.observed_at') >= ?1
                     AND json_extract(body_json, '$.observed_at') < ?2)
                 OR (kind='recording-gap'
@@ -60,22 +107,23 @@ impl StoreQueries {
                     AND json_extract(body_json, '$.payload.data.end') > ?1)
              ORDER BY json_extract(body_json, '$.observed_at'), event_id
              LIMIT ?3",
-        )?;
-        let limit = i64::try_from(MAX_EVENT_ROWS + 1)
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let rows = statement.query_map(
-            params![range.start.to_rfc3339(), range.end.to_rfc3339(), limit],
-            |row| row.get::<_, String>(0),
-        )?;
-        let events = rows
-            .map(|row| EventEnvelope::parse(&row?).map_err(StoreError::from))
-            .collect::<Result<Vec<_>>>()?;
-        if events.len() > MAX_EVENT_ROWS {
-            return Err(StoreError::InvalidPath(
-                "event range exceeds the bounded query row limit".to_owned(),
-            ));
-        }
-        Ok(events)
+            )?;
+            let limit = i64::try_from(MAX_EVENT_ROWS + 1)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let rows = statement.query_map(
+                params![range.start.to_rfc3339(), range.end.to_rfc3339(), limit],
+                |row| row.get::<_, String>(0),
+            )?;
+            let events = rows
+                .map(|row| EventEnvelope::parse(&row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>>>()?;
+            if events.len() > MAX_EVENT_ROWS {
+                return Err(StoreError::InvalidPath(
+                    "event range exceeds the bounded query row limit".to_owned(),
+                ));
+            }
+            Ok(events)
+        })
     }
 
     pub fn aggregation_events_for_bucket(
@@ -83,30 +131,31 @@ impl StoreQueries {
         device_id: &DeviceId,
         bucket_start: DateTime<Utc>,
     ) -> Result<Vec<EventEnvelope>> {
-        let connection = self.sqlite.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT events.body_json
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT events.body_json
              FROM aggregation_bucket_events membership
              JOIN events ON events.event_id=membership.event_id
              WHERE membership.device_id=?1 AND membership.bucket_start=?2
              ORDER BY json_extract(events.body_json, '$.observed_at'), events.event_id
              LIMIT ?3",
-        )?;
-        let limit = i64::try_from(MAX_EVENT_ROWS + 1)
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let rows = statement.query_map(
-            params![device_id.as_str(), bucket_start.to_rfc3339(), limit],
-            |row| row.get::<_, String>(0),
-        )?;
-        let events = rows
-            .map(|row| EventEnvelope::parse(&row?).map_err(StoreError::from))
-            .collect::<Result<Vec<_>>>()?;
-        if events.len() > MAX_EVENT_ROWS {
-            return Err(StoreError::InvalidPath(
-                "aggregation bucket exceeds the bounded event row limit".to_owned(),
-            ));
-        }
-        Ok(events)
+            )?;
+            let limit = i64::try_from(MAX_EVENT_ROWS + 1)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let rows = statement.query_map(
+                params![device_id.as_str(), bucket_start.to_rfc3339(), limit],
+                |row| row.get::<_, String>(0),
+            )?;
+            let events = rows
+                .map(|row| EventEnvelope::parse(&row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>>>()?;
+            if events.len() > MAX_EVENT_ROWS {
+                return Err(StoreError::InvalidPath(
+                    "aggregation bucket exceeds the bounded event row limit".to_owned(),
+                ));
+            }
+            Ok(events)
+        })
     }
 
     pub fn filtered_events(
@@ -115,58 +164,192 @@ impl StoreQueries {
         include_ocr: bool,
     ) -> Result<Vec<QueryEvent>> {
         let events = self.events_in_range(&filter.range)?;
-        let connection = self.sqlite.connection()?;
-        events
-            .into_iter()
-            .filter(|event| event_matches_filter(event, filter))
-            .map(|event| self.query_event(&connection, event, include_ocr))
-            .collect()
+        self.with_connection(|connection| {
+            events
+                .into_iter()
+                .filter(|event| event_matches_filter(event, filter))
+                .map(|event| self.query_event(connection, event, include_ocr))
+                .collect()
+        })
     }
 
     pub fn current_chunk(&self, chunk_id: &ChunkId) -> Result<Option<ChunkRevision>> {
-        let connection = self.sqlite.connection()?;
-        let body: Option<String> = connection
-            .query_row(
-                "SELECT revision.body_json
+        self.with_connection(|connection| {
+            let body: Option<String> = connection
+                .query_row(
+                    "SELECT revision.body_json
                  FROM current_chunks current
                  JOIN chunk_revisions revision ON revision.revision_id=current.revision_id
                  WHERE current.chunk_id=?1",
-                [chunk_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        body.map(|body| ChunkRevision::parse(&body).map_err(StoreError::from))
-            .transpose()
+                    [chunk_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            body.map(|body| ChunkRevision::parse(&body).map_err(StoreError::from))
+                .transpose()
+        })
     }
 
     pub fn current_chunks_in_range(&self, range: &UtcRange) -> Result<Vec<ChunkRevision>> {
         range
             .validate()
             .map_err(|reason| StoreError::InvalidPath(reason.to_owned()))?;
-        let connection = self.sqlite.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT revision.body_json
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT revision.body_json
              FROM current_chunks current
              JOIN chunk_revisions revision ON revision.revision_id=current.revision_id
              WHERE revision.window_start < ?2 AND revision.window_end > ?1
              ORDER BY revision.window_start, current.chunk_id
              LIMIT ?3",
-        )?;
-        let limit = i64::try_from(MAX_CHUNK_ROWS + 1)
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let rows = statement.query_map(
-            params![range.start.to_rfc3339(), range.end.to_rfc3339(), limit],
-            |row| row.get::<_, String>(0),
-        )?;
-        let chunks = rows
-            .map(|row| ChunkRevision::parse(&row?).map_err(StoreError::from))
-            .collect::<Result<Vec<_>>>()?;
-        if chunks.len() > MAX_CHUNK_ROWS {
-            return Err(StoreError::InvalidPath(
-                "chunk range exceeds the bounded query row limit".to_owned(),
-            ));
+            )?;
+            let limit = i64::try_from(MAX_CHUNK_ROWS + 1)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let rows = statement.query_map(
+                params![range.start.to_rfc3339(), range.end.to_rfc3339(), limit],
+                |row| row.get::<_, String>(0),
+            )?;
+            let chunks = rows
+                .map(|row| ChunkRevision::parse(&row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>>>()?;
+            if chunks.len() > MAX_CHUNK_ROWS {
+                return Err(StoreError::InvalidPath(
+                    "chunk range exceeds the bounded query row limit".to_owned(),
+                ));
+            }
+            Ok(chunks)
+        })
+    }
+
+    /// SQL-filtered keyset page used by the shared service. Filtering and the
+    /// page+1 bound happen before canonical JSON materialization.
+    pub fn current_chunk_page(
+        &self,
+        filter: &ActivityFilter,
+        after_chunk_id: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<ChunkRevision>, bool)> {
+        filter.range.validate().map_err(StoreError::InvalidPath)?;
+        if limit == 0 || limit > MAX_SHARED_PAGE_ITEMS {
+            return Err(StoreError::InvalidPath(format!(
+                "chunk page limit must be 1..={MAX_SHARED_PAGE_ITEMS}"
+            )));
         }
-        Ok(chunks)
+        self.with_connection(|connection| {
+            let cursor = after_chunk_id
+                .map(|chunk_id| {
+                    connection
+                        .query_row(
+                            "SELECT revision.window_start, current.chunk_id
+                             FROM current_chunks current
+                             JOIN chunk_revisions revision
+                               ON revision.revision_id=current.revision_id
+                             WHERE current.chunk_id=?1",
+                            [chunk_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()?
+                        .ok_or(StoreError::CursorScopeMismatch)
+                })
+                .transpose()?;
+            let (cursor_start, cursor_id) = cursor
+                .map(|(start, id)| (Some(start), Some(id)))
+                .unwrap_or((None, None));
+            let evidence_states = serde_json::to_string(&filter.evidence_states)?;
+            let evidence_state_count = i64::try_from(filter.evidence_states.len())
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let filters_present = i64::from(
+                filter.application_bundle_id.is_some()
+                    || filter.window_text.is_some()
+                    || filter.authorized_domain.is_some()
+                    || !filter.evidence_states.is_empty(),
+            );
+            let sql_limit = i64::from(limit.saturating_add(1));
+            let mut statement = connection.prepare(
+                "SELECT revision.body_json
+                 FROM current_chunks current
+                 JOIN chunk_revisions revision ON revision.revision_id=current.revision_id
+                 WHERE revision.window_start < ?2 AND revision.window_end > ?1
+                   AND (?3 IS NULL OR revision.window_start > ?3
+                        OR (revision.window_start = ?3 AND current.chunk_id > ?4))
+                   AND (?5 = 0 OR EXISTS (
+                       SELECT 1
+                       FROM chunk_evidence_refs refs
+                       JOIN observations ON observations.event_id=refs.event_id
+                       WHERE refs.revision_id=current.revision_id
+                         AND (?6 IS NULL OR observations.application_bundle_id=?6)
+                         AND (?7 IS NULL OR instr(
+                              lower(coalesce(observations.window_title, '')), lower(?7)) > 0)
+                         AND (?8 IS NULL OR observations.authorized_domain=?8)
+                         AND (?9 = 0 OR observations.evidence_state IN (
+                              SELECT value FROM json_each(?10)))
+                   ))
+                 ORDER BY revision.window_start, current.chunk_id
+                 LIMIT ?11",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    filter.range.start.to_rfc3339(),
+                    filter.range.end.to_rfc3339(),
+                    cursor_start,
+                    cursor_id,
+                    filters_present,
+                    filter.application_bundle_id,
+                    filter.window_text,
+                    filter.authorized_domain,
+                    evidence_state_count,
+                    evidence_states,
+                    sql_limit,
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut chunks = rows
+                .map(|row| ChunkRevision::parse(&row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>>>()?;
+            let truncated = chunks.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+            chunks.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok((chunks, truncated))
+        })
+    }
+
+    pub fn bounded_query_events_in_range(
+        &self,
+        range: &UtcRange,
+        include_ocr: bool,
+        limit: u32,
+    ) -> Result<Vec<QueryEvent>> {
+        range.validate().map_err(StoreError::InvalidPath)?;
+        if limit == 0 || limit > MAX_SUPPORTING_EVENTS as u32 {
+            return Err(StoreError::InvalidPath(format!(
+                "event response limit must be 1..={MAX_SUPPORTING_EVENTS}"
+            )));
+        }
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT body_json FROM events
+                 WHERE (json_extract(body_json, '$.observed_at') >= ?1
+                        AND json_extract(body_json, '$.observed_at') < ?2)
+                    OR (kind='recording-gap'
+                        AND json_extract(body_json, '$.payload.data.start') < ?2
+                        AND json_extract(body_json, '$.payload.data.end') > ?1)
+                 ORDER BY json_extract(body_json, '$.observed_at'), event_id
+                 LIMIT ?3",
+            )?;
+            let sql_limit = i64::from(limit.saturating_add(1));
+            let rows = statement.query_map(
+                params![range.start.to_rfc3339(), range.end.to_rfc3339(), sql_limit],
+                |row| row.get::<_, String>(0),
+            )?;
+            let events = rows
+                .map(|row| self.query_event_from_json(connection, &row?, include_ocr))
+                .collect::<Result<Vec<_>>>()?;
+            if events.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
+                return Err(StoreError::InvalidPath(
+                    "moment response exceeds the bounded event row limit".to_owned(),
+                ));
+            }
+            Ok(events)
+        })
     }
 
     pub fn supporting_events(
@@ -174,53 +357,57 @@ impl StoreQueries {
         chunk_id: &ChunkId,
         include_ocr: bool,
     ) -> Result<Vec<QueryEvent>> {
-        let connection = self.sqlite.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT events.body_json
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT events.body_json
              FROM current_chunks current
              JOIN chunk_evidence_refs refs ON refs.revision_id=current.revision_id
              JOIN events ON events.event_id=refs.event_id
              WHERE current.chunk_id=?1
              ORDER BY refs.ordinal
              LIMIT ?2",
-        )?;
-        let limit = i64::try_from(MAX_SUPPORTING_EVENTS + 1)
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let rows = statement.query_map(params![chunk_id.as_str(), limit], |row| {
-            row.get::<_, String>(0)
-        })?;
-        let events = rows
-            .map(|row| self.query_event_from_json(&connection, &row?, include_ocr))
-            .collect::<Result<Vec<_>>>()?;
-        if events.len() > MAX_SUPPORTING_EVENTS {
-            return Err(StoreError::InvalidPath(
-                "chunk evidence exceeds the bounded query row limit".to_owned(),
-            ));
-        }
-        Ok(events)
+            )?;
+            let limit = i64::try_from(MAX_SUPPORTING_EVENTS + 1)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let rows = statement.query_map(params![chunk_id.as_str(), limit], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let events = rows
+                .map(|row| self.query_event_from_json(connection, &row?, include_ocr))
+                .collect::<Result<Vec<_>>>()?;
+            if events.len() > MAX_SUPPORTING_EVENTS {
+                return Err(StoreError::InvalidPath(
+                    "chunk evidence exceeds the bounded query row limit".to_owned(),
+                ));
+            }
+            Ok(events)
+        })
     }
 
     pub fn aggregation_watermark(
         &self,
     ) -> Result<Option<(DateTime<Utc>, chronicle_domain::ChunkRevisionId)>> {
-        let connection = self.sqlite.connection()?;
-        let value: Option<(String, String)> = connection
-            .query_row(
-                "SELECT through_utc, revision_id FROM aggregation_watermark WHERE singleton=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        value
-            .map(|(through, revision)| {
-                let through = through.parse::<DateTime<Utc>>().map_err(|error| {
-                    StoreError::SqliteIdentity(format!("aggregation watermark is not UTC: {error}"))
-                })?;
-                let revision = chronicle_domain::ChunkRevisionId::new(revision)
-                    .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
-                Ok((through, revision))
-            })
-            .transpose()
+        self.with_connection(|connection| {
+            let value: Option<(String, String)> = connection
+                .query_row(
+                    "SELECT through_utc, revision_id FROM aggregation_watermark WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            value
+                .map(|(through, revision)| {
+                    let through = through.parse::<DateTime<Utc>>().map_err(|error| {
+                        StoreError::SqliteIdentity(format!(
+                            "aggregation watermark is not UTC: {error}"
+                        ))
+                    })?;
+                    let revision = chronicle_domain::ChunkRevisionId::new(revision)
+                        .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
+                    Ok((through, revision))
+                })
+                .transpose()
+        })
     }
 
     pub fn pending_aggregation_buckets(&self) -> Result<Vec<PendingAggregationBucket>> {
@@ -246,66 +433,67 @@ impl StoreQueries {
                 "aggregation cadence must be 30 or 60 seconds".to_owned(),
             ));
         }
-        let connection = self.sqlite.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT device_id, bucket_start, finalization_cadence_seconds, generation_at
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT device_id, bucket_start, finalization_cadence_seconds, generation_at
              FROM aggregation_pending_buckets
              WHERE (?1 IS NULL OR bucket_start_epoch + 300
                     + max(finalization_cadence_seconds, ?2) <= ?1)
              ORDER BY bucket_start_epoch, device_id
              LIMIT ?3",
-        )?;
-        let limit = i64::try_from(AGGREGATION_BATCH_SIZE + 1)
-            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
-        let rows = statement.query_map(
-            params![
-                due_at.map(|value| value.timestamp()),
-                configured_cadence_seconds,
-                limit,
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, u32>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )?;
-        let mut values = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let has_more = values.len() > AGGREGATION_BATCH_SIZE;
-        values.truncate(AGGREGATION_BATCH_SIZE);
-        let values = values
-            .into_iter()
-            .map(|(device, start, cadence, generation_at)| {
-                let device_id = DeviceId::new(device)
-                    .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
-                let bucket_start = start.parse::<DateTime<Utc>>().map_err(|error| {
-                    StoreError::SqliteIdentity(format!(
-                        "pending aggregation bucket is not UTC: {error}"
+            )?;
+            let limit = i64::try_from(AGGREGATION_BATCH_SIZE + 1)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let rows = statement.query_map(
+                params![
+                    due_at.map(|value| value.timestamp()),
+                    configured_cadence_seconds,
+                    limit,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
-                })?;
-                let generation_at = generation_at
-                    .map(|value| {
-                        value.parse::<DateTime<Utc>>().map_err(|error| {
-                            StoreError::SqliteIdentity(format!(
-                                "aggregation generation time is not UTC: {error}"
-                            ))
+                },
+            )?;
+            let mut values = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_more = values.len() > AGGREGATION_BATCH_SIZE;
+            values.truncate(AGGREGATION_BATCH_SIZE);
+            let values = values
+                .into_iter()
+                .map(|(device, start, cadence, generation_at)| {
+                    let device_id = DeviceId::new(device)
+                        .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
+                    let bucket_start = start.parse::<DateTime<Utc>>().map_err(|error| {
+                        StoreError::SqliteIdentity(format!(
+                            "pending aggregation bucket is not UTC: {error}"
+                        ))
+                    })?;
+                    let generation_at = generation_at
+                        .map(|value| {
+                            value.parse::<DateTime<Utc>>().map_err(|error| {
+                                StoreError::SqliteIdentity(format!(
+                                    "aggregation generation time is not UTC: {error}"
+                                ))
+                            })
                         })
+                        .transpose()?;
+                    Ok(PendingAggregationBucket {
+                        device_id,
+                        bucket_start,
+                        finalization_cadence_seconds: cadence,
+                        generation_at,
                     })
-                    .transpose()?;
-                Ok(PendingAggregationBucket {
-                    device_id,
-                    bucket_start,
-                    finalization_cadence_seconds: cadence,
-                    generation_at,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok((values, has_more))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((values, has_more))
+        })
     }
 
-    fn query_event_from_json(
+    pub(crate) fn query_event_from_json(
         &self,
         connection: &rusqlite::Connection,
         body: &str,
@@ -314,7 +502,7 @@ impl StoreQueries {
         self.query_event(connection, EventEnvelope::parse(body)?, include_ocr)
     }
 
-    fn query_event(
+    pub(crate) fn query_event(
         &self,
         connection: &rusqlite::Connection,
         event: EventEnvelope,
@@ -477,3 +665,4 @@ pub(crate) fn event_matches_filter(event: &EventEnvelope, filter: &ActivityFilte
     }
     true
 }
+use std::sync::{Arc, Mutex};
