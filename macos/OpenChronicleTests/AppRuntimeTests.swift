@@ -68,6 +68,44 @@ final class AppRuntimeTests: XCTestCase {
         ])
     }
 
+    @MainActor
+    func testLifecycleMonitorPreservesOrderAcrossSynchronousNotificationBursts() async throws {
+        let coordinator = CoordinatorProbe()
+        let runtime = AppCaptureRuntime(
+            sessionID: "session-monitor-burst",
+            recordingEnabled: true,
+            control: RuntimeControlProbe(),
+            coordinator: coordinator,
+            environment: SystemCaptureEnvironmentSource(),
+            statusSink: { _ in }
+        )
+        try await runtime.start()
+        let workspace = NotificationCenter()
+        let system = NotificationCenter()
+        let monitor = LifecycleMonitor(runtime: runtime)
+        monitor.start(workspaceCenter: workspace, systemCenter: system)
+
+        for _ in 0..<20 {
+            workspace.post(name: NSWorkspace.willSleepNotification, object: nil)
+            workspace.post(name: NSWorkspace.didWakeNotification, object: nil)
+            workspace.post(name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+            workspace.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+            system.post(name: Notification.Name.NSSystemClockDidChange, object: nil)
+        }
+        await monitor.flush()
+        monitor.stop()
+
+        let calls = await coordinator.calls
+        let expectedBurst: [CoordinatorCall] = [
+            .suspend,
+            .resume,
+            .privacyBoundary,
+            .privacyBoundary,
+            .wallClockChanged,
+        ]
+        XCTAssertEqual(calls, [.start] + Array(repeating: expectedBurst, count: 20).flatMap { $0 })
+    }
+
     func testLifecycleEventsUpdatePrivacyStateAndCoordinatorInOrder() async throws {
         let control = RuntimeControlProbe()
         let coordinator = CoordinatorProbe()

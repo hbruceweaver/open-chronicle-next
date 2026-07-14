@@ -71,7 +71,7 @@ final class LifecycleMonitor {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.enqueue(event)
             }
         }
