@@ -284,7 +284,7 @@ struct MCPBPackageService: @unchecked Sendable {
             arguments: ["-1", archive.path]
         )
         let entries = listing.standardOutput
-            .split(whereSeparator: \Character.isNewline)
+            .split(whereSeparator: { $0.isNewline })
             .map(String.init)
         let expectedEntries = Set([
             "manifest.json",
