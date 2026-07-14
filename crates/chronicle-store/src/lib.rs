@@ -66,6 +66,8 @@ pub enum StoreError {
     },
     #[error("lock timed out: {0}")]
     LockTimeout(String),
+    #[error("another Open Chronicle application process owns capture")]
+    CaptureOwnerActive,
     #[error("stable ID {id} was replayed with different canonical bytes")]
     StableIdConflict { id: String },
     #[error("artifact expected prior revision conflict")]

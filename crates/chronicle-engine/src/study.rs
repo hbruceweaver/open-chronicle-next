@@ -1,8 +1,9 @@
 use std::time::Duration as StdDuration;
 
 use chronicle_domain::{
-    DurableAcknowledgement, EventEnvelope, EventPayload, ImageArtifactId, ObservationContent,
-    ScreenshotProjectedState, StudyHealthState, StudyHealthSummary,
+    CaptureCadence, DurableAcknowledgement, EventEnvelope, EventPayload, ImageArtifactId,
+    NoEvidenceReason, ObservationContent, ScreenshotProjectedState, StudyHealthState,
+    StudyHealthSummary,
 };
 use chronicle_store::{
     CanonicalJournal, FaultInjector, LockManager, ManagedRoot, Projector, ScreenshotStore,
@@ -13,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    CadenceStamp, ChunkerConfig, EngineError, IngestEngine, IngestOutcome, IngestRequest, Result,
+    CadenceStamp, CaptureAdmission, CaptureAdmissionReason, ChunkerConfig, EngineError,
+    HeartbeatAcknowledgementProof, IngestEngine, IngestOutcome, IngestRequest, Result,
+    RuntimeConfigState, RuntimeController, RuntimeFaultInjector, StartupReconcileRequest,
+    StartupReconcileResult,
 };
 
 const CONFIG_PATH: &str = "config.json";
@@ -284,6 +288,7 @@ pub struct RecordingCoordinator {
     ingest: IngestEngine,
     screenshots: ScreenshotStore,
     study: StudyController,
+    runtime: RuntimeController,
 }
 
 pub(crate) fn study_health_summary(
@@ -307,12 +312,101 @@ impl RecordingCoordinator {
             Projector::new(sqlite),
         )?;
         let study = StudyController::open(root.clone())?;
+        let runtime = RuntimeController::open(root.clone())?;
         Ok(Self {
             root,
             ingest,
             screenshots,
             study,
+            runtime,
         })
+    }
+
+    pub fn runtime_state(&self, now: DateTime<Utc>) -> Result<RuntimeConfigState> {
+        // Validate and expose study expiry through the existing policy owner,
+        // while keeping the persisted runtime settings in one config document.
+        let _ = self.study.health_summary(now)?;
+        self.runtime.state()
+    }
+
+    pub fn set_recording_preference(&mut self, enabled: bool) -> Result<()> {
+        self.runtime.set_recording_preference(enabled)
+    }
+
+    pub fn set_cadence(&mut self, cadence: CaptureCadence) -> Result<()> {
+        self.runtime.set_cadence(cadence)
+    }
+
+    pub fn capture_admission(&mut self, now: DateTime<Utc>) -> Result<CaptureAdmission> {
+        let runtime = self.runtime.state()?;
+        if !runtime.session_active {
+            return Ok(CaptureAdmission {
+                allowed: false,
+                reason: CaptureAdmissionReason::RuntimeInactive,
+            });
+        }
+        if !runtime.recording_preference {
+            return Ok(CaptureAdmission {
+                allowed: false,
+                reason: CaptureAdmissionReason::UserPaused,
+            });
+        }
+        match self.study.require_capture(now) {
+            Ok(()) => Ok(CaptureAdmission {
+                allowed: true,
+                reason: CaptureAdmissionReason::Allowed,
+            }),
+            Err(EngineError::StudyNotStarted) => Ok(CaptureAdmission {
+                allowed: false,
+                reason: CaptureAdmissionReason::StudyNotStarted,
+            }),
+            Err(EngineError::StudyExpired) => Ok(CaptureAdmission {
+                allowed: false,
+                reason: CaptureAdmissionReason::StudyExpired,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn startup_reconcile(
+        &mut self,
+        request: StartupReconcileRequest,
+    ) -> Result<StartupReconcileResult> {
+        self.startup_reconcile_with_faults(request, FaultInjector::none())
+    }
+
+    pub fn startup_reconcile_with_faults(
+        &mut self,
+        request: StartupReconcileRequest,
+        event_faults: FaultInjector,
+    ) -> Result<StartupReconcileResult> {
+        self.reconcile_heartbeat_intent()?;
+        let prepared = self.runtime.prepare_startup(&request)?;
+        let has_pending_events = !prepared.gap_events.is_empty();
+        for event in prepared.gap_events {
+            let ingest_now = request.now.max(event.recorded_at);
+            self.ingest.ingest_with_faults(
+                IngestRequest {
+                    event,
+                    cadence: None,
+                },
+                ingest_now,
+                event_faults,
+                FaultInjector::none(),
+            )?;
+        }
+        if has_pending_events {
+            self.runtime
+                .commit_startup(&request.session_id, &prepared.gap_event_ids)?;
+        }
+        Ok(StartupReconcileResult {
+            gap_event_ids: prepared.gap_event_ids,
+        })
+    }
+
+    pub fn prepare_termination(&mut self, session_id: &str, now: DateTime<Utc>) -> Result<()> {
+        self.reconcile_heartbeat_intent()?;
+        self.runtime.prepare_termination(session_id, now)
     }
 
     pub fn configure_study(&mut self, boundary: StudyBoundary) -> Result<StudyBoundary> {
@@ -340,6 +434,34 @@ impl RecordingCoordinator {
     }
 
     pub fn ingest(&mut self, request: IngestRequest, now: DateTime<Utc>) -> Result<IngestOutcome> {
+        self.ingest_with_faults(request, now, FaultInjector::none(), FaultInjector::none())
+    }
+
+    pub fn ingest_with_faults(
+        &mut self,
+        request: IngestRequest,
+        now: DateTime<Utc>,
+        event_faults: FaultInjector,
+        chunk_faults: FaultInjector,
+    ) -> Result<IngestOutcome> {
+        self.ingest_with_runtime_faults(
+            request,
+            now,
+            event_faults,
+            chunk_faults,
+            RuntimeFaultInjector::none(),
+        )
+    }
+
+    pub fn ingest_with_runtime_faults(
+        &mut self,
+        request: IngestRequest,
+        now: DateTime<Utc>,
+        event_faults: FaultInjector,
+        chunk_faults: FaultInjector,
+        heartbeat_faults: RuntimeFaultInjector,
+    ) -> Result<IngestOutcome> {
+        self.reconcile_heartbeat_intent()?;
         self.require_live_event(&request.event, now)?;
         if matches!(
             &request.event.payload,
@@ -350,7 +472,28 @@ impl RecordingCoordinator {
                 "image-bearing observations must use retain_screenshot".to_owned(),
             ));
         }
-        self.ingest.ingest(request, now)
+        let acknowledgement_event_id = request.event.event_id.clone();
+        let heartbeat_intent =
+            self.runtime
+                .prepare_heartbeat_intent(vec![HeartbeatAcknowledgementProof::new(
+                    acknowledgement_event_id.clone(),
+                    now,
+                )])?;
+        let outcome = self
+            .ingest
+            .ingest_with_faults(request, now, event_faults, chunk_faults)?;
+        if matches!(
+            outcome.acknowledgement,
+            DurableAcknowledgement::Durable
+                | DurableAcknowledgement::JournalDurableProjectionPending
+        ) {
+            self.runtime.resolve_heartbeat_intent(
+                &heartbeat_intent,
+                std::slice::from_ref(&acknowledgement_event_id),
+                heartbeat_faults,
+            )?;
+        }
+        Ok(outcome)
     }
 
     pub fn retain_screenshot(
@@ -362,6 +505,29 @@ impl RecordingCoordinator {
         now: DateTime<Utc>,
         faults: FaultInjector,
     ) -> Result<RetainedImageAcknowledgement> {
+        self.retain_screenshot_with_runtime_faults(
+            observation,
+            encoded_image,
+            completion,
+            cadence,
+            now,
+            faults,
+            RuntimeFaultInjector::none(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain_screenshot_with_runtime_faults(
+        &mut self,
+        observation: &EventEnvelope,
+        encoded_image: &[u8],
+        completion: &EventEnvelope,
+        cadence: CadenceStamp,
+        now: DateTime<Utc>,
+        faults: FaultInjector,
+        heartbeat_faults: RuntimeFaultInjector,
+    ) -> Result<RetainedImageAcknowledgement> {
+        self.reconcile_heartbeat_intent()?;
         self.require_live_event(observation, now)?;
         completion.validate().map_err(EngineError::Aggregation)?;
         if completion.recorded_at > now {
@@ -384,10 +550,22 @@ impl RecordingCoordinator {
         .ok_or_else(|| {
             EngineError::Configuration("retained observation has no image intent".to_owned())
         })?;
+        let heartbeat_intent = self.runtime.prepare_heartbeat_intent(vec![
+            HeartbeatAcknowledgementProof::new(
+                observation.event_id.clone(),
+                observation.recorded_at,
+            ),
+            HeartbeatAcknowledgementProof::new(completion.event_id.clone(), now),
+        ])?;
         self.ingest
             .prepare_transactional_image(observation, &cadence)?;
         self.screenshots
             .retain(observation, encoded_image, completion, faults)?;
+        self.runtime.resolve_heartbeat_intent(
+            &heartbeat_intent,
+            std::slice::from_ref(&completion.event_id),
+            heartbeat_faults,
+        )?;
         let ingest = self
             .ingest
             .reconcile_transactional_image(now, FaultInjector::none())?;
@@ -421,6 +599,28 @@ impl RecordingCoordinator {
         Ok(report)
     }
 
+    fn reconcile_heartbeat_intent(&mut self) -> Result<()> {
+        let Some(intent) = self.runtime.heartbeat_intent()? else {
+            return Ok(());
+        };
+        let proof_event_ids = intent
+            .proofs
+            .iter()
+            .map(|proof| proof.event_id.clone())
+            .collect::<Vec<_>>();
+        let canonical_presence = self.ingest.canonical_event_presence(&proof_event_ids)?;
+        let canonical_event_ids = proof_event_ids
+            .into_iter()
+            .zip(canonical_presence)
+            .filter_map(|(event_id, canonical)| canonical.then_some(event_id))
+            .collect::<Vec<_>>();
+        self.runtime.resolve_heartbeat_intent(
+            &intent,
+            &canonical_event_ids,
+            RuntimeFaultInjector::none(),
+        )
+    }
+
     fn require_live_event(&self, event: &EventEnvelope, now: DateTime<Utc>) -> Result<()> {
         event.validate().map_err(EngineError::Aggregation)?;
         if event.recorded_at > now {
@@ -429,6 +629,35 @@ impl RecordingCoordinator {
             ));
         }
         if matches!(event.payload, EventPayload::ObservationAttempt(_)) {
+            if !self.runtime.session_active()? {
+                return Err(EngineError::Configuration(
+                    "recording runtime session is inactive".to_owned(),
+                ));
+            }
+            let user_paused = matches!(
+                &event.payload,
+                EventPayload::ObservationAttempt(attempt)
+                    if matches!(
+                        &attempt.content,
+                        ObservationContent::NoEvidence(content)
+                            if content.reason == NoEvidenceReason::UserPaused
+                    )
+            );
+            match (self.runtime.recording_preference()?, user_paused) {
+                (false, false) => {
+                    return Err(EngineError::Configuration(
+                        "recording is paused; only a user-paused factual attempt is allowed"
+                            .to_owned(),
+                    ));
+                }
+                (true, true) => {
+                    return Err(EngineError::Configuration(
+                        "user-paused factual attempt is stale because recording is not paused"
+                            .to_owned(),
+                    ));
+                }
+                (false, true) | (true, false) => {}
+            }
             self.study.require_capture(event.observed_at)?;
         }
         // The second check is the post-capture/wake boundary. Crossing the

@@ -69,6 +69,30 @@ impl LockManager {
         lock_bounded(&file, true, self.timeout, "query snapshot")?;
         Ok(QuerySnapshotGuard { file })
     }
+
+    /// Acquires the one process-lifetime capture lease for this managed root.
+    ///
+    /// This deliberately does not wait: a second application instance must
+    /// activate the existing owner instead of becoming another scheduler.
+    pub fn try_capture_owner(&self) -> Result<CaptureOwnerGuard> {
+        let process =
+            try_lock_named_process(format!("{}:capture-owner", self.root.path().display()))?;
+        let file = self
+            .root
+            .open_file("locks/capture-owner.lock", true, false, false)?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(CaptureOwnerGuard {
+                _process: process,
+                file,
+            }),
+            Err(error)
+                if error == rustix::io::Errno::WOULDBLOCK || error == rustix::io::Errno::AGAIN =>
+            {
+                Err(StoreError::CaptureOwnerActive)
+            }
+            Err(error) => Err(io_error(error)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -184,6 +208,12 @@ pub struct QuerySnapshotGuard {
     file: File,
 }
 
+#[derive(Debug)]
+pub struct CaptureOwnerGuard {
+    _process: ProcessNamedGuard,
+    file: File,
+}
+
 fn lock_bounded(file: &File, exclusive: bool, timeout: Duration, label: &str) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -254,6 +284,19 @@ fn lock_named_process(key: String, timeout: Duration, label: &str) -> Result<Pro
     }
 }
 
+fn try_lock_named_process(key: String) -> Result<ProcessNamedGuard> {
+    let (registry, _) =
+        NAMED_PROCESS_LOCKS.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
+    let mut active = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if active.insert(key.clone()) {
+        Ok(ProcessNamedGuard { key })
+    } else {
+        Err(StoreError::CaptureOwnerActive)
+    }
+}
+
 impl Drop for ProcessNamedGuard {
     fn drop(&mut self) {
         let (registry, wake) =
@@ -297,3 +340,4 @@ impl Drop for ConfigurationGuard {
 unlock_on_drop!(JournalGuard);
 unlock_on_drop!(GrantReceiptGuard);
 unlock_on_drop!(QuerySnapshotGuard);
+unlock_on_drop!(CaptureOwnerGuard);

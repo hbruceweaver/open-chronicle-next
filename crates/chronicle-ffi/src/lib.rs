@@ -13,19 +13,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use chronicle_domain::{
-    EventEnvelope, EventPayload, ImageArtifactId, ObservationContent, ScreenshotProjectedState,
-    SharedServiceRequest, parse_versioned, validate_schema_version,
+    CaptureCadence, DeviceId, EventEnvelope, EventPayload, ImageArtifactId, ObservationContent,
+    ScreenshotProjectedState, SharedServiceRequest, parse_versioned, validate_schema_version,
 };
 use chronicle_engine::{
     CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator, SharedService,
-    SharedServiceError,
+    SharedServiceError, StartupReconcileRequest, StudyBoundary,
 };
 use chronicle_store::{
-    FaultInjector, LockManager, ManagedRoot, SqliteStore, StoreError, StoreGeneration,
+    CaptureOwnerGuard, FaultInjector, LockManager, ManagedRoot, SqliteStore, StoreError,
+    StoreGeneration,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const ABI_SCHEMA_VERSION: &str = chronicle_domain::CONTRACT_VERSION;
@@ -67,6 +68,7 @@ enum ChronicleStatus {
     Panic = 9,
     Internal = 10,
     InvalidBuffer = 11,
+    CaptureOwnerActive = 12,
 }
 
 #[derive(Debug)]
@@ -112,6 +114,11 @@ impl From<StoreError> for FfiError {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::StaleGeneration { expected, actual } => Self::stale(expected, actual),
+            StoreError::CaptureOwnerActive => Self::new(
+                ChronicleStatus::CaptureOwnerActive,
+                "capture-owner-active",
+                "another Open Chronicle application process owns capture",
+            ),
             StoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Self::new(
                 ChronicleStatus::NotFound,
                 "not-found",
@@ -185,6 +192,7 @@ impl From<SharedServiceError> for FfiError {
 
 #[derive(Debug)]
 struct CoreHandle {
+    _capture_owner: CaptureOwnerGuard,
     root: ManagedRoot,
     sqlite: SqliteStore,
     service: SharedService,
@@ -320,6 +328,16 @@ fn success(result: Value) -> Value {
     })
 }
 
+fn serialize_value<T: Serialize>(value: T) -> Result<Value, FfiError> {
+    serde_json::to_value(value).map_err(|_| {
+        FfiError::new(
+            ChronicleStatus::Internal,
+            "serialization-error",
+            "Chronicle call response could not be serialized",
+        )
+    })
+}
+
 fn encode_value(value: &Value) -> Result<ChronicleBuffer, FfiError> {
     serde_json::to_vec(value)
         .map_err(|_| {
@@ -433,10 +451,44 @@ struct OpenRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CallRequest {
     schema_version: String,
     now: DateTime<Utc>,
-    request: SharedServiceRequest,
+    #[serde(default)]
+    request: Option<SharedServiceRequest>,
+    #[serde(default)]
+    control: Option<AppControl>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum AppControl {
+    RuntimeState,
+    SetRecordingPreference {
+        enabled: bool,
+    },
+    SetCadence {
+        cadence: CaptureCadence,
+    },
+    ConfigureStudy {
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    },
+    UsePersonalMode,
+    ExtendStudy {
+        new_end: DateTime<Utc>,
+    },
+    CaptureAdmission,
+    ReconcilePendingImages,
+    PrepareTermination {
+        session_id: String,
+    },
+    StartupReconcile {
+        session_id: String,
+        device_id: DeviceId,
+        display_timezone: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,6 +569,9 @@ impl CoreHandle {
         };
         chunker.validate().map_err(FfiError::from)?;
         let root = ManagedRoot::initialize(path).map_err(FfiError::from)?;
+        let capture_owner = LockManager::new(root.clone(), std::time::Duration::from_secs(2))
+            .try_capture_owner()
+            .map_err(FfiError::from)?;
         let sqlite = SqliteStore::open(root.clone()).map_err(FfiError::from)?;
         let opened_generation = StoreGeneration::load(&root)
             .map_err(FfiError::from)?
@@ -525,6 +580,7 @@ impl CoreHandle {
         let coordinator = RecordingCoordinator::open_at(root.clone(), chunker, request.now)
             .map_err(FfiError::from)?;
         Ok(Self {
+            _capture_owner: capture_owner,
             root,
             sqlite,
             service,
@@ -543,21 +599,91 @@ impl CoreHandle {
         Ok(())
     }
 
-    fn call(&self, request: CallRequest) -> Result<Value, FfiError> {
+    fn call(&mut self, request: CallRequest) -> Result<Value, FfiError> {
         validate_schema_version(&request.schema_version).map_err(|message| {
             FfiError::new(ChronicleStatus::Contract, "schema-mismatch", message)
         })?;
-        let response = self
-            .service
-            .execute(request.request, request.now)
-            .map_err(FfiError::from)?;
-        serde_json::to_value(response).map_err(|_| {
-            FfiError::new(
-                ChronicleStatus::Internal,
-                "serialization-error",
-                "shared service response could not be serialized",
-            )
-        })
+        match (request.request, request.control) {
+            (Some(shared), None) => serialize_value(
+                self.service
+                    .execute(shared, request.now)
+                    .map_err(FfiError::from)?,
+            ),
+            (None, Some(control)) => self.execute_control(control, request.now),
+            (None, None) | (Some(_), Some(_)) => Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "invalid-call-envelope",
+                "call request must contain exactly one shared request or app control",
+            )),
+        }
+    }
+
+    fn execute_control(
+        &mut self,
+        control: AppControl,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        match control {
+            AppControl::RuntimeState => serialize_value(
+                self.coordinator
+                    .runtime_state(now)
+                    .map_err(FfiError::from)?,
+            ),
+            AppControl::SetRecordingPreference { enabled } => self
+                .coordinator
+                .set_recording_preference(enabled)
+                .map(|()| json!({ "recording_preference": enabled }))
+                .map_err(FfiError::from),
+            AppControl::SetCadence { cadence } => self
+                .coordinator
+                .set_cadence(cadence)
+                .map(|()| json!({ "cadence": cadence }))
+                .map_err(FfiError::from),
+            AppControl::ConfigureStudy { start, end } => self
+                .coordinator
+                .configure_study(StudyBoundary { start, end })
+                .map_err(FfiError::from)
+                .and_then(serialize_value),
+            AppControl::UsePersonalMode => self
+                .coordinator
+                .use_personal_mode()
+                .map(|()| json!({ "mode": "personal" }))
+                .map_err(FfiError::from),
+            AppControl::ExtendStudy { new_end } => self
+                .coordinator
+                .extend_study(new_end, now)
+                .map_err(FfiError::from)
+                .and_then(serialize_value),
+            AppControl::CaptureAdmission => self
+                .coordinator
+                .capture_admission(now)
+                .map_err(FfiError::from)
+                .and_then(serialize_value),
+            AppControl::ReconcilePendingImages => self
+                .coordinator
+                .reconcile_pending_images(now)
+                .map_err(FfiError::from)
+                .and_then(serialize_value),
+            AppControl::PrepareTermination { session_id } => self
+                .coordinator
+                .prepare_termination(&session_id, now)
+                .map(|()| json!({ "prepared": true }))
+                .map_err(FfiError::from),
+            AppControl::StartupReconcile {
+                session_id,
+                device_id,
+                display_timezone,
+            } => self
+                .coordinator
+                .startup_reconcile(StartupReconcileRequest {
+                    session_id,
+                    device_id,
+                    display_timezone,
+                    now,
+                })
+                .map_err(FfiError::from)
+                .and_then(serialize_value),
+        }
     }
 
     fn ingest(
@@ -805,7 +931,8 @@ pub unsafe extern "C" fn chronicle_open(
     })
 }
 
-/// Executes one bounded SharedService request at the explicit request time.
+/// Executes exactly one bounded SharedService request or app-only control at
+/// the explicit request time.
 ///
 /// # Safety
 ///
@@ -1036,6 +1163,13 @@ mod tests {
     }
 
     fn open(temporary: &tempfile::TempDir) -> (u64, Value) {
+        let (status, handle, value) = open_raw(temporary);
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{value}");
+        assert_ne!(handle, 0);
+        (handle, value)
+    }
+
+    fn open_raw(temporary: &tempfile::TempDir) -> (u32, u64, Value) {
         let request = json!({
             "schema_version": "1.0",
             "application_support_path": temporary.path().join("store"),
@@ -1052,9 +1186,7 @@ mod tests {
         let value: Value =
             serde_json::from_slice(&response_bytes(response)).expect("decode open response");
         free(&mut response);
-        assert_eq!(status, ChronicleStatus::Ok as u32, "{value}");
-        assert_ne!(handle, 0);
-        (handle, value)
+        (status, handle, value)
     }
 
     fn close(handle: u64) -> (u32, Value) {
@@ -1075,6 +1207,33 @@ mod tests {
             serde_json::from_slice(&response_bytes(response)).expect("decode call response");
         free(&mut response);
         (status, value)
+    }
+
+    fn control(handle: u64, now: &str, control: Value) -> (u32, Value) {
+        call_raw(
+            handle,
+            &serde_json::to_vec(&json!({
+                "schema_version": "1.0",
+                "now": now,
+                "control": control,
+            }))
+            .expect("encode app control"),
+        )
+    }
+
+    fn start_recording(handle: u64, session_id: &str) {
+        for request in [
+            json!({
+                "type": "startup-reconcile",
+                "session_id": session_id,
+                "device_id": "dev-ffi-ingest",
+                "display_timezone": "Europe/Zurich"
+            }),
+            json!({ "type": "set-recording-preference", "enabled": true }),
+        ] {
+            let (status, response) = control(handle, "2026-07-13T09:00:00Z", request);
+            assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        }
     }
 
     fn ingest_raw(handle: u64, request: &Value, image: Option<&[u8]>) -> (u32, Value) {
@@ -1179,6 +1338,190 @@ mod tests {
     }
 
     #[test]
+    fn app_open_owns_capture_until_close_and_reports_a_typed_conflict() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (first, _) = open(&temporary);
+
+        let (status, second, response) = open_raw(&temporary);
+        assert_eq!(status, ChronicleStatus::CaptureOwnerActive as u32);
+        assert_eq!(second, 0);
+        assert_eq!(response["error"]["code"], "capture-owner-active");
+
+        assert_eq!(close(first).0, ChronicleStatus::Ok as u32);
+        let (reopened, _) = open(&temporary);
+        assert_eq!(close(reopened).0, ChronicleStatus::Ok as u32);
+    }
+
+    #[test]
+    fn call_envelope_requires_exactly_one_shared_request_or_app_control() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, opened) = open(&temporary);
+        let generation = opened["result"]["store_generation"]
+            .as_u64()
+            .expect("generation");
+        let shared_request = json!({
+            "schema_version": "1.0",
+            "request_id": "req-exclusive-envelope",
+            "store_generation": generation,
+            "operation": { "type": "health" }
+        });
+
+        for invalid in [
+            json!({
+                "schema_version": "1.0",
+                "now": "2026-07-13T09:00:01Z"
+            }),
+            json!({
+                "schema_version": "1.0",
+                "now": "2026-07-13T09:00:01Z",
+                "request": shared_request,
+                "control": { "type": "runtime-state" }
+            }),
+        ] {
+            let (status, response) = call_raw(
+                handle,
+                &serde_json::to_vec(&invalid).expect("encode invalid envelope"),
+            );
+            assert_eq!(status, ChronicleStatus::Contract as u32, "{response}");
+            assert_eq!(response["error"]["code"], "invalid-call-envelope");
+        }
+
+        let runtime_state = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:00:01Z",
+            "control": { "type": "runtime-state" }
+        });
+        let (status, response) = call_raw(
+            handle,
+            &serde_json::to_vec(&runtime_state).expect("encode runtime state"),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        assert_eq!(response["result"]["recording_preference"], false);
+        assert_eq!(response["result"]["cadence"], "sixty-seconds");
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn app_controls_delegate_to_the_recording_coordinator() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+
+        for (now, request) in [
+            (
+                "2026-07-13T09:00:00Z",
+                json!({
+                    "type": "startup-reconcile",
+                    "session_id": "ffi-session-one",
+                    "device_id": "dev-ffi-runtime",
+                    "display_timezone": "Europe/Zurich"
+                }),
+            ),
+            (
+                "2026-07-13T09:00:01Z",
+                json!({ "type": "set-recording-preference", "enabled": true }),
+            ),
+            (
+                "2026-07-13T09:00:02Z",
+                json!({ "type": "set-cadence", "cadence": "thirty-seconds" }),
+            ),
+            (
+                "2026-07-13T09:00:03Z",
+                json!({
+                    "type": "configure-study",
+                    "start": "2026-07-13T09:00:00Z",
+                    "end": "2026-07-13T10:00:00Z"
+                }),
+            ),
+            (
+                "2026-07-13T09:30:00Z",
+                json!({ "type": "capture-admission" }),
+            ),
+            (
+                "2026-07-13T09:30:01Z",
+                json!({
+                    "type": "extend-study",
+                    "new_end": "2026-07-13T11:00:00Z"
+                }),
+            ),
+            (
+                "2026-07-13T09:30:02Z",
+                json!({ "type": "use-personal-mode" }),
+            ),
+            (
+                "2026-07-13T09:30:03Z",
+                json!({ "type": "reconcile-pending-images" }),
+            ),
+        ] {
+            let (status, response) = control(handle, now, request);
+            assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        }
+
+        let (status, state) = control(
+            handle,
+            "2026-07-13T09:30:04Z",
+            json!({ "type": "runtime-state" }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{state}");
+        assert_eq!(state["result"]["recording_preference"], true);
+        assert_eq!(state["result"]["cadence"], "thirty-seconds");
+
+        let (status, response) = control(
+            handle,
+            "2026-07-13T09:31:00Z",
+            json!({
+                "type": "prepare-termination",
+                "session_id": "ffi-session-one"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        assert_eq!(response["result"]["prepared"], true);
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn capture_admission_is_runtime_inactive_before_startup_and_after_termination() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+        let (status, response) = control(
+            handle,
+            "2026-07-13T09:00:00Z",
+            json!({ "type": "set-recording-preference", "enabled": true }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+
+        let assert_inactive = |now: &str| {
+            let (status, response) = control(handle, now, json!({ "type": "capture-admission" }));
+            assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+            assert_eq!(response["result"]["allowed"], false);
+            assert_eq!(response["result"]["reason"], "runtime-inactive");
+        };
+        assert_inactive("2026-07-13T09:00:01Z");
+
+        let (status, response) = control(
+            handle,
+            "2026-07-13T09:00:02Z",
+            json!({
+                "type": "startup-reconcile",
+                "session_id": "ffi-inactive-session",
+                "device_id": "dev-ffi-runtime",
+                "display_timezone": "Europe/Zurich"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        let (status, response) = control(
+            handle,
+            "2026-07-13T09:00:03Z",
+            json!({
+                "type": "prepare-termination",
+                "session_id": "ffi-inactive-session"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        assert_inactive("2026-07-13T09:00:04Z");
+        let _ = close(handle);
+    }
+
+    #[test]
     fn null_malformed_invalid_utf8_and_oversized_inputs_are_typed() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let (handle, _) = open(&temporary);
@@ -1230,6 +1573,7 @@ mod tests {
     fn non_image_and_transactional_image_ingest_use_the_recording_coordinator() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let (handle, _) = open(&temporary);
+        start_recording(handle, "ffi-ingest-session");
         let events = fixture_events();
         let image_ingest = json!({
             "schema_version": "1.0",
@@ -1262,6 +1606,7 @@ mod tests {
         let generation = opened["result"]["store_generation"]
             .as_u64()
             .expect("generation");
+        start_recording(handle, "ffi-image-session");
         let events = fixture_events();
         let image_ingest = json!({
             "schema_version": "1.0",

@@ -142,6 +142,10 @@ impl IngestEngine {
         self.ingest_with_faults(request, now, FaultInjector::none(), FaultInjector::none())
     }
 
+    pub(crate) fn canonical_event_presence(&self, event_ids: &[EventId]) -> Result<Vec<bool>> {
+        self.journal.event_presence(event_ids).map_err(Into::into)
+    }
+
     pub fn ingest_with_faults(
         &mut self,
         request: IngestRequest,

@@ -320,6 +320,27 @@ impl CanonicalJournal {
         self.scan_all_locked(family, repair_partial)
     }
 
+    /// Performs exact canonical event lookups through the maintained journal
+    /// index. Once startup recovery has loaded the event family, this does not
+    /// rescan historical record bodies.
+    pub fn event_presence(&self, event_ids: &[EventId]) -> Result<Vec<bool>> {
+        let _writer = LockManager::new(self.root.clone(), Duration::from_secs(1))
+            .journal(JournalFamily::Events)?;
+        self.refresh_index(JournalFamily::Events)?;
+        let index = self
+            .index
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Ok(event_ids
+            .iter()
+            .map(|event_id| {
+                index
+                    .records
+                    .contains_key(&(JournalFamily::Events, event_id.to_string()))
+            })
+            .collect())
+    }
+
     pub(crate) fn image_intent_owner(&self, artifact_id: &str) -> Result<Option<String>> {
         let _writer = LockManager::new(self.root.clone(), Duration::from_secs(1))
             .journal(JournalFamily::Events)?;

@@ -9,6 +9,7 @@ pub mod health;
 pub mod ingest;
 pub mod policy;
 pub mod reconcile;
+pub mod runtime;
 pub mod service;
 pub mod study;
 
@@ -19,5 +20,6 @@ pub use health::*;
 pub use ingest::*;
 pub use policy::*;
 pub use reconcile::*;
+pub use runtime::*;
 pub use service::*;
 pub use study::*;

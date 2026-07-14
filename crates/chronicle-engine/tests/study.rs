@@ -1,12 +1,12 @@
 mod common;
 
 use chronicle_domain::{
-    DurableAcknowledgement, RequestId, ScreenshotProjectedState, SharedServiceOperation,
+    DeviceId, DurableAcknowledgement, RequestId, ScreenshotProjectedState, SharedServiceOperation,
     SharedServiceRequest, SharedServiceResult, StudyHealthState,
 };
 use chronicle_engine::{
     CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator, SharedService,
-    StudyBoundary,
+    StartupReconcileRequest, StudyBoundary,
 };
 use chronicle_store::{FaultInjector, FaultPoint, ManagedRoot, SqliteStore, StoreError};
 use chrono::{DateTime, Utc};
@@ -25,7 +25,7 @@ fn stamp(tick: u64) -> CadenceStamp {
 fn coordinator() -> Result<(tempfile::TempDir, RecordingCoordinator), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let root = ManagedRoot::initialize(temporary.path().join("store"))?;
-    let coordinator = RecordingCoordinator::open_at(
+    let mut coordinator = RecordingCoordinator::open_at(
         root,
         ChunkerConfig {
             aggregator_version: "study-test-1".to_owned(),
@@ -33,6 +33,13 @@ fn coordinator() -> Result<(tempfile::TempDir, RecordingCoordinator), Box<dyn st
         },
         at("2026-07-13T09:00:00Z"),
     )?;
+    coordinator.startup_reconcile(StartupReconcileRequest {
+        session_id: "study-test-session".to_owned(),
+        device_id: DeviceId::new("dev-study-test")?,
+        display_timezone: "Europe/Zurich".to_owned(),
+        now: at("2026-07-13T09:00:00Z"),
+    })?;
+    coordinator.set_recording_preference(true)?;
     Ok((temporary, coordinator))
 }
 
