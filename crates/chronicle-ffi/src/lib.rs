@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use chronicle_domain::{
-    CaptureCadence, DeviceId, EventEnvelope, EventPayload, ImageArtifactId, ObservationContent,
-    ScreenshotProjectedState, ScreenshotRetention, SharedServiceRequest, parse_versioned,
-    validate_schema_version,
+    CaptureCadence, ClientId, DeviceId, DisclosureGrant, EventEnvelope, EventPayload, GrantId,
+    GrantState, ImageArtifactId, ObservationContent, ReceiptId, ScreenshotProjectedState,
+    ScreenshotRetention, SharedServiceRequest, parse_versioned, validate_schema_version,
 };
 use chronicle_engine::{
     CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator,
@@ -154,6 +154,11 @@ impl From<StoreError> for FfiError {
                 ChronicleStatus::Contract,
                 "contract-error",
                 "request violates the Chronicle storage contract",
+            ),
+            StoreError::GrantAlreadyExists => Self::new(
+                ChronicleStatus::Contract,
+                "disclosure-grant-conflict",
+                "an existing disclosure grant has a different contract",
             ),
             other => Self::new(
                 ChronicleStatus::Internal,
@@ -519,6 +524,29 @@ enum AppControl {
         device_id: DeviceId,
         display_timezone: String,
     },
+    InstallDisclosureGrant {
+        grant: DisclosureGrant,
+    },
+    RevokeDisclosureGrant {
+        grant_id: GrantId,
+        client_id: ClientId,
+        receipt_id: ReceiptId,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DisclosureGrantMutation {
+    Installed,
+    AlreadyInstalled,
+    Revoked,
+    AlreadyRevoked,
+}
+
+#[derive(Debug, Serialize)]
+struct DisclosureGrantMutationResponse {
+    mutation: DisclosureGrantMutation,
+    grant: DisclosureGrant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -743,7 +771,90 @@ impl CoreHandle {
                 })
                 .map_err(FfiError::from)
                 .and_then(serialize_value),
+            AppControl::InstallDisclosureGrant { grant } => {
+                self.install_disclosure_grant(grant, now)
+            }
+            AppControl::RevokeDisclosureGrant {
+                grant_id,
+                client_id,
+                receipt_id,
+            } => self.revoke_disclosure_grant(grant_id, client_id, receipt_id, now),
         }
+    }
+
+    fn install_disclosure_grant(
+        &self,
+        grant: DisclosureGrant,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        grant.validate().map_err(|_| {
+            FfiError::new(
+                ChronicleStatus::Contract,
+                "invalid-disclosure-grant",
+                "disclosure grant violates the Chronicle contract",
+            )
+        })?;
+        if !grant.is_active_at(now) || grant.disclosed_bytes != 0 {
+            return Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "inactive-disclosure-grant",
+                "a new disclosure grant must be active with no prior disclosure",
+            ));
+        }
+
+        match self.service.grant(&grant.grant_id) {
+            Ok(existing) if existing == grant => serialize_value(DisclosureGrantMutationResponse {
+                mutation: DisclosureGrantMutation::AlreadyInstalled,
+                grant: existing,
+            }),
+            Ok(_) => Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "disclosure-grant-conflict",
+                "an existing disclosure grant has a different contract",
+            )),
+            Err(SharedServiceError::GrantNotFound) => {
+                self.service
+                    .install_grant(grant.clone())
+                    .map_err(FfiError::from)?;
+                serialize_value(DisclosureGrantMutationResponse {
+                    mutation: DisclosureGrantMutation::Installed,
+                    grant,
+                })
+            }
+            Err(error) => Err(FfiError::from(error)),
+        }
+    }
+
+    fn revoke_disclosure_grant(
+        &self,
+        grant_id: GrantId,
+        client_id: ClientId,
+        receipt_id: ReceiptId,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        let existing = self.service.grant(&grant_id).map_err(FfiError::from)?;
+        if existing.client_id != client_id || existing.receipt_id != receipt_id {
+            return Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "disclosure-grant-identity-mismatch",
+                "disclosure grant identity does not match the installed receipt",
+            ));
+        }
+        if existing.state == GrantState::Revoked {
+            return serialize_value(DisclosureGrantMutationResponse {
+                mutation: DisclosureGrantMutation::AlreadyRevoked,
+                grant: existing,
+            });
+        }
+
+        self.service
+            .revoke_grant(&grant_id, now)
+            .map_err(FfiError::from)?;
+        let revoked = self.service.grant(&grant_id).map_err(FfiError::from)?;
+        serialize_value(DisclosureGrantMutationResponse {
+            mutation: DisclosureGrantMutation::Revoked,
+            grant: revoked,
+        })
     }
 
     fn ingest(
@@ -1281,6 +1392,35 @@ mod tests {
         )
     }
 
+    fn disclosure_grant(
+        generation: u64,
+        grant_id: &str,
+        client_id: &str,
+        receipt_id: &str,
+    ) -> Value {
+        json!({
+            "schema_version": "1.0",
+            "grant_id": grant_id,
+            "client_id": client_id,
+            "receipt_id": receipt_id,
+            "time_scope": {
+                "type": "rolling-horizon",
+                "seconds": 86_400
+            },
+            "content_classes": ["metadata", "derived"],
+            "created_at": "2026-07-13T09:00:00Z",
+            "expires_at": "2026-07-20T09:00:00Z",
+            "state": "active",
+            "limits": {
+                "max_page_items": 100,
+                "max_response_bytes": 262_144,
+                "max_cumulative_bytes": 1_048_576
+            },
+            "disclosed_bytes": 0,
+            "store_generation": generation
+        })
+    }
+
     fn start_recording(handle: u64, session_id: &str) {
         for request in [
             json!({
@@ -1479,6 +1619,173 @@ mod tests {
         );
         assert_eq!(status, ChronicleStatus::Contract as u32, "{response}");
         assert!(response.get("result").is_none());
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn disclosure_grant_controls_are_app_only_idempotent_and_exactly_revocable() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (mut handle, opened) = open(&temporary);
+        let generation = opened["result"]["store_generation"]
+            .as_u64()
+            .expect("generation");
+        let grant = disclosure_grant(
+            generation,
+            "grant-ffi-codex",
+            "client-ffi-codex",
+            "receipt-ffi-codex",
+        );
+
+        let install = json!({
+            "type": "install-disclosure-grant",
+            "grant": grant
+        });
+        let (status, installed) = control(handle, "2026-07-13T09:00:01Z", install.clone());
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{installed}");
+        assert_eq!(installed["result"]["mutation"], "installed");
+        assert_eq!(installed["result"]["grant"]["state"], "active");
+        assert_eq!(
+            installed["result"]["grant"]["content_classes"],
+            json!(["metadata", "derived"])
+        );
+
+        let (status, replayed) = control(handle, "2026-07-13T09:00:02Z", install);
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{replayed}");
+        assert_eq!(replayed["result"]["mutation"], "already-installed");
+
+        assert_eq!(close(handle).0, ChronicleStatus::Ok as u32);
+        let (reopened, reopened_response) = open(&temporary);
+        assert_eq!(reopened_response["result"]["store_generation"], generation);
+        handle = reopened;
+
+        let wrong_identity = json!({
+            "type": "revoke-disclosure-grant",
+            "grant_id": "grant-ffi-codex",
+            "client_id": "SECRET_CLIENT_MUST_NOT_BE_ECHOED",
+            "receipt_id": "receipt-ffi-codex"
+        });
+        let (status, mismatch) = control(handle, "2026-07-13T09:00:03Z", wrong_identity);
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{mismatch}");
+        assert_eq!(
+            mismatch["error"]["code"],
+            "disclosure-grant-identity-mismatch"
+        );
+        assert!(
+            !mismatch
+                .to_string()
+                .contains("SECRET_CLIENT_MUST_NOT_BE_ECHOED")
+        );
+
+        let revoke = json!({
+            "type": "revoke-disclosure-grant",
+            "grant_id": "grant-ffi-codex",
+            "client_id": "client-ffi-codex",
+            "receipt_id": "receipt-ffi-codex"
+        });
+        let (status, revoked) = control(handle, "2026-07-13T09:00:04Z", revoke.clone());
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{revoked}");
+        assert_eq!(revoked["result"]["mutation"], "revoked");
+        assert_eq!(revoked["result"]["grant"]["state"], "revoked");
+
+        let (status, replayed) = control(handle, "2026-07-13T09:00:05Z", revoke);
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{replayed}");
+        assert_eq!(replayed["result"]["mutation"], "already-revoked");
+
+        let shared_install = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:00:06Z",
+            "request": {
+                "schema_version": "1.0",
+                "request_id": "req-shared-grant-install",
+                "store_generation": generation,
+                "operation": {
+                    "type": "install-disclosure-grant",
+                    "data": { "grant": disclosure_grant(
+                        generation,
+                        "grant-agent-forbidden",
+                        "client-agent-forbidden",
+                        "receipt-agent-forbidden"
+                    ) }
+                }
+            }
+        });
+        let (status, forbidden) = call_raw(
+            handle,
+            &serde_json::to_vec(&shared_install).expect("encode forbidden shared operation"),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{forbidden}");
+        assert!(forbidden.get("result").is_none());
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn disclosure_grant_install_fails_closed_without_persisting_invalid_or_conflicting_input() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, opened) = open(&temporary);
+        let generation = opened["result"]["store_generation"]
+            .as_u64()
+            .expect("generation");
+        let mut inactive = disclosure_grant(
+            generation,
+            "grant-ffi-invalid",
+            "SECRET_INVALID_CLIENT_MUST_NOT_BE_ECHOED",
+            "receipt-ffi-invalid",
+        );
+        inactive["expires_at"] = json!("2026-07-13T09:00:01Z");
+        let (status, rejected) = control(
+            handle,
+            "2026-07-13T09:00:01Z",
+            json!({
+                "type": "install-disclosure-grant",
+                "grant": inactive
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "inactive-disclosure-grant");
+        assert!(
+            !rejected
+                .to_string()
+                .contains("SECRET_INVALID_CLIENT_MUST_NOT_BE_ECHOED")
+        );
+
+        let valid = disclosure_grant(
+            generation,
+            "grant-ffi-invalid",
+            "client-ffi-valid",
+            "receipt-ffi-invalid",
+        );
+        let (status, installed) = control(
+            handle,
+            "2026-07-13T09:00:02Z",
+            json!({
+                "type": "install-disclosure-grant",
+                "grant": valid
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{installed}");
+        assert_eq!(installed["result"]["mutation"], "installed");
+
+        let collision = disclosure_grant(
+            generation,
+            "grant-ffi-collision",
+            "SECRET_COLLISION_CLIENT_MUST_NOT_BE_ECHOED",
+            "receipt-ffi-invalid",
+        );
+        let (status, rejected) = control(
+            handle,
+            "2026-07-13T09:00:03Z",
+            json!({
+                "type": "install-disclosure-grant",
+                "grant": collision
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "disclosure-grant-conflict");
+        assert!(
+            !rejected
+                .to_string()
+                .contains("SECRET_COLLISION_CLIENT_MUST_NOT_BE_ECHOED")
+        );
         let _ = close(handle);
     }
 
