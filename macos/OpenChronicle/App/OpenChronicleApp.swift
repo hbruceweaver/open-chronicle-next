@@ -20,6 +20,7 @@ struct OpenChronicleApp: App {
         MenuBarExtra {
             ChronicleMenu(onOpen: appDelegate.prepareForExplicitOpen)
                 .environmentObject(appDelegate.appModel)
+                .environmentObject(appDelegate.navigation)
         } label: {
             ChronicleMenuLabel(appModel: appDelegate.appModel)
         }
@@ -119,9 +120,24 @@ private struct ShellView: View {
                             onChunk: { navigation.show(.logicalChunk($0)) },
                             onEvent: { navigation.show(.event($0)) }
                         )
-                    case .home, .settings:
+                    case .settings:
+                        SettingsView(
+                            model: appModel.settingsViewModel,
+                            onOpenHealth: { navigation.show(.health) }
+                        )
+                    case .home:
                         Text(title(for: route))
                             .navigationTitle(title(for: route))
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .automatic) {
+                        Button {
+                            navigation.show(.settings)
+                        } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                        .help("Open recording, privacy, and AI integration settings")
                     }
                 }
             }
@@ -147,6 +163,7 @@ private struct ShellView: View {
 private struct ChronicleMenu: View {
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var appModel: AppModel
+    @EnvironmentObject private var navigation: NavigationModel
     let onOpen: @MainActor () -> Void
 
     var body: some View {
@@ -154,11 +171,11 @@ private struct ChronicleMenu: View {
         Divider()
         if appModel.captureStatus == .recording {
             Button("Pause Observation") {
-                Task { await appModel.setRecordingEnabled(false) }
+                Task { try? await appModel.setRecordingEnabled(false) }
             }
         } else if appModel.captureStatus == .paused {
             Button("Resume Observation") {
-                Task { await appModel.setRecordingEnabled(true) }
+                Task { try? await appModel.setRecordingEnabled(true) }
             }
         }
         Button("Open Chronicle") {
@@ -166,6 +183,13 @@ private struct ChronicleMenu: View {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         }
+        Button("Settings…") {
+            onOpen()
+            navigation.show(.settings)
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        .keyboardShortcut(",")
         Button("Quit Open Chronicle") {
             NSApp.terminate(nil)
         }
@@ -219,7 +243,6 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
         self?.requestAuthoritativeInstanceActivation()
     })
     lazy var navigation = NavigationModel()
-    private lazy var launchAtLoginService = LaunchAtLoginService()
     private lazy var agentSetupModel = AgentSetupModel { [weak self] installation in
         guard let self else { return .failed(.clientUnavailable) }
         return await self.appModel.connectAgent(installation)
@@ -232,12 +255,7 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
         },
         launchPreferenceHandler: { [weak self] enabled in
             guard let self else { return "Launch at login could not be configured." }
-            await self.launchAtLoginService.setEnabled(enabled)
-            if let error = self.launchAtLoginService.lastError { return error }
-            if enabled, self.launchAtLoginService.state == .requiresApproval {
-                return "Launch at login requires approval in System Settings. Recording can still start now."
-            }
-            return nil
+            return await self.appModel.setLaunchAtLogin(enabled)
         }
     )
     private lazy var notificationResponseDelegate = ChronicleNotificationResponseDelegate {

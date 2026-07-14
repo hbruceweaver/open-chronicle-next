@@ -135,7 +135,7 @@ final class AppRuntimeTests: XCTestCase {
         privacy = await environment.currentEnvironment()
         XCTAssertFalse(privacy.isAsleep)
         await runtime.handle(.wallClockChanged)
-        await runtime.setRecordingEnabled(false)
+        try await runtime.setRecordingEnabled(false)
         privacy = await environment.currentEnvironment()
         XCTAssertTrue(privacy.isPaused)
         try await runtime.shutdown(at: startedAt.addingTimeInterval(60))
@@ -168,6 +168,42 @@ final class AppRuntimeTests: XCTestCase {
             .stopped,
             .stopped,
         ])
+    }
+
+    func testRecordingFailureDoesNotUpdatePausedEnvironmentOrPublishPausedStatus() async throws {
+        let failure = CapturePersistenceFailure(
+            category: .contractRepair,
+            code: "preference-write-failed",
+            retryable: false
+        )
+        let coordinator = CoordinatorProbe()
+        await coordinator.setPreferenceOutcome(.failed(failure))
+        let environment = SystemCaptureEnvironmentSource()
+        let statuses = StatusProbe()
+        let runtime = AppCaptureRuntime(
+            sessionID: "session-preference-failure",
+            recordingEnabled: true,
+            control: RuntimeControlProbe(),
+            coordinator: coordinator,
+            environment: environment,
+            statusSink: { state in await statuses.append(state) }
+        )
+        try await runtime.start()
+
+        do {
+            try await runtime.setRecordingEnabled(false)
+            XCTFail("A failed core preference write must be returned")
+        } catch {
+            XCTAssertEqual(
+                error as? AppCaptureRuntimeError,
+                .recordingPreferenceFailed(failure)
+            )
+        }
+
+        let privacy = await environment.currentEnvironment()
+        let lastStatus = await statuses.last
+        XCTAssertFalse(privacy.isPaused)
+        XCTAssertEqual(lastStatus, .recording)
     }
 
     func testStorageRetryAndRepairStateArePublishedHonestly() async throws {
@@ -420,6 +456,7 @@ private actor CoordinatorProbe: CaptureCoordinating {
     private var generation: UInt64 = 0
     private var lastDenial: CaptureDenial?
     private var updateSink: CaptureCoordinatorUpdateSink?
+    private var preferenceOutcome: CaptureRecordingPreferenceOutcome = .persisted
 
     func setUpdateSink(_ sink: @escaping CaptureCoordinatorUpdateSink) async {
         updateSink = sink
@@ -462,8 +499,15 @@ private actor CoordinatorProbe: CaptureCoordinating {
         calls.append(.wallClockChanged)
     }
 
-    func recordingPreferenceChanged(enabled: Bool) {
+    func recordingPreferenceChanged(
+        enabled: Bool
+    ) -> CaptureRecordingPreferenceOutcome {
         calls.append(.recordingPreference(enabled))
+        return preferenceOutcome
+    }
+
+    func setPreferenceOutcome(_ outcome: CaptureRecordingPreferenceOutcome) {
+        preferenceOutcome = outcome
     }
 
     func privacyBoundaryChanged() async {

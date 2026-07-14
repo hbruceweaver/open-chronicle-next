@@ -20,6 +20,8 @@ final class NavigationModel: ObservableObject {
     func show(_ route: AppRoute) {
         if route == .home {
             path.removeAll()
+        } else if route == .settings, path.last == .settings {
+            return
         } else {
             path.append(route)
         }

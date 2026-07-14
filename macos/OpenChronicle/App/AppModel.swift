@@ -16,6 +16,8 @@ final class AppModel: ObservableObject {
     let homeViewModel = HomeViewModel()
     let timelineViewModel = TimelineViewModel()
     let analysisViewModel = AnalysisViewModel()
+    let settingsViewModel = SettingsViewModel()
+    let launchAtLoginService: LaunchAtLoginService
     private var core: (any CoreService)?
     private var runtime: AppCaptureRuntime?
     private var lifecycleMonitor: LifecycleMonitor?
@@ -38,6 +40,7 @@ final class AppModel: ObservableObject {
         runtimeFactory: RuntimeFactory? = nil,
         shouldStartCapture: (() -> Bool)? = nil,
         notificationService: NotificationService? = nil,
+        launchAtLoginService: LaunchAtLoginService? = nil,
         duplicateInstanceHandler: @escaping DuplicateInstanceHandler = {}
     ) {
         self.coreFactory = coreFactory ?? { supportURL in
@@ -52,6 +55,7 @@ final class AppModel: ObservableObject {
             AppRuntimeFactory.hasCompletedOnboarding()
         }
         self.notificationService = notificationService ?? NotificationService()
+        self.launchAtLoginService = launchAtLoginService ?? LaunchAtLoginService()
         self.duplicateInstanceHandler = duplicateInstanceHandler
     }
 
@@ -69,8 +73,18 @@ final class AppModel: ObservableObject {
         connectionTask = nil
     }
 
-    func setRecordingEnabled(_ enabled: Bool) async {
-        await runtime?.setRecordingEnabled(enabled)
+    func setRecordingEnabled(_ enabled: Bool) async throws {
+        guard let runtime else { throw AppCaptureRuntimeError.notStarted }
+        try await runtime.setRecordingEnabled(enabled)
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) async -> String? {
+        await launchAtLoginService.setEnabled(enabled)
+        if let error = launchAtLoginService.lastError { return error }
+        if enabled, launchAtLoginService.state == .requiresApproval {
+            return "Launch at login requires approval in System Settings. Recording can still start now."
+        }
+        return nil
     }
 
     func retryStorageRecovery() async {
@@ -161,6 +175,7 @@ final class AppModel: ObservableObject {
         homeViewModel.detach()
         timelineViewModel.detach()
         analysisViewModel.detach()
+        settingsViewModel.detach()
         if let runtime {
             try? await runtime.shutdown()
         }
@@ -203,6 +218,24 @@ final class AppModel: ObservableObject {
             homeViewModel.attach(client: CoreFactualReportClient(core: opened))
             timelineViewModel.attach(client: CoreTimelineEvidenceClient(core: opened))
             analysisViewModel.attach(client: CoreAnalysisEvidenceClient(core: opened))
+            let helper = Bundle.main.bundleURL
+                .appendingPathComponent("Contents/Helpers/chronicle-mcp", isDirectory: false)
+            settingsViewModel.attach(
+                runtime: CoreSettingsRuntimeService(
+                    core: opened,
+                    launchAtLogin: launchAtLoginService,
+                    recordingHandler: { [weak self] enabled in
+                        guard let self else { throw AppCaptureRuntimeError.notStarted }
+                        try await self.setRecordingEnabled(enabled)
+                    }
+                ),
+                integrations: SettingsIntegrationService.live(
+                    core: opened,
+                    applicationBundleURL: Bundle.main.bundleURL,
+                    helperURL: helper,
+                    managedRootURL: supportURL
+                )
+            )
             let diagnosticClient = CoreDiagnosticHealthClient(core: opened)
             healthViewModel.attach(fetcher: diagnosticClient)
             let monitor = StorageMonitor(fetcher: diagnosticClient) { [weak self] update in

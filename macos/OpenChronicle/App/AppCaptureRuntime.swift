@@ -43,9 +43,15 @@ protocol CaptureCoordinating: Sendable {
     func resume() async
     func resumeAfterStorageRecovery() async
     func wallClockChanged() async
-    func recordingPreferenceChanged(enabled: Bool) async
+    func recordingPreferenceChanged(enabled: Bool) async -> CaptureRecordingPreferenceOutcome
     func privacyBoundaryChanged() async
     func snapshot() async -> CaptureCoordinatorSnapshot
+}
+
+enum CaptureRecordingPreferenceOutcome: Equatable, Sendable {
+    case persisted
+    case notApplied
+    case failed(CapturePersistenceFailure)
 }
 
 extension CaptureCoordinator: CaptureCoordinating {}
@@ -184,10 +190,17 @@ actor AppCaptureRuntime {
         }
     }
 
-    func setRecordingEnabled(_ enabled: Bool) async {
-        guard started else { return }
+    func setRecordingEnabled(_ enabled: Bool) async throws {
+        guard started else { throw AppCaptureRuntimeError.notStarted }
+        switch await coordinator.recordingPreferenceChanged(enabled: enabled) {
+        case .persisted:
+            break
+        case .notApplied:
+            throw AppCaptureRuntimeError.recordingPreferenceNotApplied
+        case let .failed(failure):
+            throw AppCaptureRuntimeError.recordingPreferenceFailed(failure)
+        }
         await environment.update(paused: !enabled)
-        await coordinator.recordingPreferenceChanged(enabled: enabled)
         recordingEnabled = enabled
         await publishStatus()
     }
@@ -260,6 +273,23 @@ actor AppCaptureRuntime {
             .protected
         case .permissionDenied, .asleep, .noExactWindow, .ambiguousWindow, .foregroundChanged:
             .unavailable(denial)
+        }
+    }
+}
+
+enum AppCaptureRuntimeError: LocalizedError, Equatable {
+    case notStarted
+    case recordingPreferenceNotApplied
+    case recordingPreferenceFailed(CapturePersistenceFailure)
+
+    var errorDescription: String? {
+        switch self {
+        case .notStarted:
+            "Observation is not running, so its recording preference was not changed."
+        case .recordingPreferenceNotApplied:
+            "The recording preference could not be applied in the current capture state."
+        case let .recordingPreferenceFailed(failure):
+            "The recording preference was not saved (\(failure.code ?? "persistence-failure"))."
         }
     }
 }

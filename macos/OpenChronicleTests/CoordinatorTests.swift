@@ -274,6 +274,25 @@ final class CoordinatorTests: XCTestCase {
         XCTAssertEqual(state.state, .running)
     }
 
+    func testRecordingPreferencePersistenceFailureIsReturnedToCaller() async {
+        let failure = CapturePersistenceFailure(
+            category: .contractRepair,
+            code: "preference-write-failed",
+            retryable: false
+        )
+        let coordinator = makeCoordinator(
+            executor: RecordingCaptureExecutor(),
+            preferences: FailingPreferenceSetter(failure: failure)
+        )
+        await coordinator.activate(at: sample(wall: 0, monotonic: 0), startLoop: false)
+
+        let outcome = await coordinator.recordingPreferenceChanged(enabled: false)
+        let snapshot = await coordinator.snapshot()
+
+        XCTAssertEqual(outcome, .failed(failure))
+        XCTAssertEqual(snapshot.state, .repairRequired(failure))
+    }
+
     func testUserPauseForcesPixelFreeAttemptAndPermissionDenialKeepsCadence() async {
         let executor = RecordingCaptureExecutor(results: [
             .denied(.userPaused),
@@ -891,6 +910,22 @@ private actor RecordingPreferenceSetter: CaptureRecordingPreferenceSetting {
     ) -> CapturePersistenceFailure? {
         values.append(enabled)
         return nil
+    }
+}
+
+private actor FailingPreferenceSetter: CaptureRecordingPreferenceSetting {
+    let failure: CapturePersistenceFailure
+
+    init(failure: CapturePersistenceFailure) {
+        self.failure = failure
+    }
+
+    func setRecordingEnabled(
+        _ enabled: Bool,
+        at: Date
+    ) -> CapturePersistenceFailure? {
+        _ = enabled
+        return failure
     }
 }
 

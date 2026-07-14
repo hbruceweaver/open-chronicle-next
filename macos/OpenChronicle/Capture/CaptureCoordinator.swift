@@ -624,21 +624,39 @@ actor CaptureCoordinator {
         await recover(reason: nil, operation: operation)
     }
 
-    func recordingPreferenceChanged(enabled: Bool) async {
-        pendingRecordingPreference = enabled
-        guard state == .running,
-              let operation = beginLifecycleOperation()
-        else { return }
-        defer { finishLifecycleOperation(operation) }
-        guard await applyPendingRecordingPreference(operation: operation),
-              isCurrentLifecycleOperation(operation),
-              state == .running
-        else { return }
-        if pendingClockChange != nil {
-            await transition(to: .suspended, invalidation: .clockChanged)
-            guard isCurrentLifecycleOperation(operation) else { return }
-            await recover(reason: nil, operation: operation)
+    func recordingPreferenceChanged(
+        enabled: Bool
+    ) async -> CaptureRecordingPreferenceOutcome {
+        while state == .running {
+            guard let operation = beginLifecycleOperation() else {
+                await Task.yield()
+                continue
+            }
+            pendingRecordingPreference = enabled
+            let outcome = await applyPendingRecordingPreference(operation: operation)
+            if outcome == .notApplied, pendingRecordingPreference == enabled {
+                pendingRecordingPreference = nil
+            }
+            guard outcome == .persisted,
+                  isCurrentLifecycleOperation(operation),
+                  state == .running
+            else {
+                finishLifecycleOperation(operation)
+                if outcome == .notApplied, state == .running { continue }
+                return outcome
+            }
+            if pendingClockChange != nil {
+                await transition(to: .suspended, invalidation: .clockChanged)
+                guard isCurrentLifecycleOperation(operation) else {
+                    finishLifecycleOperation(operation)
+                    return .notApplied
+                }
+                await recover(reason: nil, operation: operation)
+            }
+            finishLifecycleOperation(operation)
+            return .persisted
         }
+        return .notApplied
     }
 
     func privacyBoundaryChanged() async {
@@ -839,7 +857,8 @@ actor CaptureCoordinator {
                 }
                 guard isCurrentLifecycleOperation(operation) else { return }
             }
-            guard await applyPendingRecordingPreference(operation: operation),
+            let preferenceOutcome = await applyPendingRecordingPreference(operation: operation)
+            guard preferenceOutcome == .persisted,
                   isCurrentLifecycleOperation(operation)
             else { return }
             if pendingClockChange != nil { continue }
@@ -861,7 +880,7 @@ actor CaptureCoordinator {
         operation: UInt64
     ) async -> Bool {
         while isCurrentLifecycleOperation(operation) {
-            guard await applyPendingRecordingPreference(operation: operation) else {
+            guard await applyPendingRecordingPreference(operation: operation) == .persisted else {
                 return true
             }
             let decision = await admission.admission(at: sample.wallTime)
@@ -949,7 +968,7 @@ actor CaptureCoordinator {
 
     private func applyPendingRecordingPreference(
         operation: UInt64
-    ) async -> Bool {
+    ) async -> CaptureRecordingPreferenceOutcome {
         while let enabled = pendingRecordingPreference {
             pendingRecordingPreference = nil
             let previousGeneration = executionGeneration
@@ -961,7 +980,7 @@ actor CaptureCoordinator {
                 if pendingRecordingPreference == nil {
                     pendingRecordingPreference = enabled
                 }
-                return false
+                return .notApplied
             }
             executionGeneration = nil
             let sample = await clock.sample()
@@ -969,22 +988,22 @@ actor CaptureCoordinator {
                 if pendingRecordingPreference == nil {
                     pendingRecordingPreference = enabled
                 }
-                return false
+                return .notApplied
             }
             if let failure = await preferences.setRecordingEnabled(
                 enabled,
                 at: sample.wallTime
             ) {
                 await handle(failure: failure)
-                return false
+                return .failed(failure)
             }
-            guard isCurrentLifecycleOperation(operation) else { return false }
+            guard isCurrentLifecycleOperation(operation) else { return .notApplied }
             if state == .running {
                 executionGeneration = await epoch.beginGeneration()
-                guard isCurrentLifecycleOperation(operation) else { return false }
+                guard isCurrentLifecycleOperation(operation) else { return .notApplied }
             }
         }
-        return true
+        return .persisted
     }
 
     private func transition(
