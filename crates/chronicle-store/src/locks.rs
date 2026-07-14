@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,6 @@ use crate::permissions::io_error;
 use crate::{JournalFamily, ManagedRoot, Result, StoreError};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
-static DERIVED_REVISION_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NAMED_PROCESS_LOCKS: OnceLock<(Mutex<HashSet<String>>, Condvar)> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -104,7 +103,11 @@ pub struct SharedStoreGuard {
 
 impl SharedStoreGuard {
     pub fn derived_revisions(&self) -> Result<DerivedRevisionGuard> {
-        let process = lock_derived_revision_process(self.timeout)?;
+        let process = lock_named_process(
+            format!("{}:derived-revisions", self.root.path().display()),
+            self.timeout,
+            "derived revisions",
+        )?;
         let file = self
             .root
             .open_file("locks/derived-revisions.lock", true, false, false)?;
@@ -177,7 +180,7 @@ pub struct ArtifactGuard {
 
 #[derive(Debug)]
 pub struct DerivedRevisionGuard {
-    _process: MutexGuard<'static, ()>,
+    _process: ProcessNamedGuard,
     _file: File,
 }
 
@@ -233,23 +236,6 @@ fn lock_bounded(file: &File, exclusive: bool, timeout: Duration, label: &str) ->
                 thread::sleep(RETRY_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
             }
             Err(error) => return Err(io_error(error)),
-        }
-    }
-}
-
-fn lock_derived_revision_process(timeout: Duration) -> Result<MutexGuard<'static, ()>> {
-    let lock = DERIVED_REVISION_PROCESS_LOCK.get_or_init(|| Mutex::new(()));
-    let started = Instant::now();
-    loop {
-        match lock.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) if started.elapsed() < timeout => {
-                thread::sleep(RETRY_INTERVAL);
-            }
-            Err(TryLockError::WouldBlock) => {
-                return Err(StoreError::LockTimeout("derived revisions".to_owned()));
-            }
         }
     }
 }

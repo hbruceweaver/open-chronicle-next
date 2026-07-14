@@ -25,6 +25,22 @@ fn shared_requests_block_exclusive_maintenance_with_bounded_wait() -> chronicle_
 }
 
 #[test]
+fn independent_roots_do_not_share_the_derived_revision_process_lock() -> chronicle_store::Result<()>
+{
+    let first_temporary = tempfile::tempdir()?;
+    let second_temporary = tempfile::tempdir()?;
+    let first_root = ManagedRoot::initialize(first_temporary.path().join("first-store"))?;
+    let second_root = ManagedRoot::initialize(second_temporary.path().join("second-store"))?;
+    let first_shared = LockManager::new(first_root, Duration::from_millis(25)).shared_request()?;
+    let _first_revision = first_shared.derived_revisions()?;
+    let second_shared =
+        LockManager::new(second_root, Duration::from_millis(25)).shared_request()?;
+
+    let _second_revision = second_shared.derived_revisions()?;
+    Ok(())
+}
+
+#[test]
 fn generation_change_invalidates_stale_handles() -> chronicle_store::Result<()> {
     let (_temporary, root, _sqlite, _projector) = common::store()?;
     let old = StoreGeneration::load(&root)?;
