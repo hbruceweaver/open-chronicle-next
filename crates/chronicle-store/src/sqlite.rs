@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::checksum::checksum_bytes;
+use crate::maintenance::ensure_normal_store_access;
 use crate::permissions::secure_file;
 use crate::{JournalFamily, ManagedRoot, Result, StoreError, StoreGeneration};
 
@@ -35,6 +36,7 @@ impl SqliteStore {
         if file_name.contains('/') || file_name.contains('\\') || file_name.is_empty() {
             return Err(StoreError::InvalidPath(file_name.to_owned()));
         }
+        ensure_normal_store_access(&root)?;
         let generation = StoreGeneration::initialize(&root)?;
         let store = Self {
             root,
@@ -48,10 +50,13 @@ impl SqliteStore {
             .root
             .open_file(&store.file_name, false, false, false)?;
         secure_file(&file, &store.file_name)?;
+        ensure_normal_store_access(&store.root)?;
+        store.generation.ensure_current(&store.root)?;
         Ok(store)
     }
 
     pub fn connection(&self) -> Result<Connection> {
+        ensure_normal_store_access(&self.root)?;
         self.generation.ensure_current(&self.root)?;
         let connection = self.open_connection()?;
         let identity: Option<(i64, String)> = connection

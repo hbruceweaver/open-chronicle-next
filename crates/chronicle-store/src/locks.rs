@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{FlockOperation, flock};
 
+use crate::maintenance::ensure_normal_store_access;
 use crate::permissions::io_error;
 use crate::{JournalFamily, ManagedRoot, Result, StoreError};
 
@@ -28,6 +29,7 @@ impl LockManager {
             .root
             .open_file("locks/store.lock", true, false, false)?;
         lock_bounded(&file, false, self.timeout, "shared store")?;
+        ensure_normal_store_access(&self.root)?;
         Ok(SharedStoreGuard {
             file,
             root: self.root.clone(),

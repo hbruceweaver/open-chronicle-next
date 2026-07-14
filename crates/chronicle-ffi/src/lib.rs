@@ -147,6 +147,11 @@ impl From<StoreError> for FfiError {
                 "capture-owner-active",
                 "another Open Chronicle application process owns capture",
             ),
+            StoreError::MaintenanceInProgress => Self::retryable(
+                ChronicleStatus::Io,
+                "maintenance-in-progress",
+                "committed Chronicle maintenance must be resumed before normal access",
+            ),
             StoreError::ScreenshotFreeSpace { .. } => Self::retryable(
                 ChronicleStatus::Io,
                 "screenshot-free-space",
@@ -2781,7 +2786,11 @@ mod tests {
         ArtifactStatus, ArtifactType, AuthorIdentity, AuthorKind, ChunkRevision,
         DerivedArtifactRevision, DurationEstimate, EvidenceReferences, QueryResponse,
     };
-    use chronicle_store::{ArtifactStore, CanonicalJournal, Projector, RecoveryManager};
+    use chronicle_store::{
+        ArtifactStore, CanonicalJournal, EvidenceDeletionConfirmation, EvidenceDeletionOptions,
+        MaintenanceFaultInjector, MaintenanceFaultPoint, MaintenanceStore, Projector,
+        RecoveryManager,
+    };
     use std::sync::{Arc, Barrier};
 
     fn response_bytes(buffer: ChronicleBuffer) -> Vec<u8> {
@@ -3179,6 +3188,69 @@ mod tests {
         assert_eq!(close(first).0, ChronicleStatus::Ok as u32);
         let (reopened, _) = open(&temporary);
         assert_eq!(close(reopened).0, ChronicleStatus::Ok as u32);
+    }
+
+    #[test]
+    fn app_open_reports_committed_maintenance_until_deletion_resume_completes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ManagedRoot::initialize(temporary.path().join("store")).expect("managed root");
+        SqliteStore::open(root.clone()).expect("initial projection");
+        let maintenance =
+            MaintenanceStore::open(root.clone(), std::time::Duration::from_millis(100))
+                .expect("maintenance store");
+        let preview = maintenance
+            .prepare_evidence_deletion(
+                EvidenceDeletionOptions::default(),
+                "2026-07-13T09:00:00Z".parse().expect("timestamp"),
+            )
+            .expect("deletion preview");
+        assert!(
+            maintenance
+                .finalize_evidence_deletion(
+                    EvidenceDeletionConfirmation::confirmed(&preview),
+                    "2026-07-13T09:00:01Z".parse().expect("timestamp"),
+                    MaintenanceFaultInjector::at(MaintenanceFaultPoint::AfterGenerationIncrement,),
+                )
+                .is_err()
+        );
+
+        let committed_receipt = root
+            .read("receipts/evidence-deletion.json")
+            .expect("committed receipt");
+        let mut forged: Value = serde_json::from_slice(&committed_receipt).expect("decode receipt");
+        forged["state"] = Value::String("complete".to_owned());
+        forged["committed_generation"] = Value::from(2_u64);
+        forged["completed_at"] = Value::String("2026-07-13T09:00:01.5Z".to_owned());
+        forged["deleted_relative_paths"] = Value::Array(
+            preview
+                .deletion
+                .files
+                .iter()
+                .map(|item| Value::String(item.relative_path.clone()))
+                .collect(),
+        );
+        root.atomic_write(
+            "receipts/evidence-deletion.json",
+            &serde_json::to_vec(&forged).expect("encode forged receipt"),
+        )
+        .expect("persist forged receipt");
+
+        let (status, handle, response) = open_raw(&temporary);
+        assert_eq!(status, ChronicleStatus::Io as u32);
+        assert_eq!(handle, 0);
+        assert_eq!(response["error"]["code"], "maintenance-in-progress");
+        assert_eq!(response["error"]["retryable"], true);
+
+        root.atomic_write("receipts/evidence-deletion.json", &committed_receipt)
+            .expect("restore committed receipt");
+        maintenance
+            .resume_evidence_deletion(
+                "2026-07-13T09:00:02Z".parse().expect("timestamp"),
+                MaintenanceFaultInjector::none(),
+            )
+            .expect("maintenance resume");
+        let (handle, _) = open(&temporary);
+        assert_eq!(close(handle).0, ChronicleStatus::Ok as u32);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::checksum::{canonical_json, checksum_bytes};
+use crate::maintenance::ensure_normal_store_access;
 use crate::{FaultInjector, FaultPoint, LockManager, ManagedRoot, Result, SqliteStore, StoreError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -315,6 +316,7 @@ impl CanonicalJournal {
     }
 
     pub fn scan_all(&self, family: JournalFamily, repair_partial: bool) -> Result<ScanReport> {
+        ensure_normal_store_access(&self.root)?;
         let _writer =
             LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
         self.scan_all_locked(family, repair_partial)
@@ -324,6 +326,7 @@ impl CanonicalJournal {
     /// index. Once startup recovery has loaded the event family, this does not
     /// rescan historical record bodies.
     pub fn event_presence(&self, event_ids: &[EventId]) -> Result<Vec<bool>> {
+        ensure_normal_store_access(&self.root)?;
         let _writer = LockManager::new(self.root.clone(), Duration::from_secs(1))
             .journal(JournalFamily::Events)?;
         self.refresh_index(JournalFamily::Events)?;
@@ -342,6 +345,7 @@ impl CanonicalJournal {
     }
 
     pub(crate) fn image_intent_owner(&self, artifact_id: &str) -> Result<Option<String>> {
+        ensure_normal_store_access(&self.root)?;
         let _writer = LockManager::new(self.root.clone(), Duration::from_secs(1))
             .journal(JournalFamily::Events)?;
         self.refresh_index(JournalFamily::Events)?;
@@ -546,6 +550,9 @@ impl CanonicalJournal {
         shard: &str,
         repair_partial: bool,
     ) -> Result<ScanReport> {
+        if repair_partial {
+            ensure_normal_store_access(&self.root)?;
+        }
         validate_shard_name(shard)?;
         let relative = format!("{}/{shard}", family.directory());
         let mut file = self.root.open_file(&relative, false, false, false)?;
@@ -609,6 +616,7 @@ impl CanonicalJournal {
         _confirmation: RepairConfirmation,
         faults: FaultInjector,
     ) -> Result<RepairReport> {
+        ensure_normal_store_access(&self.root)?;
         validate_shard_name(shard)?;
         let _writer =
             LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
@@ -772,6 +780,7 @@ impl CanonicalJournal {
         body: &T,
         faults: FaultInjector,
     ) -> Result<VerifiedRecord> {
+        ensure_normal_store_access(&self.root)?;
         let (line, body_bytes, checksum) = encode_line(body)?;
         let _writer =
             LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;

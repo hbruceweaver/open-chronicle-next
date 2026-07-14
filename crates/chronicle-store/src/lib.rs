@@ -8,6 +8,7 @@ pub mod health;
 pub mod journal;
 pub mod layout;
 pub mod locks;
+pub mod maintenance;
 pub mod permissions;
 pub mod projection;
 pub mod queries;
@@ -34,6 +35,7 @@ pub use health::*;
 pub use journal::*;
 pub use layout::*;
 pub use locks::*;
+pub use maintenance::*;
 pub use projection::*;
 pub use queries::*;
 pub use receipts::*;
@@ -70,6 +72,8 @@ pub enum StoreError {
     LockTimeout(String),
     #[error("another Open Chronicle application process owns capture")]
     CaptureOwnerActive,
+    #[error("an evidence deletion is committed and must be resumed before normal store access")]
+    MaintenanceInProgress,
     #[error(
         "screenshot transaction requires {required_bytes} available bytes but found {available_bytes}"
     )]

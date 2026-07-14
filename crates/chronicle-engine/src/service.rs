@@ -94,6 +94,10 @@ impl SharedService {
     }
 
     pub fn open(root: ManagedRoot, sqlite: SqliteStore) -> Result<Self, SharedServiceError> {
+        // The caller may be handing us a handle opened before a committed
+        // maintenance fence. Revalidate it here instead of trusting handle
+        // construction time.
+        drop(sqlite.connection().map_err(map_store)?);
         let generation = StoreGeneration::load(&root).map_err(map_store)?;
         Ok(Self {
             queries: StoreQueries::new(sqlite.clone()),

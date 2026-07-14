@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::maintenance::ensure_normal_store_access;
 use crate::{ManagedRoot, Result, StoreError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +16,7 @@ impl StoreGeneration {
         if root.exists("store-generation")? {
             return Self::load(root);
         }
+        ensure_normal_store_access(root)?;
         let generation = Self {
             schema_version: 1,
             generation: 1,
@@ -35,6 +37,7 @@ impl StoreGeneration {
     }
 
     pub fn increment(&self, root: &ManagedRoot) -> Result<Self> {
+        ensure_normal_store_access(root)?;
         let next = Self {
             schema_version: 1,
             generation: self
