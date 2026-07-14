@@ -1,17 +1,17 @@
 import AppKit
 import Carbon
 import SwiftUI
+@preconcurrency import UserNotifications
 
 @main
 struct OpenChronicleApp: App {
     @NSApplicationDelegateAdaptor(AppLifecycleDelegate.self) private var appDelegate
-    @StateObject private var navigation = NavigationModel()
 
     var body: some Scene {
         Window("Open Chronicle", id: "main") {
             ShellView()
                 .environmentObject(appDelegate.appModel)
-                .environmentObject(navigation)
+                .environmentObject(appDelegate.navigation)
                 .frame(minWidth: 720, minHeight: 480)
         }
         .defaultSize(width: 960, height: 680)
@@ -39,18 +39,27 @@ private struct ChronicleMenuLabel: View {
 
     private var symbol: String {
         switch appModel.health.status {
-        case .connecting: "clock"
-        case .repairRequired: "exclamationmark.triangle"
+        case .connecting: return "clock"
+        case .repairRequired: return "exclamationmark.triangle"
         case .ready:
+            if appModel.captureStatus == .storageBlocked
+                || appModel.captureStatus.isRepairRequired
+                || appModel.operationalStorageState == .blocked
+            {
+                return "exclamationmark.triangle"
+            }
+            if appModel.operationalStorageState == .warning {
+                return "exclamationmark.circle"
+            }
             switch appModel.captureStatus {
-            case .recording: "record.circle.fill"
-            case .paused, .setupRequired, .stopped: "pause.circle"
-            case .protected: "eye.slash"
-            case .unavailable: "exclamationmark.circle"
-            case .sleeping: "moon.zzz"
-            case .studyNotStarted, .studyExpired: "calendar.badge.exclamationmark"
-            case .storageBlocked, .repairRequired: "exclamationmark.triangle"
-            case .starting: "clock"
+            case .recording: return "record.circle.fill"
+            case .paused, .setupRequired, .stopped: return "pause.circle"
+            case .protected: return "eye.slash"
+            case .unavailable: return "exclamationmark.circle"
+            case .sleeping: return "moon.zzz"
+            case .studyNotStarted, .studyExpired: return "calendar.badge.exclamationmark"
+            case .storageBlocked, .repairRequired: return "exclamationmark.triangle"
+            case .starting: return "clock"
             }
         }
     }
@@ -161,22 +170,30 @@ private struct ChronicleMenu: View {
 
     private var statusLabel: String {
         switch appModel.health.status {
-        case .connecting: "Core: Connecting"
-        case .repairRequired: "Core: Repair Required"
+        case .connecting: return "Core: Connecting"
+        case .repairRequired: return "Core: Repair Required"
         case .ready:
+            if appModel.captureStatus == .storageBlocked
+                || appModel.operationalStorageState == .blocked
+            {
+                return "Storage blocked"
+            }
+            if appModel.operationalStorageState == .warning {
+                return "Storage running low"
+            }
             switch appModel.captureStatus {
-            case .setupRequired: "Setup required"
-            case .starting: "Observation starting"
-            case .recording: "Observation active"
-            case .paused: "Observation paused"
-            case .protected: "Current surface protected"
-            case .unavailable: "Observation unavailable"
-            case .sleeping: "Sleeping"
-            case .studyNotStarted: "Study not started"
-            case .studyExpired: "Study ended"
-            case .storageBlocked: "Storage blocked"
-            case .stopped: "Observation stopped"
-            case .repairRequired: "Observation repair required"
+            case .setupRequired: return "Setup required"
+            case .starting: return "Observation starting"
+            case .recording: return "Observation active"
+            case .paused: return "Observation paused"
+            case .protected: return "Current surface protected"
+            case .unavailable: return "Observation unavailable"
+            case .sleeping: return "Sleeping"
+            case .studyNotStarted: return "Study not started"
+            case .studyExpired: return "Study ended"
+            case .storageBlocked: return "Storage blocked"
+            case .stopped: return "Observation stopped"
+            case .repairRequired: return "Observation repair required"
             }
         }
     }
@@ -201,6 +218,13 @@ private extension CaptureDenial {
     }
 }
 
+private extension CapturePresentationState {
+    var isRepairRequired: Bool {
+        if case .repairRequired = self { return true }
+        return false
+    }
+}
+
 @MainActor
 final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     static let activationRequest = Notification.Name(
@@ -210,6 +234,14 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     lazy var appModel = AppModel(duplicateInstanceHandler: { [weak self] in
         self?.requestAuthoritativeInstanceActivation()
     })
+    lazy var navigation = NavigationModel()
+    private lazy var notificationResponseDelegate = ChronicleNotificationResponseDelegate {
+        [weak self] route in
+        Task { @MainActor [weak self] in
+            self?.presentMainWindow()
+            self?.navigation.show(notificationRoute: route)
+        }
+    }
     private var terminationInFlight = false
     private var suppressInitialWindows = false
     private var windowVisibilityObserver: NSObjectProtocol?
@@ -221,6 +253,7 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = notificationResponseDelegate
         DistributedNotificationCenter.default().addObserver(
             self,
             selector: #selector(handleActivationRequest(_:)),

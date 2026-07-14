@@ -64,6 +64,33 @@ struct DiagnosticStorageSummary: Codable, Equatable, Sendable {
     }
 }
 
+enum DiagnosticScreenshotStorageState: String, Codable, Equatable, Sendable {
+    case healthy
+    case warning
+    case blockedFreeSpace = "blocked-free-space"
+    case blockedImageQuota = "blocked-image-quota"
+}
+
+struct DiagnosticScreenshotStorageSummary: Codable, Equatable, Sendable {
+    let managedImageBytes: UInt64
+    let availableBytes: UInt64
+    let warningFreeBytes: UInt64
+    let minimumFreeBytes: UInt64
+    let managedImageQuotaBytes: UInt64
+    let journalReserveBytes: UInt64
+    let state: DiagnosticScreenshotStorageState
+
+    enum CodingKeys: String, CodingKey {
+        case managedImageBytes = "managed_image_bytes"
+        case availableBytes = "available_bytes"
+        case warningFreeBytes = "warning_free_bytes"
+        case minimumFreeBytes = "minimum_free_bytes"
+        case managedImageQuotaBytes = "managed_image_quota_bytes"
+        case journalReserveBytes = "journal_reserve_bytes"
+        case state
+    }
+}
+
 struct DiagnosticStudySummary: Codable, Equatable, Sendable {
     let state: DiagnosticStudyState
     let start: String?
@@ -141,6 +168,7 @@ struct DiagnosticHealthSnapshot: Codable, Equatable, Sendable {
     let screenshotRetention: DiagnosticScreenshotRetentionSummary
     let mcp: DiagnosticMCPHealthSummary
     let issues: [DiagnosticHealthIssue]
+    var screenshotStorage: DiagnosticScreenshotStorageSummary? = nil
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -222,7 +250,19 @@ actor CoreDiagnosticHealthClient: DiagnosticHealthFetching {
         else {
             throw ChronicleBridgeError.malformedResponse
         }
-        return shared.result.data
+        let storageRequest = try JSONSerialization.data(withJSONObject: [
+            "schema_version": "1.0",
+            "now": ChronicleTimestamp.string(date),
+            "control": ["type": "storage-health"],
+        ])
+        let storageResponse = try await core.call(storageRequest)
+        let storageEnvelope = try JSONDecoder().decode(
+            ChronicleEnvelope<DiagnosticScreenshotStorageSummary>.self,
+            from: storageResponse
+        )
+        var snapshot = shared.result.data
+        snapshot.screenshotStorage = try storageEnvelope.requireCompatibleMajor()
+        return snapshot
     }
 }
 

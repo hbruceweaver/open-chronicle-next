@@ -11,11 +11,14 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var health = ChronicleHealthState(status: .connecting)
     @Published private(set) var captureStatus: CapturePresentationState = .starting
+    @Published private(set) var operationalStorageState: OperationalStorageState = .healthy
     let healthViewModel = HealthViewModel()
     private var core: (any CoreService)?
     private var runtime: AppCaptureRuntime?
     private var lifecycleMonitor: LifecycleMonitor?
     private var storageMonitor: StorageMonitor?
+    private let notificationService: NotificationService
+    private var latestDiagnosticHealth: DiagnosticHealthSnapshot?
     private var connectionTask: Task<Void, Never>?
     private var isShuttingDown = false
     private let coreFactory: CoreFactory
@@ -27,6 +30,7 @@ final class AppModel: ObservableObject {
         coreFactory: CoreFactory? = nil,
         runtimeFactory: RuntimeFactory? = nil,
         shouldStartCapture: (() -> Bool)? = nil,
+        notificationService: NotificationService? = nil,
         duplicateInstanceHandler: @escaping DuplicateInstanceHandler = {}
     ) {
         self.coreFactory = coreFactory ?? { supportURL in
@@ -40,6 +44,7 @@ final class AppModel: ObservableObject {
         self.shouldStartCapture = shouldStartCapture ?? {
             AppRuntimeFactory.hasCompletedOnboarding()
         }
+        self.notificationService = notificationService ?? NotificationService()
         self.duplicateInstanceHandler = duplicateInstanceHandler
     }
 
@@ -173,15 +178,25 @@ final class AppModel: ObservableObject {
         return base.appendingPathComponent(identifier, isDirectory: true)
     }
 
-    private func updateCaptureStatus(_ status: CapturePresentationState) {
+    private func updateCaptureStatus(_ status: CapturePresentationState) async {
         captureStatus = status
+        await notificationService.evaluate(
+            captureStatus: status,
+            health: latestDiagnosticHealth
+        )
     }
 
-    private func applyStorageMonitorUpdate(_ update: StorageMonitorUpdate) {
+    private func applyStorageMonitorUpdate(_ update: StorageMonitorUpdate) async {
         guard !isShuttingDown else { return }
         switch update {
         case let .snapshot(snapshot):
+            latestDiagnosticHealth = snapshot
+            operationalStorageState = OperationalStoragePolicy.state(for: snapshot)
             healthViewModel.apply(snapshot)
+            await notificationService.evaluate(
+                captureStatus: captureStatus,
+                health: snapshot
+            )
         case let .failed(message):
             healthViewModel.fail(message)
         }

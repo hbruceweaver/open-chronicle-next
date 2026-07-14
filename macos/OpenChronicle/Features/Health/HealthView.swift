@@ -20,7 +20,12 @@ struct HealthView: View {
                         row("Projection", snapshot.projection.rawValue.capitalized)
                         row("Last durable event", latestEvent(snapshot))
                         row("Available storage", format(bytes: snapshot.storage.availableBytes))
-                        row("Managed screenshots", format(bytes: snapshot.storage.managedBytes))
+                        row("Managed data", format(bytes: snapshot.storage.managedBytes))
+                        row(
+                            "Managed screenshots",
+                            snapshot.screenshotStorage.map { format(bytes: $0.managedImageBytes) }
+                                ?? "Unavailable"
+                        )
                         row("Screenshot records", "\(snapshot.screenshotRetention.retained) retained")
                         row("Mode", studyDescription(snapshot.study))
                         row("MCP grants", "\(snapshot.mcp.activeGrants) active")
@@ -66,7 +71,7 @@ struct HealthView: View {
             return "Action required"
         }
         if !snapshot.issues.isEmpty
-            || HealthViewModel.storageState(for: snapshot.storage) == .warning
+            || HealthViewModel.storageState(for: snapshot) == .warning
         {
             return "Needs attention"
         }
@@ -74,7 +79,7 @@ struct HealthView: View {
     }
 
     private func healthSymbol(_ snapshot: DiagnosticHealthSnapshot) -> String {
-        switch HealthViewModel.storageState(for: snapshot.storage) {
+        switch HealthViewModel.storageState(for: snapshot) {
         case .blocked: "exclamationmark.triangle.fill"
         case .warning: "exclamationmark.circle"
         case .healthy: snapshot.issues.isEmpty ? "checkmark.circle.fill" : "info.circle"

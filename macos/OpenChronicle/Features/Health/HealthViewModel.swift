@@ -6,12 +6,40 @@ enum OperationalStorageState: Equatable, Sendable {
     case blocked
 }
 
-@MainActor
-final class HealthViewModel: ObservableObject {
+enum OperationalStoragePolicy {
     static let gibibyte = UInt64(1_073_741_824)
     static let warningAvailableBytes = 4 * gibibyte
     static let minimumAvailableBytes = 2 * gibibyte
     static let managedImageQuotaBytes = 20 * gibibyte
+
+    static func state(for summary: DiagnosticStorageSummary) -> OperationalStorageState {
+        if summary.availableBytes < minimumAvailableBytes {
+            return .blocked
+        }
+        if summary.availableBytes < warningAvailableBytes {
+            return .warning
+        }
+        return .healthy
+    }
+
+    static func state(for snapshot: DiagnosticHealthSnapshot) -> OperationalStorageState {
+        guard let screenshotStorage = snapshot.screenshotStorage else {
+            return state(for: snapshot.storage)
+        }
+        switch screenshotStorage.state {
+        case .healthy: return .healthy
+        case .warning: return .warning
+        case .blockedFreeSpace, .blockedImageQuota: return .blocked
+        }
+    }
+}
+
+@MainActor
+final class HealthViewModel: ObservableObject {
+    static let gibibyte = OperationalStoragePolicy.gibibyte
+    static let warningAvailableBytes = OperationalStoragePolicy.warningAvailableBytes
+    static let minimumAvailableBytes = OperationalStoragePolicy.minimumAvailableBytes
+    static let managedImageQuotaBytes = OperationalStoragePolicy.managedImageQuotaBytes
 
     @Published private(set) var snapshot: DiagnosticHealthSnapshot?
     @Published private(set) var lastError: String?
@@ -43,14 +71,10 @@ final class HealthViewModel: ObservableObject {
     }
 
     static func storageState(for summary: DiagnosticStorageSummary) -> OperationalStorageState {
-        if summary.availableBytes < minimumAvailableBytes
-            || summary.managedBytes >= managedImageQuotaBytes
-        {
-            return .blocked
-        }
-        if summary.availableBytes < warningAvailableBytes {
-            return .warning
-        }
-        return .healthy
+        OperationalStoragePolicy.state(for: summary)
+    }
+
+    static func storageState(for snapshot: DiagnosticHealthSnapshot) -> OperationalStorageState {
+        OperationalStoragePolicy.state(for: snapshot)
     }
 }

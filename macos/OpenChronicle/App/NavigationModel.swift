@@ -24,6 +24,10 @@ final class NavigationModel: ObservableObject {
         }
     }
 
+    func show(notificationRoute: ChronicleNotificationRoute) {
+        show(notificationRoute.appRoute)
+    }
+
     func goBack() {
         guard !path.isEmpty else { return }
         path.removeLast()
