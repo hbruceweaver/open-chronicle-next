@@ -375,13 +375,13 @@ final class AgentRegistrationService {
         matchesHelper helper: String,
         arguments: [String]
     ) -> Bool {
-        let lines = output.split(whereSeparator: \Character.isNewline).map(String.init)
+        let lines = output.split(whereSeparator: { $0.isNewline }).map(String.init)
         guard let commandLine = lines.first(where: {
-            $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("command:")
+            $0.trimmingCharacters(in: CharacterSet.whitespaces).lowercased().hasPrefix("command:")
         }),
             unquoted(value(afterLabel: commandLine)) == helper,
             let argumentsLine = lines.first(where: {
-                $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("args:")
+                $0.trimmingCharacters(in: CharacterSet.whitespaces).lowercased().hasPrefix("args:")
             })
         else { return false }
         let actualArguments = value(afterLabel: argumentsLine)

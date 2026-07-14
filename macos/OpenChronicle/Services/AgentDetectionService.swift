@@ -332,10 +332,10 @@ final class AgentDetectionService {
 
     private static func safeVersion(_ output: String) -> String? {
         guard let line = output
-            .split(whereSeparator: \Character.isNewline)
+            .split(whereSeparator: { $0.isNewline })
             .first
             .map(String.init)
-            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }),
+            .map({ $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }),
             !line.isEmpty
         else { return nil }
         return String(line.prefix(160))
