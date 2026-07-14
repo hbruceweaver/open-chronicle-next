@@ -373,7 +373,8 @@ private final class SettingsIntegrationFixture {
     let kind: AgentKind
     let applicationBundle = URL(fileURLWithPath: "/Applications/Open Chronicle.app")
     let helper = URL(fileURLWithPath: "/Applications/Open Chronicle.app/Contents/Helpers/chronicle-mcp")
-    let managedRoot = URL(fileURLWithPath: "/Users/test/Library/Application Support/Open Chronicle")
+    let managedRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("open-chronicle-settings-test", isDirectory: true)
     let grant: DisclosureGrantRecord
     let detector: FixedSettingsAgentDetector
     let connection = StubSettingsAgentConnection()
