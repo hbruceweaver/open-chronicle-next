@@ -38,7 +38,7 @@ enum AppRuntimeFactory {
             contextSource: SystemCaptureAttemptContextSource(
                 deviceID: deviceID,
                 cadenceSeconds: configuration.cadenceSeconds,
-                retentionSeconds: 24 * 60 * 60
+                retentionSeconds: TimeInterval(configuration.screenshotRetentionSeconds)
             ),
             executor: pipeline,
             admission: captureControl,
@@ -58,7 +58,15 @@ enum AppRuntimeFactory {
     }
 
     static func hasCompletedOnboarding(defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: "onboarding.completed")
+        let store = UserDefaultsOnboardingStateStore(defaults: defaults)
+        guard case let .restored(state) = store.load(now: Date()) else { return false }
+        return state.isComplete &&
+            state.currentStep == .completion &&
+            state.furthestStepIndex == OnboardingStep.allCases.count - 1 &&
+            state.proofState == .passed &&
+            state.proofFailure == nil &&
+            state.draft.privacyAcknowledged &&
+            state.draft.deferAgentSetup
     }
 
     private static func stableDeviceID(defaults: UserDefaults) -> String {

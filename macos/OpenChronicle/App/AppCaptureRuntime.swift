@@ -26,6 +26,7 @@ enum CapturePresentationState: Equatable, Sendable {
 struct AppRuntimeConfiguration: Equatable, Sendable {
     let recordingEnabled: Bool
     let cadenceSeconds: UInt32
+    let screenshotRetentionSeconds: UInt32
 }
 
 protocol AppRuntimeControlling: Sendable {
@@ -67,7 +68,8 @@ actor CoreAppRuntimeController: AppRuntimeControlling {
         )
         return AppRuntimeConfiguration(
             recordingEnabled: payload.recordingPreference,
-            cadenceSeconds: payload.cadence.seconds
+            cadenceSeconds: payload.cadence.seconds,
+            screenshotRetentionSeconds: payload.screenshotRetention.seconds
         )
     }
 
@@ -265,10 +267,28 @@ actor AppCaptureRuntime {
 private struct RuntimeStatePayload: Codable, Sendable {
     let recordingPreference: Bool
     let cadence: RuntimeCadence
+    let screenshotRetention: RuntimeScreenshotRetention
 
     enum CodingKeys: String, CodingKey {
         case recordingPreference = "recording_preference"
         case cadence
+        case screenshotRetention = "screenshot_retention"
+    }
+}
+
+private enum RuntimeScreenshotRetention: String, Codable, Sendable {
+    case oneHour = "one-hour"
+    case twentyFourHours = "twenty-four-hours"
+    case sevenDays = "seven-days"
+    case thirtyDays = "thirty-days"
+
+    var seconds: UInt32 {
+        switch self {
+        case .oneHour: 60 * 60
+        case .twentyFourHours: 24 * 60 * 60
+        case .sevenDays: 7 * 24 * 60 * 60
+        case .thirtyDays: 30 * 24 * 60 * 60
+        }
     }
 }
 

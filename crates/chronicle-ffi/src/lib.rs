@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use chronicle_domain::{
     CaptureCadence, DeviceId, EventEnvelope, EventPayload, ImageArtifactId, ObservationContent,
-    ScreenshotProjectedState, SharedServiceRequest, parse_versioned, validate_schema_version,
+    ScreenshotProjectedState, ScreenshotRetention, SharedServiceRequest, parse_versioned,
+    validate_schema_version,
 };
 use chronicle_engine::{
     CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator,
@@ -492,6 +493,9 @@ enum AppControl {
     SetCadence {
         cadence: CaptureCadence,
     },
+    SetScreenshotRetention {
+        retention: ScreenshotRetention,
+    },
     ConfigureStudy {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
@@ -675,6 +679,11 @@ impl CoreHandle {
                 .coordinator
                 .set_cadence(cadence)
                 .map(|()| json!({ "cadence": cadence }))
+                .map_err(FfiError::from),
+            AppControl::SetScreenshotRetention { retention } => self
+                .coordinator
+                .set_screenshot_retention(retention)
+                .map(|()| json!({ "screenshot_retention": retention }))
                 .map_err(FfiError::from),
             AppControl::ConfigureStudy { start, end } => self
                 .coordinator
@@ -1449,6 +1458,10 @@ mod tests {
         assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
         assert_eq!(response["result"]["recording_preference"], false);
         assert_eq!(response["result"]["cadence"], "sixty-seconds");
+        assert_eq!(
+            response["result"]["screenshot_retention"],
+            "twenty-four-hours"
+        );
 
         let private_operation_as_shared = json!({
             "schema_version": "1.0",
@@ -1523,6 +1536,13 @@ mod tests {
                 json!({ "type": "set-cadence", "cadence": "thirty-seconds" }),
             ),
             (
+                "2026-07-13T09:00:02.500Z",
+                json!({
+                    "type": "set-screenshot-retention",
+                    "retention": "seven-days"
+                }),
+            ),
+            (
                 "2026-07-13T09:00:03Z",
                 json!({
                     "type": "configure-study",
@@ -1562,6 +1582,7 @@ mod tests {
         assert_eq!(status, ChronicleStatus::Ok as u32, "{state}");
         assert_eq!(state["result"]["recording_preference"], true);
         assert_eq!(state["result"]["cadence"], "thirty-seconds");
+        assert_eq!(state["result"]["screenshot_retention"], "seven-days");
 
         let (status, storage) = control(
             handle,

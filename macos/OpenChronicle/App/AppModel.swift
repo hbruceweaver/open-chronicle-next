@@ -20,6 +20,10 @@ final class AppModel: ObservableObject {
     private let notificationService: NotificationService
     private var latestDiagnosticHealth: DiagnosticHealthSnapshot?
     private var connectionTask: Task<Void, Never>?
+    private var runtimeStartTask: Task<Void, Error>?
+    private var onboardingCompletionTask: Task<Void, Error>?
+    private var onboardingConfigurationInFlight: OnboardingRuntimeConfiguration?
+    private var completedOnboardingConfiguration: OnboardingRuntimeConfiguration?
     private var isShuttingDown = false
     private let coreFactory: CoreFactory
     private let runtimeFactory: RuntimeFactory
@@ -70,6 +74,42 @@ final class AppModel: ObservableObject {
         await runtime?.retryStorageRecovery()
     }
 
+    func completeOnboarding(_ configuration: OnboardingRuntimeConfiguration) async throws {
+        if let completedOnboardingConfiguration {
+            guard completedOnboardingConfiguration == configuration else {
+                throw AppModelOnboardingError.conflictingConfiguration
+            }
+            return
+        }
+        if let onboardingCompletionTask {
+            guard onboardingConfigurationInFlight == configuration else {
+                throw AppModelOnboardingError.conflictingConfiguration
+            }
+            try await onboardingCompletionTask.value
+            return
+        }
+        guard !isShuttingDown, let core else {
+            throw AppModelOnboardingError.coreUnavailable
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self, !self.isShuttingDown else { throw CancellationError() }
+            try await CoreOnboardingConfigurationService(core: core).apply(configuration)
+            try await self.startCaptureRuntime(using: core)
+        }
+        onboardingConfigurationInFlight = configuration
+        onboardingCompletionTask = task
+        do {
+            try await task.value
+            completedOnboardingConfiguration = configuration
+            onboardingCompletionTask = nil
+            onboardingConfigurationInFlight = nil
+        } catch {
+            onboardingCompletionTask = nil
+            onboardingConfigurationInFlight = nil
+            throw error
+        }
+    }
+
     func shutdown() async {
         guard !isShuttingDown else {
             await connectionTask?.value
@@ -79,6 +119,17 @@ final class AppModel: ObservableObject {
         connectionTask?.cancel()
         await connectionTask?.value
         connectionTask = nil
+        onboardingCompletionTask?.cancel()
+        if let onboardingCompletionTask {
+            _ = try? await onboardingCompletionTask.value
+        }
+        self.onboardingCompletionTask = nil
+        onboardingConfigurationInFlight = nil
+        runtimeStartTask?.cancel()
+        if let runtimeStartTask {
+            _ = try? await runtimeStartTask.value
+        }
+        self.runtimeStartTask = nil
         lifecycleMonitor?.stop()
         lifecycleMonitor = nil
         await storageMonitor?.stop()
@@ -118,23 +169,7 @@ final class AppModel: ObservableObject {
                 return
             }
             if shouldStartCapture() {
-                let runtime = try await runtimeFactory(opened) { [weak self] status in
-                    await self?.updateCaptureStatus(status)
-                }
-                guard !isShuttingDown else {
-                    try? await opened.close()
-                    return
-                }
-                try await runtime.start()
-                guard !isShuttingDown else {
-                    try? await runtime.shutdown()
-                    try? await opened.close()
-                    return
-                }
-                let monitor = LifecycleMonitor(runtime: runtime)
-                monitor.start()
-                self.runtime = runtime
-                lifecycleMonitor = monitor
+                try await startCaptureRuntime(using: opened)
             } else {
                 captureStatus = .setupRequired
             }
@@ -186,6 +221,39 @@ final class AppModel: ObservableObject {
         )
     }
 
+    private func startCaptureRuntime(using core: any CoreService) async throws {
+        if runtime != nil { return }
+        if let runtimeStartTask {
+            try await runtimeStartTask.value
+            return
+        }
+
+        let task = Task { @MainActor [weak self] in
+            guard let self, !self.isShuttingDown else { throw CancellationError() }
+            let created = try await self.runtimeFactory(core) { [weak self] status in
+                await self?.updateCaptureStatus(status)
+            }
+            guard !self.isShuttingDown else { throw CancellationError() }
+            try await created.start()
+            guard !self.isShuttingDown else {
+                try? await created.shutdown()
+                throw CancellationError()
+            }
+            let monitor = LifecycleMonitor(runtime: created)
+            monitor.start()
+            self.runtime = created
+            self.lifecycleMonitor = monitor
+        }
+        runtimeStartTask = task
+        do {
+            try await task.value
+            runtimeStartTask = nil
+        } catch {
+            runtimeStartTask = nil
+            throw error
+        }
+    }
+
     private func applyStorageMonitorUpdate(_ update: StorageMonitorUpdate) async {
         guard !isShuttingDown else { return }
         switch update {
@@ -207,5 +275,19 @@ final class AppModel: ObservableObject {
             return false
         }
         return payload?.code == "capture-owner-active"
+    }
+}
+
+enum AppModelOnboardingError: LocalizedError {
+    case coreUnavailable
+    case conflictingConfiguration
+
+    var errorDescription: String? {
+        switch self {
+        case .coreUnavailable:
+            "The local Chronicle core is still connecting. Wait a moment and retry."
+        case .conflictingConfiguration:
+            "A different onboarding configuration is already being applied."
+        }
     }
 }

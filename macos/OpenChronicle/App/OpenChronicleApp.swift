@@ -12,6 +12,7 @@ struct OpenChronicleApp: App {
             ShellView()
                 .environmentObject(appDelegate.appModel)
                 .environmentObject(appDelegate.navigation)
+                .environmentObject(appDelegate.onboardingModel)
                 .frame(minWidth: 720, minHeight: 480)
         }
         .defaultSize(width: 960, height: 680)
@@ -68,30 +69,35 @@ private struct ChronicleMenuLabel: View {
 private struct ShellView: View {
     @EnvironmentObject private var appModel: AppModel
     @EnvironmentObject private var navigation: NavigationModel
+    @EnvironmentObject private var onboardingModel: OnboardingModel
 
     var body: some View {
-        NavigationStack(path: $navigation.path) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Open Chronicle")
-                    .font(.largeTitle)
-                Text(statusText)
-                    .foregroundStyle(statusColor)
-                Text(captureStatusText)
-                    .foregroundStyle(.secondary)
-                HealthView(viewModel: appModel.healthViewModel)
-                Spacer()
-            }
-            .padding(32)
-            .navigationDestination(for: AppRoute.self) { route in
-                if route == .health {
+        if onboardingModel.isComplete {
+            NavigationStack(path: $navigation.path) {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Open Chronicle")
+                        .font(.largeTitle)
+                    Text(statusText)
+                        .foregroundStyle(statusColor)
+                    Text(captureStatusText)
+                        .foregroundStyle(.secondary)
                     HealthView(viewModel: appModel.healthViewModel)
-                        .padding(32)
-                        .navigationTitle(title(for: route))
-                } else {
-                    Text(title(for: route))
-                        .navigationTitle(title(for: route))
+                    Spacer()
+                }
+                .padding(32)
+                .navigationDestination(for: AppRoute.self) { route in
+                    if route == .health {
+                        HealthView(viewModel: appModel.healthViewModel)
+                            .padding(32)
+                            .navigationTitle(title(for: route))
+                    } else {
+                        Text(title(for: route))
+                            .navigationTitle(title(for: route))
+                    }
                 }
             }
+        } else {
+            OnboardingView(model: onboardingModel)
         }
     }
 
@@ -235,6 +241,22 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
         self?.requestAuthoritativeInstanceActivation()
     })
     lazy var navigation = NavigationModel()
+    private lazy var launchAtLoginService = LaunchAtLoginService()
+    lazy var onboardingModel = OnboardingModel(
+        finishHandler: { [weak self] configuration in
+            guard let self else { throw AppModelOnboardingError.coreUnavailable }
+            try await self.appModel.completeOnboarding(configuration)
+        },
+        launchPreferenceHandler: { [weak self] enabled in
+            guard let self else { return "Launch at login could not be configured." }
+            await self.launchAtLoginService.setEnabled(enabled)
+            if let error = self.launchAtLoginService.lastError { return error }
+            if enabled, self.launchAtLoginService.state == .requiresApproval {
+                return "Launch at login requires approval in System Settings. Recording can still start now."
+            }
+            return nil
+        }
+    )
     private lazy var notificationResponseDelegate = ChronicleNotificationResponseDelegate {
         [weak self] route in
         Task { @MainActor [weak self] in
@@ -249,7 +271,8 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         suppressInitialWindows = NSAppleEventManager.shared()
             .currentAppleEvent?
-            .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) != nil
+            .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) != nil &&
+            AppRuntimeFactory.hasCompletedOnboarding()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

@@ -37,7 +37,8 @@ struct CapturePrivacyPolicy: Equatable, Sendable {
             "com.apple.SecurityAgent",
         ],
         excludedTitleFragments: [],
-        chronicleBundleIdentifier: "com.screenata.openchronicle"
+        chronicleBundleIdentifier: Bundle.main.bundleIdentifier
+            ?? "com.screenata.openchronicle"
     )
 }
 

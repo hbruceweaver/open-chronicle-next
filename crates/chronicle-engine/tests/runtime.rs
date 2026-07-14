@@ -3,7 +3,7 @@ mod common;
 use chronicle_domain::{
     AttemptStatus, CaptureCadence, DeviceId, DurableAcknowledgement, EventEnvelope, EventId,
     EventPayload, EvidenceState, GapReason, NoEvidenceContent, NoEvidenceReason,
-    ObservationContent, OcrState, PresenceState, SharedServiceRequest,
+    ObservationContent, OcrState, PresenceState, ScreenshotRetention, SharedServiceRequest,
 };
 use chronicle_engine::{
     CadenceStamp, CaptureAdmissionReason, ChunkerConfig, EngineError, IngestRequest,
@@ -118,11 +118,15 @@ fn runtime_config_round_trips_and_preserves_unknown_top_level_keys() {
     coordinator
         .set_cadence(CaptureCadence::ThirtySeconds)
         .expect("set cadence");
+    coordinator
+        .set_screenshot_retention(ScreenshotRetention::SevenDays)
+        .expect("set screenshot retention");
     let state = coordinator
         .runtime_state(at("2026-07-13T09:00:01Z"))
         .expect("runtime state");
     assert!(state.recording_preference);
     assert_eq!(state.cadence, CaptureCadence::ThirtySeconds);
+    assert_eq!(state.screenshot_retention, ScreenshotRetention::SevenDays);
 
     let document: serde_json::Value =
         serde_json::from_slice(&root.read("config.json").expect("read config"))
@@ -130,6 +134,7 @@ fn runtime_config_round_trips_and_preserves_unknown_top_level_keys() {
     assert_eq!(document["future_policy"]["keep"], true);
     assert_eq!(document["recording_preference"], true);
     assert_eq!(document["capture_cadence"], "thirty-seconds");
+    assert_eq!(document["screenshot_retention"], "seven-days");
 }
 
 #[test]

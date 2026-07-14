@@ -34,6 +34,17 @@ pub enum ScreenshotRetention {
     ThirtyDays,
 }
 
+impl ScreenshotRetention {
+    pub const fn seconds(self) -> u32 {
+        match self {
+            Self::OneHour => 60 * 60,
+            Self::TwentyFourHours => 24 * 60 * 60,
+            Self::SevenDays => 7 * 24 * 60 * 60,
+            Self::ThirtyDays => 30 * 24 * 60 * 60,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UtcRange {
     pub start: DateTime<Utc>,

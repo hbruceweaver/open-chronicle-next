@@ -2,8 +2,8 @@ use std::time::Duration as StdDuration;
 
 use chronicle_domain::{
     CaptureCadence, DurableAcknowledgement, EventEnvelope, EventPayload, ImageArtifactId,
-    NoEvidenceReason, ObservationContent, ScreenshotProjectedState, StudyHealthState,
-    StudyHealthSummary,
+    NoEvidenceReason, ObservationContent, ScreenshotProjectedState, ScreenshotRetention,
+    StudyHealthState, StudyHealthSummary,
 };
 use chronicle_store::{
     CanonicalJournal, FaultInjector, LockManager, ManagedRoot, Projector, ScreenshotStore,
@@ -335,6 +335,10 @@ impl RecordingCoordinator {
 
     pub fn set_cadence(&mut self, cadence: CaptureCadence) -> Result<()> {
         self.runtime.set_cadence(cadence)
+    }
+
+    pub fn set_screenshot_retention(&mut self, retention: ScreenshotRetention) -> Result<()> {
+        self.runtime.set_screenshot_retention(retention)
     }
 
     pub fn capture_admission(&mut self, now: DateTime<Utc>) -> Result<CaptureAdmission> {

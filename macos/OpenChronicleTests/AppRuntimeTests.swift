@@ -254,6 +254,60 @@ final class AppRuntimeTests: XCTestCase {
     }
 
     @MainActor
+    func testCompletionCommitsCoreChoicesAndStartsRuntimeUsingExistingCore() async throws {
+        let core = OnboardingCoreProbe()
+        let runtimeFactory = SuccessfulRuntimeFactoryProbe()
+        let model = AppModel(
+            coreFactory: { _ in core },
+            runtimeFactory: { _, statusSink in
+                await runtimeFactory.make(statusSink: statusSink)
+            },
+            shouldStartCapture: { false }
+        )
+        await model.connect()
+        XCTAssertEqual(model.captureStatus, .setupRequired)
+
+        try await model.completeOnboarding(testOnboardingConfiguration())
+
+        let controls = await core.controlTypesValue()
+        XCTAssertEqual(controls, [
+            "set-cadence",
+            "set-screenshot-retention",
+            "use-personal-mode",
+            "set-recording-preference",
+        ])
+        let runtimeCalls = await runtimeFactory.callsValue()
+        XCTAssertEqual(runtimeCalls, 1)
+        XCTAssertEqual(model.captureStatus, .recording)
+        await model.shutdown()
+    }
+
+    @MainActor
+    func testConcurrentCompletionConstructsExactlyOneRuntime() async throws {
+        let core = OnboardingCoreProbe()
+        let runtimeFactory = SuccessfulRuntimeFactoryProbe()
+        let model = AppModel(
+            coreFactory: { _ in core },
+            runtimeFactory: { _, statusSink in
+                await runtimeFactory.make(statusSink: statusSink)
+            },
+            shouldStartCapture: { false }
+        )
+        await model.connect()
+        let configuration = testOnboardingConfiguration()
+
+        async let first: Void = model.completeOnboarding(configuration)
+        async let second: Void = model.completeOnboarding(configuration)
+        _ = try await (first, second)
+
+        let runtimeCalls = await runtimeFactory.callsValue()
+        XCTAssertEqual(runtimeCalls, 1)
+        let controls = await core.controlTypesValue()
+        XCTAssertEqual(controls.count, 4)
+        await model.shutdown()
+    }
+
+    @MainActor
     func testShutdownWaitsForSuspendedOpenAndClosesLateCore() async {
         let core = AppCoreProbe()
         let factory = BlockingCoreFactory(core: core)
@@ -305,6 +359,16 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(model.captureStatus, .stopped)
         XCTAssertEqual(model.health.status, .connecting)
     }
+
+    private func testOnboardingConfiguration() -> OnboardingRuntimeConfiguration {
+        OnboardingRuntimeConfiguration(
+            recordingMode: .personal,
+            cadenceSeconds: 30,
+            screenshotRetentionSeconds: 7 * 24 * 60 * 60,
+            studyStart: Date(timeIntervalSince1970: 1_784_016_000),
+            studyEnd: Date(timeIntervalSince1970: 1_786_608_000)
+        )
+    }
 }
 
 private enum RuntimeControlCall: Equatable, Sendable {
@@ -316,7 +380,11 @@ private actor RuntimeControlProbe: AppRuntimeControlling {
     private(set) var calls: [RuntimeControlCall] = []
 
     func runtimeConfiguration(at _: Date) -> AppRuntimeConfiguration {
-        AppRuntimeConfiguration(recordingEnabled: true, cadenceSeconds: 30)
+        AppRuntimeConfiguration(
+            recordingEnabled: true,
+            cadenceSeconds: 30,
+            screenshotRetentionSeconds: 24 * 60 * 60
+        )
     }
 
     func startupReconcile(sessionID: String, at date: Date) {
@@ -443,6 +511,24 @@ private actor RuntimeFactoryProbe {
     }
 }
 
+private actor SuccessfulRuntimeFactoryProbe {
+    private var calls = 0
+
+    func make(statusSink: @escaping AppCaptureRuntime.StatusSink) -> AppCaptureRuntime {
+        calls += 1
+        return AppCaptureRuntime(
+            sessionID: "session-onboarding-runtime",
+            recordingEnabled: true,
+            control: RuntimeControlProbe(),
+            coordinator: CoordinatorProbe(),
+            environment: SystemCaptureEnvironmentSource(),
+            statusSink: statusSink
+        )
+    }
+
+    func callsValue() -> Int { calls }
+}
+
 private actor AppCoreProbe: CoreService {
     private(set) var closeCount = 0
 
@@ -463,6 +549,66 @@ private actor AppCoreProbe: CoreService {
     }
 
     func closeCountValue() -> Int { closeCount }
+}
+
+private actor OnboardingCoreProbe: CoreService {
+    private var controlTypes: [String] = []
+    private var closeCount = 0
+
+    func openedStoreGeneration() -> UInt64 { 1 }
+
+    func schemaIdentity() -> ChronicleSchemaIdentity {
+        ChronicleSchemaIdentity(abiSchemaVersion: "1.0", contractSchemaVersion: "1.0")
+    }
+
+    func call(_ request: Data) -> Data {
+        guard let object = try? JSONSerialization.jsonObject(with: request) as? [String: Any],
+              let control = object["control"] as? [String: Any],
+              let type = control["type"] as? String
+        else {
+            return Self.response(result: ["state": "healthy"])
+        }
+        controlTypes.append(type)
+        let result: [String: Any]
+        switch type {
+        case "set-cadence":
+            result = ["cadence": control["cadence"] ?? "sixty-seconds"]
+        case "set-screenshot-retention":
+            result = [
+                "screenshot_retention": control["retention"] ?? "twenty-four-hours",
+            ]
+        case "use-personal-mode":
+            result = ["mode": "personal"]
+        case "configure-study":
+            result = [
+                "start": control["start"] ?? "",
+                "end": control["end"] ?? "",
+            ]
+        case "set-recording-preference":
+            result = ["recording_preference": control["enabled"] ?? false]
+        default:
+            result = [:]
+        }
+        return Self.response(result: result)
+    }
+
+    func ingest(_: Data, image _: Data?) -> Data { Data() }
+
+    func imageRead(artifactID _: String, generation _: UInt64, maxBytes _: UInt64) -> Data {
+        Data()
+    }
+
+    func close() { closeCount += 1 }
+    func controlTypesValue() -> [String] { controlTypes }
+
+    private static func response(result: [String: Any]) -> Data {
+        (try? JSONSerialization.data(withJSONObject: [
+            "schema_version": "1.0",
+            "ok": true,
+            "result": result,
+            "error": NSNull(),
+        ])) ?? Data()
+    }
 }
 
 private actor BlockingCoreFactory {

@@ -2,7 +2,7 @@ use std::{collections::HashSet, time::Duration};
 
 use chronicle_domain::{
     CaptureCadence, DeviceId, EventEnvelope, EventId, EventKind, EventPayload, EvidenceSource,
-    GapReason, RecordingGap,
+    GapReason, RecordingGap, ScreenshotRetention,
 };
 use chronicle_store::{LockManager, ManagedRoot, StoreGeneration};
 use chrono::{DateTime, Utc};
@@ -48,6 +48,7 @@ impl RuntimeFaultInjector {
 pub struct RuntimeConfigState {
     pub recording_preference: bool,
     pub cadence: CaptureCadence,
+    pub screenshot_retention: ScreenshotRetention,
     pub session_id: Option<String>,
     pub session_active: bool,
 }
@@ -237,6 +238,7 @@ impl RuntimeController {
         Ok(RuntimeConfigState {
             recording_preference: recording_preference(&document)?,
             cadence: capture_cadence(&document)?,
+            screenshot_retention: screenshot_retention(&document)?,
             session_id: session.as_ref().map(|session| session.session_id.clone()),
             session_active: session.is_some_and(|session| session.closed_at.is_none()),
         })
@@ -263,6 +265,17 @@ impl RuntimeController {
             document.insert(
                 "capture_cadence".to_owned(),
                 serde_json::to_value(cadence)
+                    .map_err(|error| EngineError::Configuration(error.to_string()))?,
+            );
+            Ok(())
+        })
+    }
+
+    pub fn set_screenshot_retention(&self, retention: ScreenshotRetention) -> Result<()> {
+        self.update_document(|document| {
+            document.insert(
+                "screenshot_retention".to_owned(),
+                serde_json::to_value(retention)
                     .map_err(|error| EngineError::Configuration(error.to_string()))?,
             );
             Ok(())
@@ -762,6 +775,16 @@ fn capture_cadence(document: &Map<String, Value>) -> Result<CaptureCadence> {
         .transpose()
         .map_err(|error| EngineError::Configuration(error.to_string()))
         .map(|cadence| cadence.unwrap_or(CaptureCadence::SixtySeconds))
+}
+
+fn screenshot_retention(document: &Map<String, Value>) -> Result<ScreenshotRetention> {
+    document
+        .get("screenshot_retention")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| EngineError::Configuration(error.to_string()))
+        .map(|retention| retention.unwrap_or(ScreenshotRetention::TwentyFourHours))
 }
 
 fn current_session(document: &Map<String, Value>) -> Result<Option<RuntimeSession>> {
