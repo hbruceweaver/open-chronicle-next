@@ -6,7 +6,7 @@ use chronicle_domain::{
     ActivityFilter, EventEnvelope, EventId, EventPayload, EvidenceState, ObservationContent,
     PageRequest, UtcRange,
 };
-use chronicle_store::{ActivitySearch, CanonicalJournal, FaultInjector};
+use chronicle_store::{ActivitySearch, CanonicalJournal, FaultInjector, StoreError, StoreQueries};
 use chrono::{DateTime, Duration, Utc};
 
 #[test]
@@ -30,6 +30,28 @@ fn fts_treats_quotes_operators_and_prompt_text_as_literal_evidence() -> Result<(
         },
     )?;
     assert_eq!(unicode.hits.len(), 1);
+    let snippet = unicode.hits[0]
+        .snippet
+        .as_ref()
+        .ok_or("Unicode search omitted its structured snippet")?;
+    let highlighted = snippet
+        .highlights
+        .iter()
+        .map(|range| {
+            snippet
+                .text
+                .chars()
+                .skip(usize::try_from(range.start).unwrap_or(usize::MAX))
+                .take(usize::try_from(range.length).unwrap_or_default())
+                .collect::<String>()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        highlighted,
+        ["café".to_owned(), "日本語".to_owned()]
+            .into_iter()
+            .collect()
+    );
     assert!(
         unicode.hits[0]
             .highlight_html
@@ -50,6 +72,18 @@ fn fts_treats_quotes_operators_and_prompt_text_as_literal_evidence() -> Result<(
         injected.hits.is_empty(),
         "FTS operator widened a literal query"
     );
+    let cursor_error = search
+        .search(
+            &filter,
+            "café",
+            true,
+            &PageRequest {
+                cursor: Some("fts-event-1".to_owned()),
+                limit: 10,
+            },
+        )
+        .expect_err("out-of-query event cursor must fail");
+    assert!(matches!(cursor_error, StoreError::CursorScopeMismatch));
     let empty = search.search(
         &filter,
         "\"\" ()",
@@ -222,6 +256,37 @@ fn fts_pushes_typed_filters_before_keyset_limit_beyond_ten_thousand_rows()
     assert_eq!(second.hits.len(), 1);
     assert_eq!(second.hits[0].event.event_id.as_str(), "bulk-10001");
     assert!(second.page.next_cursor.is_none());
+    Ok(())
+}
+
+#[test]
+fn fts_high_water_excludes_backfilled_events_projected_after_snapshot() -> Result<(), Box<dyn Error>>
+{
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    let events = search_events()?;
+    let journal = CanonicalJournal::new(root);
+    let first_record = journal.append_event(&events[0], FaultInjector::none())?;
+    projector.project_record(&first_record, FaultInjector::none())?;
+    let high_water = StoreQueries::new(sqlite.clone())
+        .snapshot()?
+        .projection_high_water()?;
+    let later_record = journal.append_event(&events[1], FaultInjector::none())?;
+    projector.project_record(&later_record, FaultInjector::none())?;
+
+    let page = ActivitySearch::new(sqlite).search_at_cutoff(
+        &filter()?,
+        "Synthetic",
+        true,
+        &PageRequest {
+            cursor: None,
+            limit: 10,
+        },
+        "2026-07-13T09:05:00Z".parse()?,
+        high_water.event_rowid,
+    )?;
+    assert_eq!(page.hits.len(), 1);
+    assert_eq!(page.hits[0].event.event_id, events[0].event_id);
+    assert!(page.hits[0].snippet.is_some());
     Ok(())
 }
 

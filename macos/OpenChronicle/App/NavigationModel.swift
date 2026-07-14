@@ -5,6 +5,7 @@ enum AppRoute: Hashable {
     case health
     case timeline
     case chunk(String)
+    case logicalChunk(String)
     case event(String)
     case analysis(String)
     case settings

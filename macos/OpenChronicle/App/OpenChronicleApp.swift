@@ -78,15 +78,48 @@ private struct ShellView: View {
                     model: appModel.homeViewModel,
                     captureStatus: appModel.captureStatus,
                     health: appModel.health,
-                    onChunk: { navigation.show(.chunk($0)) },
-                    onEvent: { navigation.show(.event($0)) }
+                    onChunk: { navigation.show(.logicalChunk($0)) },
+                    onEvent: { navigation.show(.event($0)) },
+                    onTimeline: { navigation.show(.timeline) },
+                    onAnalysis: { navigation.show(.analysis("all")) },
+                    onHealth: { navigation.show(.health) }
                 )
                 .navigationDestination(for: AppRoute.self) { route in
-                    if route == .health {
+                    switch route {
+                    case .health:
                         HealthView(viewModel: appModel.healthViewModel)
                             .padding(32)
                             .navigationTitle(title(for: route))
-                    } else {
+                    case .timeline:
+                        TimelineView(
+                            model: appModel.timelineViewModel,
+                            onChunk: { navigation.show(.chunk($0)) },
+                            onEvent: { navigation.show(.event($0)) }
+                        )
+                    case let .chunk(revisionID):
+                        ChunkDetailView(
+                            model: appModel.timelineViewModel,
+                            reference: .revision(revisionID),
+                            onEvent: { navigation.show(.event($0)) }
+                        )
+                    case let .logicalChunk(chunkID):
+                        ChunkDetailView(
+                            model: appModel.timelineViewModel,
+                            reference: .logicalChunk(chunkID),
+                            onEvent: { navigation.show(.event($0)) }
+                        )
+                    case let .event(eventID):
+                        EventDetailView(
+                            model: appModel.timelineViewModel,
+                            eventID: eventID
+                        )
+                    case .analysis:
+                        AnalysisView(
+                            model: appModel.analysisViewModel,
+                            onChunk: { navigation.show(.logicalChunk($0)) },
+                            onEvent: { navigation.show(.event($0)) }
+                        )
+                    case .home, .settings:
                         Text(title(for: route))
                             .navigationTitle(title(for: route))
                     }
@@ -103,8 +136,9 @@ private struct ShellView: View {
         case .health: "Health"
         case .timeline: "Timeline"
         case let .chunk(id): "Chunk \(id)"
+        case let .logicalChunk(id): "Chunk \(id)"
         case let .event(id): "Event \(id)"
-        case let .analysis(id): "Analysis \(id)"
+        case .analysis: "Analysis"
         case .settings: "Settings"
         }
     }

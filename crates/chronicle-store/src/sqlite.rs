@@ -7,6 +7,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::checksum::checksum_bytes;
 use crate::permissions::secure_file;
@@ -62,7 +63,7 @@ impl SqliteStore {
             .optional()?;
         let user_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if identity != Some((4, STORE_BUILD_ID.to_owned())) || user_version != 4 {
+        if identity != Some((5, STORE_BUILD_ID.to_owned())) || user_version != 5 {
             return Err(StoreError::SqliteIdentity(
                 "projection migration/build identity mismatch".to_owned(),
             ));
@@ -304,13 +305,27 @@ impl SqliteStore {
             transaction.commit()?;
             user_version = 4;
         }
-        if user_version != 4 {
+        if user_version == 4 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction
+                .execute_batch(include_str!("../migrations/0005_projection_identity.sql"))?;
+            transaction.execute(
+                "INSERT INTO projection_identity(singleton, instance_id) VALUES(1, ?1)
+                 ON CONFLICT(singleton) DO NOTHING",
+                [Uuid::now_v7().to_string()],
+            )?;
+            transaction.pragma_update(None, "user_version", 5)?;
+            transaction.commit()?;
+            user_version = 5;
+        }
+        if user_version != 5 {
             return Err(StoreError::SqliteIdentity(format!(
                 "unsupported projection schema version {user_version}"
             )));
         }
         connection.execute(
-            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 4, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
+            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 5, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
             [STORE_BUILD_ID],
         )?;
         let generation_number = i64::try_from(self.generation.generation).map_err(|_| {

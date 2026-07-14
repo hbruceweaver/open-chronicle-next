@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use chronicle_store::{ManagedRoot, SqliteStore};
 
 #[test]
-fn committed_v2_database_migrates_to_v4_with_health_and_retention_facts()
+fn committed_v2_database_migrates_to_v5_with_health_retention_and_projection_identity()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = ManagedRoot::initialize(temporary.path().join("store"))?;
@@ -50,13 +50,19 @@ fn committed_v2_database_migrates_to_v4_with_health_and_retention_facts()
     let connection = store.connection()?;
     let user_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(user_version, 4);
+    assert_eq!(user_version, 5);
     let schema_version: i64 = connection.query_row(
         "SELECT version FROM schema_versions WHERE component='store'",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(schema_version, 4);
+    assert_eq!(schema_version, 5);
+    let projection_instance_id: String = connection.query_row(
+        "SELECT instance_id FROM projection_identity WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(uuid::Uuid::parse_str(&projection_instance_id).is_ok());
     let preserved: i64 = connection.query_row(
         "SELECT count(*) FROM events WHERE event_id='ae4-evt-01'",
         [],
@@ -129,5 +135,45 @@ fn committed_v2_database_migrates_to_v4_with_health_and_retention_facts()
             .any(|detail| detail.contains("retention_state_health")),
         "retention health lookup did not use its index: {retention_details:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn committed_v4_projection_migrates_to_v5_without_data_loss() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = ManagedRoot::initialize(temporary.path().join("store"))?;
+    let path = root.path().join("index.sqlite3");
+    drop(SqliteStore::open(root.clone())?);
+
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute(
+        "INSERT INTO events(event_id, checksum, kind, recorded_at, body_json)
+         VALUES('migration-v4-sentinel', 'sentinel-checksum', 'recording-gap',
+                '2026-07-13T09:00:00Z', '{}')",
+        [],
+    )?;
+    connection.execute("DROP TABLE projection_identity", [])?;
+    connection.execute(
+        "UPDATE schema_versions SET version=4, build_id='v4-test'
+         WHERE component='store'",
+        [],
+    )?;
+    connection.pragma_update(None, "user_version", 4)?;
+    drop(connection);
+
+    let migrated = SqliteStore::open(root)?;
+    let connection = migrated.connection()?;
+    let sentinel_count: i64 = connection.query_row(
+        "SELECT count(*) FROM events WHERE event_id='migration-v4-sentinel'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(sentinel_count, 1);
+    let instance_id: String = connection.query_row(
+        "SELECT instance_id FROM projection_identity WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(uuid::Uuid::parse_str(&instance_id).is_ok());
     Ok(())
 }

@@ -14,6 +14,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var operationalStorageState: OperationalStorageState = .healthy
     let healthViewModel = HealthViewModel()
     let homeViewModel = HomeViewModel()
+    let timelineViewModel = TimelineViewModel()
+    let analysisViewModel = AnalysisViewModel()
     private var core: (any CoreService)?
     private var runtime: AppCaptureRuntime?
     private var lifecycleMonitor: LifecycleMonitor?
@@ -157,6 +159,8 @@ final class AppModel: ObservableObject {
         await storageMonitor?.stop()
         storageMonitor = nil
         homeViewModel.detach()
+        timelineViewModel.detach()
+        analysisViewModel.detach()
         if let runtime {
             try? await runtime.shutdown()
         }
@@ -197,6 +201,8 @@ final class AppModel: ObservableObject {
                 captureStatus = .setupRequired
             }
             homeViewModel.attach(client: CoreFactualReportClient(core: opened))
+            timelineViewModel.attach(client: CoreTimelineEvidenceClient(core: opened))
+            analysisViewModel.attach(client: CoreAnalysisEvidenceClient(core: opened))
             let diagnosticClient = CoreDiagnosticHealthClient(core: opened)
             healthViewModel.attach(fetcher: diagnosticClient)
             let monitor = StorageMonitor(fetcher: diagnosticClient) { [weak self] update in
@@ -278,16 +284,18 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func applyStorageMonitorUpdate(_ update: StorageMonitorUpdate) async {
+    /// Internal so the authoritative health-to-presentation fan-out can be
+    /// integration tested without waiting for the monitor timer.
+    func applyStorageMonitorUpdate(_ update: StorageMonitorUpdate) async {
         guard !isShuttingDown else { return }
         switch update {
         case let .snapshot(snapshot):
             latestDiagnosticHealth = snapshot
             operationalStorageState = OperationalStoragePolicy.state(for: snapshot)
             healthViewModel.apply(snapshot)
-            homeViewModel.observe(
-                latestProjectionAt: snapshot.latest.lastProjectionAt.flatMap(ChronicleTimestamp.date)
-            )
+            let latestProjectionAt = snapshot.latest.lastProjectionAt.flatMap(ChronicleTimestamp.date)
+            homeViewModel.observe(latestProjectionAt: latestProjectionAt)
+            timelineViewModel.observe(latestProjectionAt: latestProjectionAt)
             await notificationService.evaluate(
                 captureStatus: captureStatus,
                 health: snapshot

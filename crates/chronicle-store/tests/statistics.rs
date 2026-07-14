@@ -68,3 +68,32 @@ fn statistics_reject_over_budget_ranges_and_coalesce_missing_buckets() -> Result
     );
     Ok(())
 }
+
+#[test]
+fn statistics_at_high_water_keep_the_original_chunk_revision() -> Result<(), Box<dyn Error>> {
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    let chunks = common::chunks()?;
+    let first = chunks.first().cloned().ok_or("first chunk missing")?;
+    let later = chunks.last().cloned().ok_or("later chunk missing")?;
+    let journal = CanonicalJournal::new(root);
+    let record = journal.append_chunk(&first, FaultInjector::none())?;
+    projector.project_record(&record, FaultInjector::none())?;
+    let high_water = StoreQueries::new(sqlite.clone())
+        .snapshot()?
+        .projection_high_water()?;
+    let record = journal.append_chunk(&later, FaultInjector::none())?;
+    projector.project_record(&record, FaultInjector::none())?;
+    let range = UtcRange {
+        start: first.window.start,
+        end: first.window.end,
+    };
+    let stable = FactualStatistics::new(StoreQueries::new(sqlite).snapshot()?).range_at_cutoff(
+        &range,
+        "2026-07-13T09:07:00Z".parse()?,
+        high_water,
+    )?;
+    assert_eq!(stable.source_chunk_revision_ids, vec![first.revision_id]);
+    assert_eq!(stable.coverage.evidence_seconds.captured, 120);
+    assert_eq!(stable.coverage.evidence_seconds.gap, 120);
+    Ok(())
+}

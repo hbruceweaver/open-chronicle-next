@@ -2,6 +2,29 @@ mod common;
 
 use chronicle_store::RecoveryManager;
 
+type RowIdIdentity = (Vec<(i64, String)>, Vec<(i64, String)>);
+
+fn projection_rowid_identity(
+    sqlite: &chronicle_store::SqliteStore,
+) -> chronicle_store::Result<RowIdIdentity> {
+    let connection = sqlite.connection()?;
+    let events = {
+        let mut statement =
+            connection.prepare("SELECT rowid, event_id FROM events ORDER BY rowid")?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let chunks = {
+        let mut statement =
+            connection.prepare("SELECT rowid, revision_id FROM chunk_revisions ORDER BY rowid")?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok((events, chunks))
+}
+
 #[test]
 fn canonical_sources_rebuild_to_identical_projection() -> chronicle_store::Result<()> {
     let (_temporary, root, sqlite, projector) = common::store()?;
@@ -13,6 +36,11 @@ fn canonical_sources_rebuild_to_identical_projection() -> chronicle_store::Resul
     common::seed_canonical(&root, &projector)?;
     RecoveryManager::new(root.clone()).recover_startup()?;
     let canonical_projection = sqlite.snapshot_ids()?;
+    let canonical_rowids = projection_rowid_identity(&sqlite)?;
+    let canonical_queries = chronicle_store::StoreQueries::new(sqlite.clone());
+    let canonical_instance_id = canonical_queries.projection_instance_id()?;
+    let canonical_high_water = canonical_queries.projection_high_water()?;
+    let canonical_anchors = canonical_queries.projection_anchors(canonical_high_water)?;
     let retained_expiry: String = sqlite.connection()?.query_row(
         "SELECT expires_at FROM retention_state WHERE artifact_id='img-001'",
         [],
@@ -27,6 +55,22 @@ fn canonical_sources_rebuild_to_identical_projection() -> chronicle_store::Resul
     assert_ne!(sqlite.snapshot_ids()?, canonical_projection);
     let (_report, repaired_projection) = RecoveryManager::new(root.clone()).rebuild_index()?;
     assert_eq!(repaired_projection, canonical_projection);
+    // Canonical equivalence does not imply SQLite rowid equivalence: screenshot
+    // lifecycle reconciliation is replayed in a different valid order.
+    assert_ne!(projection_rowid_identity(&sqlite)?, canonical_rowids);
+    let rebuilt_queries = chronicle_store::StoreQueries::new(sqlite.clone());
+    assert_ne!(
+        rebuilt_queries.projection_instance_id()?,
+        canonical_instance_id
+    );
+    assert_eq!(
+        rebuilt_queries.projection_high_water()?,
+        canonical_high_water
+    );
+    assert_ne!(
+        rebuilt_queries.projection_anchors(canonical_high_water)?,
+        canonical_anchors
+    );
     let connection = sqlite.connection()?;
     let ocr_rows: i64 =
         connection.query_row("SELECT count(*) FROM ocr_fts", [], |row| row.get(0))?;

@@ -2,8 +2,10 @@ mod common;
 
 use std::error::Error;
 
-use chronicle_domain::{ActivityFilter, ChunkRevision, EventEnvelope, QueryResponse, UtcRange};
-use chronicle_store::{CanonicalJournal, FaultInjector, StoreQueries};
+use chronicle_domain::{
+    ActivityFilter, ChunkRevision, EventEnvelope, EvidenceState, QueryResponse, UtcRange,
+};
+use chronicle_store::{CanonicalJournal, FaultInjector, StoreError, StoreQueries};
 
 #[test]
 fn typed_queries_return_current_facts_and_matching_evidence_ids() -> Result<(), Box<dyn Error>> {
@@ -122,6 +124,154 @@ fn shared_chunk_pages_apply_keyset_and_limit_before_materialization() -> Result<
     let (second, _) = queries.current_chunk_page(&filter, Some(first[0].chunk_id.as_str()), 1)?;
     assert_eq!(second.len(), 1);
     assert_ne!(first[0].chunk_id, second[0].chunk_id);
+    Ok(())
+}
+
+#[test]
+fn stable_high_water_excludes_chunk_revisions_projected_after_snapshot()
+-> Result<(), Box<dyn Error>> {
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    let journal = CanonicalJournal::new(root);
+    for event in common::events()? {
+        let record = journal.append_event(&event, FaultInjector::none())?;
+        projector.project_record(&record, FaultInjector::none())?;
+    }
+    let chunks = common::chunks()?;
+    let first = chunks.first().cloned().ok_or("first chunk missing")?;
+    let later = chunks.last().cloned().ok_or("later chunk missing")?;
+    let record = journal.append_chunk(&first, FaultInjector::none())?;
+    projector.project_record(&record, FaultInjector::none())?;
+
+    let snapshot_queries = StoreQueries::new(sqlite.clone()).snapshot()?;
+    let high_water = snapshot_queries.projection_high_water()?;
+    let record = journal.append_chunk(&later, FaultInjector::none())?;
+    projector.project_record(&record, FaultInjector::none())?;
+
+    let range = UtcRange {
+        start: first.window.start,
+        end: first.window.end,
+    };
+    let cutoff = "2026-07-13T09:07:00Z".parse()?;
+    let stable =
+        StoreQueries::new(sqlite.clone()).chunks_in_range_at_cutoff(&range, cutoff, high_water)?;
+    assert_eq!(stable, vec![first.clone()]);
+    assert!(
+        StoreQueries::new(sqlite.clone())
+            .chunk_revision_at_snapshot(&later.revision_id, cutoff, high_water)?
+            .is_none()
+    );
+    assert_eq!(
+        StoreQueries::new(sqlite.clone())
+            .current_chunk(&later.chunk_id)?
+            .ok_or("current chunk missing")?,
+        later
+    );
+    let filter = ActivityFilter {
+        range,
+        application_bundle_id: None,
+        window_text: None,
+        authorized_domain: None,
+        evidence_states: Vec::new(),
+    };
+    let (page, truncated) = StoreQueries::new(sqlite)
+        .chunk_page_at_cutoff(&filter, cutoff, high_water, false, None, 10)?;
+    assert!(!truncated);
+    assert_eq!(page, vec![first]);
+    Ok(())
+}
+
+#[test]
+fn stable_chunk_filters_correlate_dimensions_and_evidence_on_one_observation()
+-> Result<(), Box<dyn Error>> {
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    common::seed_canonical(&root, &projector)?;
+    let queries = StoreQueries::new(sqlite).snapshot()?;
+    let high_water = queries.projection_high_water()?;
+    let range = UtcRange {
+        start: "2026-07-13T09:00:00Z".parse()?,
+        end: "2026-07-13T09:05:00Z".parse()?,
+    };
+    let cutoff = "2026-07-13T09:07:00Z".parse()?;
+
+    // The chunk has writer observations and a different protected observation,
+    // but no single observation is both writer and protected.
+    let crossed = ActivityFilter {
+        range: range.clone(),
+        application_bundle_id: Some("com.example.writer".to_owned()),
+        window_text: None,
+        authorized_domain: None,
+        evidence_states: vec![EvidenceState::Protected],
+    };
+    let (page, _) = queries.chunk_page_at_cutoff(&crossed, cutoff, high_water, false, None, 10)?;
+    assert!(page.is_empty());
+
+    // Missing-observation is a chunk gap branch, while the selected dimension
+    // must still be present on some supporting observation.
+    let missing_writer = ActivityFilter {
+        range: range.clone(),
+        application_bundle_id: Some("com.example.writer".to_owned()),
+        window_text: None,
+        authorized_domain: None,
+        evidence_states: Vec::new(),
+    };
+    let (page, _) =
+        queries.chunk_page_at_cutoff(&missing_writer, cutoff, high_water, true, None, 10)?;
+    assert_eq!(page.len(), 1);
+    let missing_unrelated = ActivityFilter {
+        range,
+        application_bundle_id: Some("com.example.does-not-exist".to_owned()),
+        window_text: None,
+        authorized_domain: None,
+        evidence_states: Vec::new(),
+    };
+    let (page, _) =
+        queries.chunk_page_at_cutoff(&missing_unrelated, cutoff, high_water, true, None, 10)?;
+    assert!(page.is_empty());
+    Ok(())
+}
+
+#[test]
+fn stable_chunk_and_artifact_cursors_must_belong_to_the_exact_query_scope()
+-> Result<(), Box<dyn Error>> {
+    let (_temporary, root, sqlite, projector) = common::store()?;
+    common::seed_canonical(&root, &projector)?;
+    let queries = StoreQueries::new(sqlite).snapshot()?;
+    let high_water = queries.projection_high_water()?;
+    let range = UtcRange {
+        start: "2026-07-13T09:00:00Z".parse()?,
+        end: "2026-07-13T09:05:00Z".parse()?,
+    };
+    let cutoff = "2026-07-13T09:10:00Z".parse()?;
+
+    let excluded_chunk_filter = ActivityFilter {
+        range: range.clone(),
+        application_bundle_id: Some("com.example.does-not-exist".to_owned()),
+        window_text: None,
+        authorized_domain: None,
+        evidence_states: Vec::new(),
+    };
+    let chunk_cursor = common::chunks()?
+        .last()
+        .ok_or("chunk fixture missing")?
+        .chunk_id
+        .to_string();
+    let chunk_error = queries
+        .chunk_page_at_cutoff(
+            &excluded_chunk_filter,
+            cutoff,
+            high_water,
+            false,
+            Some(&chunk_cursor),
+            10,
+        )
+        .expect_err("out-of-filter chunk cursor must fail");
+    assert!(matches!(chunk_error, StoreError::CursorScopeMismatch));
+
+    let artifact_cursor = common::artifact()?.artifact_id.to_string();
+    let artifact_error = queries
+        .artifact_page_at_cutoff(&range, cutoff, high_water, Some(&artifact_cursor), 10)
+        .expect_err("out-of-range artifact cursor must fail");
+    assert!(matches!(artifact_error, StoreError::CursorScopeMismatch));
     Ok(())
 }
 

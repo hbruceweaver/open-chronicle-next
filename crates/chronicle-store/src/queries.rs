@@ -1,5 +1,5 @@
 use chronicle_domain::{
-    ActivityFilter, ArtifactId, ArtifactRevisionId, ChunkId, ChunkRevision,
+    ActivityFilter, ArtifactId, ArtifactRevisionId, ChunkId, ChunkRevision, ChunkRevisionId,
     DerivedArtifactRevision, DeviceId, EventEnvelope, EventId, EventPayload, ImageMetadata,
     ObservationContent, QueryArtifact, QueryEvent, QueryEventPayload, QueryObservation,
     QueryObservationContent, ScreenshotProjectedState, UtcRange,
@@ -14,6 +14,56 @@ const MAX_CHUNK_ROWS: usize = 105_408;
 const MAX_SUPPORTING_EVENTS: usize = 1_000;
 const MAX_SHARED_PAGE_ITEMS: u32 = 100;
 const AGGREGATION_BATCH_SIZE: usize = 1_024;
+const STABLE_CHUNK_SCOPE_SQL: &str = "
+    SELECT revision.body_json AS body_json,
+           revision.window_start AS window_start,
+           revision.chunk_id AS chunk_id
+    FROM chunk_revisions revision
+    WHERE revision.window_start < ?3 AND revision.window_end > ?2
+      AND revision.generated_at <= ?1 AND revision.rowid <= ?4
+      AND NOT EXISTS (
+          SELECT 1 FROM chunk_revisions newer
+          WHERE newer.chunk_id=revision.chunk_id
+            AND newer.generated_at <= ?1 AND newer.rowid <= ?4
+            AND (newer.generated_at > revision.generated_at
+                 OR (newer.generated_at = revision.generated_at
+                     AND newer.revision_id > revision.revision_id))
+      )
+      AND (
+          (?9 = 0 AND (?5 = 0 OR EXISTS (
+              SELECT 1
+              FROM chunk_evidence_refs refs
+              JOIN observations ON observations.event_id=refs.event_id
+              WHERE refs.revision_id=revision.revision_id
+                AND (?6 IS NULL OR observations.application_bundle_id=?6)
+                AND (?7 IS NULL OR instr(
+                     lower(coalesce(observations.window_title, '')), lower(?7)) > 0)
+                AND (?8 IS NULL OR observations.authorized_domain=?8)
+          )))
+          OR (?10 > 0
+              AND json_extract(revision.body_json, '$.evidence_seconds.gap') > 0
+              AND (?5 = 0 OR EXISTS (
+                  SELECT 1
+                  FROM chunk_evidence_refs refs
+                  JOIN observations ON observations.event_id=refs.event_id
+                  WHERE refs.revision_id=revision.revision_id
+                    AND (?6 IS NULL OR observations.application_bundle_id=?6)
+                    AND (?7 IS NULL OR instr(
+                         lower(coalesce(observations.window_title, '')), lower(?7)) > 0)
+                    AND (?8 IS NULL OR observations.authorized_domain=?8)
+              )))
+          OR EXISTS (
+              SELECT 1
+              FROM chunk_evidence_refs refs
+              JOIN observations ON observations.event_id=refs.event_id
+              WHERE refs.revision_id=revision.revision_id
+                AND (?6 IS NULL OR observations.application_bundle_id=?6)
+                AND (?7 IS NULL OR instr(
+                     lower(coalesce(observations.window_title, '')), lower(?7)) > 0)
+                AND (?8 IS NULL OR observations.authorized_domain=?8)
+                AND observations.evidence_state IN (SELECT value FROM json_each(?11))
+          )
+      )";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingAggregationBucket {
@@ -21,6 +71,20 @@ pub struct PendingAggregationBucket {
     pub bucket_start: DateTime<Utc>,
     pub finalization_cadence_seconds: u32,
     pub generation_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectionHighWater {
+    pub event_rowid: u64,
+    pub chunk_revision_rowid: u64,
+    pub artifact_revision_rowid: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionAnchors {
+    pub event_id: Option<EventId>,
+    pub chunk_revision_id: Option<ChunkRevisionId>,
+    pub artifact_revision_id: Option<ArtifactRevisionId>,
 }
 
 /// Typed, read-only access to the rebuildable projection. Canonical JSON remains
@@ -80,12 +144,156 @@ impl StoreQueries {
         }
     }
 
+    /// Captures immutable insertion high-water marks from the current SQLite
+    /// read snapshot. Later app pages constrain every lookup to these rowids,
+    /// so projection catch-up cannot backfill the rendered result set.
+    pub fn projection_high_water(&self) -> Result<ProjectionHighWater> {
+        self.with_connection(|connection| {
+            let event_rowid: i64 =
+                connection.query_row("SELECT coalesce(max(rowid), 0) FROM events", [], |row| {
+                    row.get(0)
+                })?;
+            let chunk_revision_rowid: i64 = connection.query_row(
+                "SELECT coalesce(max(rowid), 0) FROM chunk_revisions",
+                [],
+                |row| row.get(0),
+            )?;
+            let artifact_revision_rowid: i64 = connection.query_row(
+                "SELECT coalesce(max(rowid), 0) FROM artifact_revisions",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(ProjectionHighWater {
+                event_rowid: u64::try_from(event_rowid).map_err(|_| {
+                    StoreError::SqliteIdentity("event rowid high-water is negative".to_owned())
+                })?,
+                chunk_revision_rowid: u64::try_from(chunk_revision_rowid).map_err(|_| {
+                    StoreError::SqliteIdentity(
+                        "chunk revision rowid high-water is negative".to_owned(),
+                    )
+                })?,
+                artifact_revision_rowid: u64::try_from(artifact_revision_rowid).map_err(|_| {
+                    StoreError::SqliteIdentity(
+                        "artifact revision rowid high-water is negative".to_owned(),
+                    )
+                })?,
+            })
+        })
+    }
+
+    /// Identifies one concrete rebuildable SQLite projection instance. Normal
+    /// catch-up preserves this value; atomic projection replacement mints a new
+    /// value even when the canonical store generation is unchanged.
+    pub fn projection_instance_id(&self) -> Result<String> {
+        self.with_connection(|connection| {
+            let instance_id: String = connection.query_row(
+                "SELECT instance_id FROM projection_identity WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            uuid::Uuid::parse_str(&instance_id)
+                .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
+            Ok(instance_id)
+        })
+    }
+
+    /// Resolves the stable IDs at a previously captured insertion boundary.
+    /// App snapshot tokens retain these anchors so a projection rebuild cannot
+    /// silently reuse a rowid boundary for different canonical records.
+    pub fn projection_anchors(&self, high_water: ProjectionHighWater) -> Result<ProjectionAnchors> {
+        let event_rowid = i64::try_from(high_water.event_rowid)
+            .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
+        let chunk_revision_rowid = i64::try_from(high_water.chunk_revision_rowid)
+            .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
+        let artifact_revision_rowid = i64::try_from(high_water.artifact_revision_rowid)
+            .map_err(|error| StoreError::SqliteIdentity(error.to_string()))?;
+        self.with_connection(|connection| {
+            let event_id = if event_rowid == 0 {
+                None
+            } else {
+                connection
+                    .query_row(
+                        "SELECT event_id FROM events WHERE rowid=?1",
+                        [event_rowid],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|value| {
+                        EventId::new(value)
+                            .map_err(|error| StoreError::SqliteIdentity(error.to_string()))
+                    })
+                    .transpose()?
+            };
+            let chunk_revision_id = if chunk_revision_rowid == 0 {
+                None
+            } else {
+                connection
+                    .query_row(
+                        "SELECT revision_id FROM chunk_revisions WHERE rowid=?1",
+                        [chunk_revision_rowid],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|value| {
+                        ChunkRevisionId::new(value)
+                            .map_err(|error| StoreError::SqliteIdentity(error.to_string()))
+                    })
+                    .transpose()?
+            };
+            let artifact_revision_id = if artifact_revision_rowid == 0 {
+                None
+            } else {
+                connection
+                    .query_row(
+                        "SELECT revision_id FROM artifact_revisions WHERE rowid=?1",
+                        [artifact_revision_rowid],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|value| {
+                        ArtifactRevisionId::new(value)
+                            .map_err(|error| StoreError::SqliteIdentity(error.to_string()))
+                    })
+                    .transpose()?
+            };
+            Ok(ProjectionAnchors {
+                event_id,
+                chunk_revision_id,
+                artifact_revision_id,
+            })
+        })
+    }
+
     pub fn event(&self, event_id: &EventId, include_ocr: bool) -> Result<Option<QueryEvent>> {
         self.with_connection(|connection| {
             let body: Option<String> = connection
                 .query_row(
                     "SELECT body_json FROM events WHERE event_id=?1",
                     [event_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            body.map(|body| self.query_event_from_json(connection, &body, include_ocr))
+                .transpose()
+        })
+    }
+
+    pub fn event_at_snapshot(
+        &self,
+        event_id: &EventId,
+        include_ocr: bool,
+        stable_cutoff: DateTime<Utc>,
+        high_water: ProjectionHighWater,
+    ) -> Result<Option<QueryEvent>> {
+        let event_rowid = i64::try_from(high_water.event_rowid)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        self.with_connection(|connection| {
+            let body: Option<String> = connection
+                .query_row(
+                    "SELECT body_json FROM events
+                     WHERE event_id=?1 AND rowid<=?2
+                       AND json_extract(body_json, '$.recorded_at')<=?3",
+                    params![event_id.as_str(), event_rowid, stable_cutoff.to_rfc3339()],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -191,6 +399,78 @@ impl StoreQueries {
         })
     }
 
+    /// Returns one exact immutable revision rather than resolving the current
+    /// pointer. App detail routes use this to remain stable when late evidence
+    /// creates a newer revision after the list snapshot was rendered.
+    pub fn chunk_revision(
+        &self,
+        revision_id: &chronicle_domain::ChunkRevisionId,
+    ) -> Result<Option<ChunkRevision>> {
+        self.with_connection(|connection| {
+            let body: Option<String> = connection
+                .query_row(
+                    "SELECT body_json FROM chunk_revisions WHERE revision_id=?1",
+                    [revision_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            body.map(|body| ChunkRevision::parse(&body).map_err(StoreError::from))
+                .transpose()
+        })
+    }
+
+    pub fn chunk_revision_at_snapshot(
+        &self,
+        revision_id: &chronicle_domain::ChunkRevisionId,
+        stable_cutoff: DateTime<Utc>,
+        high_water: ProjectionHighWater,
+    ) -> Result<Option<ChunkRevision>> {
+        let chunk_rowid = i64::try_from(high_water.chunk_revision_rowid)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        self.with_connection(|connection| {
+            let body: Option<String> = connection
+                .query_row(
+                    "SELECT body_json FROM chunk_revisions
+                     WHERE revision_id=?1 AND rowid<=?2 AND generated_at<=?3",
+                    params![
+                        revision_id.as_str(),
+                        chunk_rowid,
+                        stable_cutoff.to_rfc3339()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            body.map(|body| ChunkRevision::parse(&body).map_err(StoreError::from))
+                .transpose()
+        })
+    }
+
+    /// Resolves the latest immutable revision whose canonical generation time
+    /// is at or before `stable_cutoff`.
+    pub fn chunk_at_cutoff(
+        &self,
+        chunk_id: &ChunkId,
+        stable_cutoff: DateTime<Utc>,
+        high_water: ProjectionHighWater,
+    ) -> Result<Option<ChunkRevision>> {
+        let chunk_rowid = i64::try_from(high_water.chunk_revision_rowid)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        self.with_connection(|connection| {
+            let body: Option<String> = connection
+                .query_row(
+                    "SELECT body_json FROM chunk_revisions
+                     WHERE chunk_id=?1 AND generated_at<=?2 AND rowid<=?3
+                     ORDER BY generated_at DESC, revision_id DESC
+                     LIMIT 1",
+                    params![chunk_id.as_str(), stable_cutoff.to_rfc3339(), chunk_rowid],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            body.map(|body| ChunkRevision::parse(&body).map_err(StoreError::from))
+                .transpose()
+        })
+    }
+
     pub fn artifact(
         &self,
         artifact_id: &ArtifactId,
@@ -224,6 +504,143 @@ impl StoreQueries {
                     .map_err(StoreError::from)
             })
             .transpose()
+        })
+    }
+
+    pub fn artifact_at_snapshot(
+        &self,
+        artifact_id: &ArtifactId,
+        revision_id: Option<&ArtifactRevisionId>,
+        stable_cutoff: DateTime<Utc>,
+        high_water: ProjectionHighWater,
+    ) -> Result<Option<QueryArtifact>> {
+        let artifact_rowid = i64::try_from(high_water.artifact_revision_rowid)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        self.with_connection(|connection| {
+            let body: Option<String> = match revision_id {
+                Some(revision_id) => connection
+                    .query_row(
+                        "SELECT body_json FROM artifact_revisions
+                         WHERE artifact_id=?1 AND revision_id=?2
+                           AND created_at<=?3 AND rowid<=?4",
+                        params![
+                            artifact_id.as_str(),
+                            revision_id.as_str(),
+                            stable_cutoff.to_rfc3339(),
+                            artifact_rowid
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+                None => connection
+                    .query_row(
+                        "SELECT body_json FROM artifact_revisions
+                         WHERE artifact_id=?1 AND created_at<=?2 AND rowid<=?3
+                         ORDER BY created_at DESC, revision_id DESC
+                         LIMIT 1",
+                        params![
+                            artifact_id.as_str(),
+                            stable_cutoff.to_rfc3339(),
+                            artifact_rowid
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+            };
+            body.map(|body| {
+                DerivedArtifactRevision::parse(&body)
+                    .map(QueryArtifact::from)
+                    .map_err(StoreError::from)
+            })
+            .transpose()
+        })
+    }
+
+    pub fn artifact_page_at_cutoff(
+        &self,
+        range: &UtcRange,
+        stable_cutoff: DateTime<Utc>,
+        high_water: ProjectionHighWater,
+        after_artifact_id: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<QueryArtifact>, bool)> {
+        range.validate().map_err(StoreError::InvalidPath)?;
+        if limit == 0 || limit > MAX_SHARED_PAGE_ITEMS {
+            return Err(StoreError::InvalidPath(format!(
+                "artifact page limit must be 1..={MAX_SHARED_PAGE_ITEMS}"
+            )));
+        }
+        let artifact_rowid = i64::try_from(high_water.artifact_revision_rowid)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        self.with_connection(|connection| {
+            if let Some(cursor) = after_artifact_id {
+                let cursor_in_scope = connection
+                    .query_row(
+                        "SELECT 1
+                         FROM artifact_revisions revision
+                         WHERE revision.artifact_id=?1
+                           AND revision.created_at>=?2 AND revision.created_at<?3
+                           AND revision.created_at<=?4 AND revision.rowid<=?5
+                           AND NOT EXISTS (
+                             SELECT 1 FROM artifact_revisions newer
+                             WHERE newer.artifact_id=revision.artifact_id
+                               AND newer.created_at<=?4 AND newer.rowid<=?5
+                               AND (newer.created_at>revision.created_at
+                                    OR (newer.created_at=revision.created_at
+                                        AND newer.revision_id>revision.revision_id))
+                           )",
+                        params![
+                            cursor,
+                            range.start.to_rfc3339(),
+                            range.end.to_rfc3339(),
+                            stable_cutoff.to_rfc3339(),
+                            artifact_rowid,
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()?;
+                if cursor_in_scope.is_none() {
+                    return Err(StoreError::CursorScopeMismatch);
+                }
+            }
+            let mut statement = connection.prepare(
+                "SELECT revision.body_json
+                 FROM artifact_revisions revision
+                 WHERE revision.created_at >= ?1 AND revision.created_at < ?2
+                   AND revision.created_at <= ?3 AND revision.rowid <= ?4
+                   AND NOT EXISTS (
+                     SELECT 1 FROM artifact_revisions newer
+                     WHERE newer.artifact_id=revision.artifact_id
+                       AND newer.created_at<=?3 AND newer.rowid<=?4
+                       AND (newer.created_at>revision.created_at
+                            OR (newer.created_at=revision.created_at
+                                AND newer.revision_id>revision.revision_id))
+                   )
+                   AND (?5 IS NULL OR revision.artifact_id > ?5)
+                 ORDER BY revision.artifact_id
+                 LIMIT ?6",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    range.start.to_rfc3339(),
+                    range.end.to_rfc3339(),
+                    stable_cutoff.to_rfc3339(),
+                    artifact_rowid,
+                    after_artifact_id,
+                    i64::from(limit.saturating_add(1)),
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut artifacts = rows
+                .map(|row| {
+                    DerivedArtifactRevision::parse(&row?)
+                        .map(QueryArtifact::from)
+                        .map_err(StoreError::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let truncated = artifacts.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+            artifacts.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok((artifacts, truncated))
         })
     }
 
@@ -331,6 +748,61 @@ impl StoreQueries {
         })
     }
 
+    /// Reads the latest revision per logical chunk at one stable generation
+    /// cutoff. This is the app-side equivalent of a pinned report snapshot:
+    /// revisions generated later cannot rewrite an already-rendered result.
+    pub fn chunks_in_range_at_cutoff(
+        &self,
+        range: &UtcRange,
+        stable_cutoff: DateTime<Utc>,
+        high_water: ProjectionHighWater,
+    ) -> Result<Vec<ChunkRevision>> {
+        range
+            .validate()
+            .map_err(|reason| StoreError::InvalidPath(reason.to_owned()))?;
+        let chunk_rowid = i64::try_from(high_water.chunk_revision_rowid)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT revision.body_json
+                 FROM chunk_revisions revision
+                 WHERE revision.window_start < ?3 AND revision.window_end > ?2
+                   AND revision.generated_at <= ?1 AND revision.rowid <= ?4
+                   AND NOT EXISTS (
+                       SELECT 1 FROM chunk_revisions newer
+                       WHERE newer.chunk_id=revision.chunk_id
+                         AND newer.generated_at <= ?1 AND newer.rowid <= ?4
+                         AND (newer.generated_at > revision.generated_at
+                              OR (newer.generated_at = revision.generated_at
+                                  AND newer.revision_id > revision.revision_id))
+                   )
+                 ORDER BY revision.window_start, revision.chunk_id
+                 LIMIT ?5",
+            )?;
+            let limit = i64::try_from(MAX_CHUNK_ROWS + 1)
+                .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+            let rows = statement.query_map(
+                params![
+                    stable_cutoff.to_rfc3339(),
+                    range.start.to_rfc3339(),
+                    range.end.to_rfc3339(),
+                    chunk_rowid,
+                    limit,
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let chunks = rows
+                .map(|row| ChunkRevision::parse(&row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>>>()?;
+            if chunks.len() > MAX_CHUNK_ROWS {
+                return Err(StoreError::InvalidPath(
+                    "stable chunk range exceeds the bounded query row limit".to_owned(),
+                ));
+            }
+            Ok(chunks)
+        })
+    }
+
     /// SQL-filtered keyset page used by the shared service. Filtering and the
     /// page+1 bound happen before canonical JSON materialization.
     pub fn current_chunk_page(
@@ -409,6 +881,107 @@ impl StoreQueries {
                     filter.authorized_domain,
                     evidence_state_count,
                     evidence_states,
+                    sql_limit,
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut chunks = rows
+                .map(|row| ChunkRevision::parse(&row?).map_err(StoreError::from))
+                .collect::<Result<Vec<_>>>()?;
+            let truncated = chunks.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+            chunks.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok((chunks, truncated))
+        })
+    }
+
+    /// SQL-filtered keyset page of the latest revision per logical chunk at a
+    /// stable generation cutoff. The response is ordered exactly like the
+    /// shared current-chunk query and materializes only page+1 canonical rows.
+    pub fn chunk_page_at_cutoff(
+        &self,
+        filter: &ActivityFilter,
+        stable_cutoff: DateTime<Utc>,
+        high_water: ProjectionHighWater,
+        include_missing_observation: bool,
+        after_chunk_id: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<ChunkRevision>, bool)> {
+        filter.range.validate().map_err(StoreError::InvalidPath)?;
+        if limit == 0 || limit > MAX_SHARED_PAGE_ITEMS {
+            return Err(StoreError::InvalidPath(format!(
+                "chunk page limit must be 1..={MAX_SHARED_PAGE_ITEMS}"
+            )));
+        }
+        let chunk_rowid = i64::try_from(high_water.chunk_revision_rowid)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        self.with_connection(|connection| {
+            let evidence_states = serde_json::to_string(&filter.evidence_states)?;
+            let dimensions_present = i64::from(
+                filter.application_bundle_id.is_some()
+                    || filter.window_text.is_some()
+                    || filter.authorized_domain.is_some(),
+            );
+            let coverage_filter_present =
+                i64::from(!filter.evidence_states.is_empty() || include_missing_observation);
+            let include_missing_observation = i64::from(include_missing_observation);
+            let cursor = after_chunk_id
+                .map(|chunk_id| {
+                    let sql = format!(
+                        "SELECT scoped.window_start, scoped.chunk_id
+                         FROM ({STABLE_CHUNK_SCOPE_SQL}) scoped
+                         WHERE scoped.chunk_id=?12"
+                    );
+                    connection
+                        .query_row(
+                            &sql,
+                            params![
+                                stable_cutoff.to_rfc3339(),
+                                filter.range.start.to_rfc3339(),
+                                filter.range.end.to_rfc3339(),
+                                chunk_rowid,
+                                dimensions_present,
+                                filter.application_bundle_id.as_deref(),
+                                filter.window_text.as_deref(),
+                                filter.authorized_domain.as_deref(),
+                                coverage_filter_present,
+                                include_missing_observation,
+                                &evidence_states,
+                                chunk_id,
+                            ],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()?
+                        .ok_or(StoreError::CursorScopeMismatch)
+                })
+                .transpose()?;
+            let (cursor_start, cursor_id) = cursor
+                .map(|(start, id)| (Some(start), Some(id)))
+                .unwrap_or((None, None));
+            let sql_limit = i64::from(limit.saturating_add(1));
+            let sql = format!(
+                "SELECT scoped.body_json
+                 FROM ({STABLE_CHUNK_SCOPE_SQL}) scoped
+                 WHERE (?12 IS NULL OR scoped.window_start > ?13
+                        OR (scoped.window_start = ?13 AND scoped.chunk_id > ?12))
+                 ORDER BY scoped.window_start, scoped.chunk_id
+                 LIMIT ?14"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(
+                params![
+                    stable_cutoff.to_rfc3339(),
+                    filter.range.start.to_rfc3339(),
+                    filter.range.end.to_rfc3339(),
+                    chunk_rowid,
+                    dimensions_present,
+                    filter.application_bundle_id.as_deref(),
+                    filter.window_text.as_deref(),
+                    filter.authorized_domain.as_deref(),
+                    coverage_filter_present,
+                    include_missing_observation,
+                    &evidence_states,
+                    cursor_id,
+                    cursor_start,
                     sql_limit,
                 ],
                 |row| row.get::<_, String>(0),

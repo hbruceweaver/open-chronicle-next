@@ -33,118 +33,143 @@ impl FactualStatistics {
     }
 
     pub fn range(&self, range: &UtcRange) -> Result<StatisticsReport> {
-        range.validate().map_err(StoreError::InvalidPath)?;
-        if range.start.timestamp().rem_euclid(300) != 0
-            || range.end.timestamp().rem_euclid(300) != 0
-        {
-            return Err(StoreError::InvalidPath(
-                "statistics range must align to UTC five-minute boundaries".to_owned(),
-            ));
-        }
-        let duration = (range.end - range.start).num_seconds();
-        let bucket_count = duration / 300;
-        if bucket_count > MAX_STATISTICS_BUCKETS {
-            return Err(StoreError::InvalidPath(
-                "statistics range exceeds the 105408-bucket factual query budget".to_owned(),
-            ));
-        }
+        validate_statistics_range(range)?;
         let chunks = self.queries.current_chunks_in_range(range)?;
-        let mut chunks_by_start = BTreeMap::new();
-        for chunk in &chunks {
-            if chunks_by_start.insert(chunk.window.start, chunk).is_some() {
-                return Err(StoreError::SqliteIdentity(
-                    "multiple current chunks occupy one local UTC bucket".to_owned(),
-                ));
-            }
-        }
-        let mut evidence = EvidenceSeconds {
-            captured: 0,
-            protected: 0,
-            paused: 0,
-            unavailable: 0,
-            error: 0,
-            gap: 0,
-        };
-        let mut presence = PresenceSeconds {
-            active: 0,
-            idle: 0,
-            unknown: 0,
-        };
-        let mut gaps = Vec::new();
-        let mut totals = BTreeMap::<(DimensionKind, String), (u32, BTreeSet<ChunkId>)>::new();
-        let mut transitions = Vec::new();
-        let mut revision_ids = Vec::new();
-        let mut cursor = range.start;
-        while cursor < range.end {
-            let end = cursor + Duration::seconds(300);
-            if let Some(chunk) = chunks_by_start.get(&cursor) {
-                add_evidence(&mut evidence, &chunk.evidence_seconds)?;
-                add_presence(&mut presence, &chunk.presence_seconds)?;
-                for gap in &chunk.gaps {
-                    push_coalesced_gap(&mut gaps, gap.clone());
-                }
-                for estimate in &chunk.duration_estimates {
-                    let entry = totals
-                        .entry((estimate.dimension, estimate.key.clone()))
-                        .or_insert_with(|| (0, BTreeSet::new()));
-                    entry.0 = entry
-                        .0
-                        .checked_add(estimate.estimated_seconds)
-                        .ok_or_else(|| {
-                            StoreError::InvalidPath("statistics total overflow".to_owned())
-                        })?;
-                    entry.1.insert(chunk.chunk_id.clone());
-                }
-                transitions.extend(chunk.transitions.clone());
-                revision_ids.push(chunk.revision_id.clone());
-            } else {
-                evidence.gap = evidence
-                    .gap
-                    .checked_add(300)
-                    .ok_or_else(|| StoreError::InvalidPath("statistics gap overflow".to_owned()))?;
-                push_coalesced_gap(
-                    &mut gaps,
-                    ChunkGap {
-                        start: cursor,
-                        end,
-                        kind: ChunkGapKind::MissingObservation,
-                        supporting_event_ids: Vec::new(),
-                    },
-                );
-            }
-            cursor = end;
-        }
-        transitions.sort_by(|left, right| {
-            left.at
-                .cmp(&right.at)
-                .then_with(|| left.supporting_event_id.cmp(&right.supporting_event_id))
-        });
-        let factual_totals = totals
-            .into_iter()
-            .map(
-                |((dimension, key), (estimated_seconds, supporting_chunk_ids))| FactualTotal {
-                    dimension,
-                    key,
-                    estimated_seconds,
-                    supporting_chunk_ids: supporting_chunk_ids.into_iter().collect(),
-                },
-            )
-            .collect();
-        let coverage = QueryCoverage {
-            range: range.clone(),
-            evidence_seconds: evidence,
-            presence_seconds: presence,
-            gaps,
-        };
-        coverage.validate().map_err(StoreError::SqliteIdentity)?;
-        Ok(StatisticsReport {
-            coverage,
-            factual_totals,
-            transitions,
-            source_chunk_revision_ids: revision_ids,
-            activity_chunks: chunks,
-        })
+        statistics_from_chunks(range, chunks)
     }
+
+    /// Computes the same factual report contract from the latest immutable
+    /// chunk revisions available at `stable_cutoff`.
+    pub fn range_at_cutoff(
+        &self,
+        range: &UtcRange,
+        stable_cutoff: chrono::DateTime<chrono::Utc>,
+        high_water: crate::ProjectionHighWater,
+    ) -> Result<StatisticsReport> {
+        validate_statistics_range(range)?;
+        let chunks = self
+            .queries
+            .chunks_in_range_at_cutoff(range, stable_cutoff, high_water)?;
+        statistics_from_chunks(range, chunks)
+    }
+}
+
+fn validate_statistics_range(range: &UtcRange) -> Result<()> {
+    range.validate().map_err(StoreError::InvalidPath)?;
+    if range.start.timestamp().rem_euclid(300) != 0 || range.end.timestamp().rem_euclid(300) != 0 {
+        return Err(StoreError::InvalidPath(
+            "statistics range must align to UTC five-minute boundaries".to_owned(),
+        ));
+    }
+    let duration = (range.end - range.start).num_seconds();
+    let bucket_count = duration / 300;
+    if bucket_count > MAX_STATISTICS_BUCKETS {
+        return Err(StoreError::InvalidPath(
+            "statistics range exceeds the 105408-bucket factual query budget".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn statistics_from_chunks(
+    range: &UtcRange,
+    chunks: Vec<ChunkRevision>,
+) -> Result<StatisticsReport> {
+    let mut chunks_by_start = BTreeMap::new();
+    for chunk in &chunks {
+        if chunks_by_start.insert(chunk.window.start, chunk).is_some() {
+            return Err(StoreError::SqliteIdentity(
+                "multiple current chunks occupy one local UTC bucket".to_owned(),
+            ));
+        }
+    }
+    let mut evidence = EvidenceSeconds {
+        captured: 0,
+        protected: 0,
+        paused: 0,
+        unavailable: 0,
+        error: 0,
+        gap: 0,
+    };
+    let mut presence = PresenceSeconds {
+        active: 0,
+        idle: 0,
+        unknown: 0,
+    };
+    let mut gaps = Vec::new();
+    let mut totals = BTreeMap::<(DimensionKind, String), (u32, BTreeSet<ChunkId>)>::new();
+    let mut transitions = Vec::new();
+    let mut revision_ids = Vec::new();
+    let mut cursor = range.start;
+    while cursor < range.end {
+        let end = cursor + Duration::seconds(300);
+        if let Some(chunk) = chunks_by_start.get(&cursor) {
+            add_evidence(&mut evidence, &chunk.evidence_seconds)?;
+            add_presence(&mut presence, &chunk.presence_seconds)?;
+            for gap in &chunk.gaps {
+                push_coalesced_gap(&mut gaps, gap.clone());
+            }
+            for estimate in &chunk.duration_estimates {
+                let entry = totals
+                    .entry((estimate.dimension, estimate.key.clone()))
+                    .or_insert_with(|| (0, BTreeSet::new()));
+                entry.0 = entry
+                    .0
+                    .checked_add(estimate.estimated_seconds)
+                    .ok_or_else(|| {
+                        StoreError::InvalidPath("statistics total overflow".to_owned())
+                    })?;
+                entry.1.insert(chunk.chunk_id.clone());
+            }
+            transitions.extend(chunk.transitions.clone());
+            revision_ids.push(chunk.revision_id.clone());
+        } else {
+            evidence.gap = evidence
+                .gap
+                .checked_add(300)
+                .ok_or_else(|| StoreError::InvalidPath("statistics gap overflow".to_owned()))?;
+            push_coalesced_gap(
+                &mut gaps,
+                ChunkGap {
+                    start: cursor,
+                    end,
+                    kind: ChunkGapKind::MissingObservation,
+                    supporting_event_ids: Vec::new(),
+                },
+            );
+        }
+        cursor = end;
+    }
+    transitions.sort_by(|left, right| {
+        left.at
+            .cmp(&right.at)
+            .then_with(|| left.supporting_event_id.cmp(&right.supporting_event_id))
+    });
+    let factual_totals = totals
+        .into_iter()
+        .map(
+            |((dimension, key), (estimated_seconds, supporting_chunk_ids))| FactualTotal {
+                dimension,
+                key,
+                estimated_seconds,
+                supporting_chunk_ids: supporting_chunk_ids.into_iter().collect(),
+            },
+        )
+        .collect();
+    let coverage = QueryCoverage {
+        range: range.clone(),
+        evidence_seconds: evidence,
+        presence_seconds: presence,
+        gaps,
+    };
+    coverage.validate().map_err(StoreError::SqliteIdentity)?;
+    Ok(StatisticsReport {
+        coverage,
+        factual_totals,
+        transitions,
+        source_chunk_revision_ids: revision_ids,
+        activity_chunks: chunks,
+    })
 }
 
 fn push_coalesced_gap(gaps: &mut Vec<ChunkGap>, mut next: ChunkGap) {

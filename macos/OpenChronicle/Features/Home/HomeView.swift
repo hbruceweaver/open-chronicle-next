@@ -6,6 +6,9 @@ struct HomeView: View {
     let health: ChronicleHealthState
     let onChunk: (String) -> Void
     let onEvent: (String) -> Void
+    let onTimeline: () -> Void
+    let onAnalysis: () -> Void
+    let onHealth: () -> Void
     @State private var evidenceSelection: HomeEvidenceSelection?
 
     var body: some View {
@@ -29,6 +32,19 @@ struct HomeView: View {
             .frame(maxWidth: 1_100, alignment: .leading)
         }
         .navigationTitle("Home")
+        .toolbar {
+            ToolbarItemGroup {
+                Button(action: onTimeline) {
+                    Label("Timeline", systemImage: "clock.arrow.circlepath")
+                }
+                Button(action: onAnalysis) {
+                    Label("Analysis", systemImage: "sparkles.rectangle.stack")
+                }
+                Button(action: onHealth) {
+                    Label("Health", systemImage: "heart.text.square")
+                }
+            }
+        }
         .task {
             if model.snapshot == nil { await model.load() }
         }

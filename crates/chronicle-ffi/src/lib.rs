@@ -13,11 +13,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use chronicle_domain::{
-    CaptureCadence, ChunkGap, ChunkId, ChunkRevisionId, ClientId, DeviceId, DimensionKind,
-    DisclosureGrant, DurationEstimate, EventEnvelope, EventId, EventPayload, EvidenceSeconds,
-    GrantId, GrantState, ImageArtifactId, ObservationContent, PresenceSeconds, QueryCoverage,
-    ReceiptId, ScreenshotProjectedState, ScreenshotRetention, SharedServiceRequest, Transition,
-    UtcRange, parse_versioned, validate_schema_version,
+    ActivityFilter, ArtifactId, ArtifactRevisionId, CaptureCadence, ChunkGap, ChunkId,
+    ChunkRevision, ChunkRevisionId, ClientId, DeviceId, DimensionKind, DisclosureGrant,
+    DurationEstimate, EventEnvelope, EventId, EventPayload, EvidenceSeconds, EvidenceState,
+    GrantId, GrantState, ImageArtifactId, ObservationContent, OcrState, PageInfo, PageRequest,
+    PermittedWindowContext, PresenceSeconds, PresenceState, QueryArtifact, QueryCoverage,
+    QueryEvent, QueryEventPayload, QueryObservationContent, ReceiptId, ScreenshotProjectedState,
+    ScreenshotRetention, SharedServiceRequest, Transition, UtcRange, parse_versioned,
+    validate_schema_version,
 };
 use chronicle_engine::{
     CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator,
@@ -25,13 +28,15 @@ use chronicle_engine::{
     StartupReconcileRequest, StudyBoundary,
 };
 use chronicle_store::{
-    CaptureOwnerGuard, FactualStatistics, FaultInjector, LockManager, ManagedRoot, SqliteStore,
-    StoreError, StoreGeneration, StoreQueries,
+    ActivitySearch, CaptureOwnerGuard, FactualStatistics, FaultInjector, LockManager, ManagedRoot,
+    ProjectionAnchors, ProjectionHighWater, SearchHit, SqliteStore, StoreError, StoreGeneration,
+    StoreQueries,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const ABI_SCHEMA_VERSION: &str = chronicle_domain::CONTRACT_VERSION;
 const MAX_OPEN_REQUEST_BYTES: usize = 16 * 1024;
@@ -41,6 +46,14 @@ const MAX_IMAGE_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_ENCODED_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FACTUAL_REPORT_RANGE_SECONDS: i64 = 31 * 24 * 60 * 60;
 const MAX_FACTUAL_REPORT_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TIMELINE_RANGE_SECONDS: i64 = 31 * 24 * 60 * 60;
+const MAX_TIMELINE_PAGE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TIMELINE_SEARCH_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TIMELINE_DETAIL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ANALYSIS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TIMELINE_PAGE_ITEMS: u32 = 100;
+const MAX_SNAPSHOT_TOKEN_BYTES: usize = 2 * 1024;
+const SNAPSHOT_TOKEN_VERSION: &str = "open-chronicle/timeline-snapshot/v1";
 
 /// A registry-owned byte allocation. Callers must copy bytes before freeing.
 #[repr(C)]
@@ -158,6 +171,11 @@ impl From<StoreError> for FfiError {
                 ChronicleStatus::Contract,
                 "contract-error",
                 "request violates the Chronicle storage contract",
+            ),
+            StoreError::CursorNotFound | StoreError::CursorScopeMismatch => Self::new(
+                ChronicleStatus::Contract,
+                "invalid-pagination-cursor",
+                "pagination cursor does not belong to this Chronicle snapshot",
             ),
             StoreError::GrantAlreadyExists => Self::new(
                 ChronicleStatus::Contract,
@@ -499,6 +517,45 @@ enum AppControl {
     FactualReport {
         range: UtcRange,
     },
+    TimelinePage {
+        stable_cutoff: DateTime<Utc>,
+        #[serde(default)]
+        snapshot_token: Option<String>,
+        filter: TimelineFilter,
+        page: PageRequest,
+    },
+    TimelineSearch {
+        stable_cutoff: DateTime<Utc>,
+        #[serde(default)]
+        snapshot_token: Option<String>,
+        filter: TimelineFilter,
+        query: String,
+        page: PageRequest,
+    },
+    TimelineChunkDetail {
+        snapshot_token: String,
+        #[serde(default)]
+        revision_id: Option<ChunkRevisionId>,
+        #[serde(default)]
+        chunk_id: Option<ChunkId>,
+    },
+    TimelineEventDetail {
+        snapshot_token: String,
+        event_id: EventId,
+    },
+    AnalysisPage {
+        stable_cutoff: DateTime<Utc>,
+        #[serde(default)]
+        snapshot_token: Option<String>,
+        range: UtcRange,
+        page: PageRequest,
+    },
+    AnalysisDetail {
+        snapshot_token: String,
+        artifact_id: ArtifactId,
+        #[serde(default)]
+        revision_id: Option<ArtifactRevisionId>,
+    },
     SetRecordingPreference {
         enabled: bool,
     },
@@ -539,6 +596,28 @@ enum AppControl {
         client_id: ClientId,
         receipt_id: ReceiptId,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimelineFilter {
+    range: UtcRange,
+    application_bundle_id: Option<String>,
+    window_text: Option<String>,
+    authorized_domain: Option<String>,
+    #[serde(default)]
+    coverage_states: Vec<TimelineCoverageState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TimelineCoverageState {
+    Captured,
+    Protected,
+    Paused,
+    Unavailable,
+    Error,
+    MissingObservation,
 }
 
 #[derive(Debug, Serialize)]
@@ -590,6 +669,189 @@ struct FactualReportProvenance {
     sqlite_source_id: &'static str,
     source_event_ids: Vec<EventId>,
     source_chunk_revision_ids: Vec<ChunkRevisionId>,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelinePageSnapshot {
+    schema_version: &'static str,
+    generated_at: DateTime<Utc>,
+    stable_cutoff: DateTime<Utc>,
+    snapshot_token: String,
+    store_generation: u64,
+    filter: TimelineFilter,
+    coverage: QueryCoverage,
+    chunks: Vec<TimelineChunkBand>,
+    page: PageInfo,
+    domain_context_available: bool,
+    provenance: FactualReportProvenance,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineChunkBand {
+    chunk_id: ChunkId,
+    revision_id: ChunkRevisionId,
+    prior_revision_id: Option<ChunkRevisionId>,
+    supersedes_revision_id: Option<ChunkRevisionId>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    generated_at: DateTime<Utc>,
+    display_timezone: String,
+    aggregator_version: String,
+    input_digest: String,
+    store_generation: u64,
+    finalization_cadence_seconds: u32,
+    evidence_seconds: EvidenceSeconds,
+    presence_seconds: PresenceSeconds,
+    duration_estimates: Vec<DurationEstimate>,
+    transitions: Vec<Transition>,
+    extracts: Vec<TimelineExtractMetadata>,
+    gaps: Vec<ChunkGap>,
+    supporting_event_ids: Vec<EventId>,
+    late_input: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineExtractMetadata {
+    source_event_id: EventId,
+    character_count: u32,
+    untrusted_evidence: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineSearchSnapshot {
+    schema_version: &'static str,
+    generated_at: DateTime<Utc>,
+    stable_cutoff: DateTime<Utc>,
+    snapshot_token: String,
+    store_generation: u64,
+    filter: TimelineFilter,
+    coverage: QueryCoverage,
+    query: String,
+    hits: Vec<TimelineSearchHit>,
+    page: PageInfo,
+    provenance: FactualReportProvenance,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineSearchHit {
+    event_id: EventId,
+    observed_at: DateTime<Utc>,
+    context: PermittedWindowContext,
+    evidence_state: EvidenceState,
+    presence_state: PresenceState,
+    ocr_state: OcrState,
+    snippet: TimelineSearchSnippet,
+    untrusted_evidence: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineSearchSnippet {
+    text: String,
+    highlights: Vec<TimelineHighlightRange>,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineHighlightRange {
+    start: u32,
+    length: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineChunkDetailSnapshot {
+    schema_version: &'static str,
+    generated_at: DateTime<Utc>,
+    stable_cutoff: DateTime<Utc>,
+    snapshot_token: String,
+    store_generation: u64,
+    chunk: ChunkRevision,
+    provenance: FactualReportProvenance,
+}
+
+#[derive(Debug, Serialize)]
+struct TimelineEventDetailSnapshot {
+    schema_version: &'static str,
+    generated_at: DateTime<Utc>,
+    stable_cutoff: DateTime<Utc>,
+    snapshot_token: String,
+    store_generation: u64,
+    event: QueryEvent,
+    provenance: FactualReportProvenance,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisPageSnapshot {
+    schema_version: &'static str,
+    generated_at: DateTime<Utc>,
+    stable_cutoff: DateTime<Utc>,
+    snapshot_token: String,
+    store_generation: u64,
+    range: UtcRange,
+    artifacts: Vec<QueryArtifact>,
+    page: PageInfo,
+    provenance: AnalysisProvenance,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisDetailSnapshot {
+    schema_version: &'static str,
+    generated_at: DateTime<Utc>,
+    stable_cutoff: DateTime<Utc>,
+    snapshot_token: String,
+    store_generation: u64,
+    artifact: QueryArtifact,
+    provenance: AnalysisProvenance,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisProvenance {
+    query_engine_version: &'static str,
+    projection_build_id: &'static str,
+    sqlite_version: &'static str,
+    sqlite_source_id: &'static str,
+    source_event_ids: Vec<EventId>,
+    source_chunk_ids: Vec<ChunkId>,
+    source_artifact_revision_ids: Vec<ArtifactRevisionId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimelineSnapshotToken {
+    version: String,
+    store_generation: u64,
+    projection_instance_id: String,
+    stable_cutoff: DateTime<Utc>,
+    event_rowid_high_water: u64,
+    chunk_revision_rowid_high_water: u64,
+    artifact_revision_rowid_high_water: u64,
+    event_anchor_id: Option<EventId>,
+    chunk_revision_anchor_id: Option<ChunkRevisionId>,
+    artifact_revision_anchor_id: Option<ArtifactRevisionId>,
+    scope_digest: String,
+}
+
+impl TimelineSnapshotToken {
+    const fn high_water(&self) -> ProjectionHighWater {
+        ProjectionHighWater {
+            event_rowid: self.event_rowid_high_water,
+            chunk_revision_rowid: self.chunk_revision_rowid_high_water,
+            artifact_revision_rowid: self.artifact_revision_rowid_high_water,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TimelineSnapshotScope<'a> {
+    operation: &'static str,
+    stable_cutoff: DateTime<Utc>,
+    filter: &'a TimelineFilter,
+    query: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct AnalysisSnapshotScope<'a> {
+    operation: &'static str,
+    stable_cutoff: DateTime<Utc>,
+    range: &'a UtcRange,
 }
 
 #[derive(Debug, Default)]
@@ -771,6 +1033,490 @@ fn serialize_bounded_factual_report(
     Ok(value)
 }
 
+fn validate_timeline_filter(
+    filter: &TimelineFilter,
+    stable_cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), FfiError> {
+    let duration = filter
+        .range
+        .end
+        .signed_duration_since(filter.range.start)
+        .num_seconds();
+    let aligned = filter.range.start.timestamp().rem_euclid(300) == 0
+        && filter.range.end.timestamp().rem_euclid(300) == 0
+        && filter.range.start.timestamp_subsec_nanos() == 0
+        && filter.range.end.timestamp_subsec_nanos() == 0;
+    if filter.range.validate().is_err()
+        || !aligned
+        || duration > MAX_TIMELINE_RANGE_SECONDS
+        || filter.range.end > stable_cutoff
+        || stable_cutoff > now
+        || stable_cutoff.timestamp_subsec_nanos() != 0
+    {
+        return Err(FfiError::new(
+            ChronicleStatus::Contract,
+            "invalid-timeline-range",
+            "timeline range must be a past, UTC five-minute-aligned interval of at most 31 days inside a whole-second stable cutoff",
+        ));
+    }
+    for (value, maximum, label) in [
+        (
+            filter.application_bundle_id.as_deref(),
+            255,
+            "application bundle ID",
+        ),
+        (filter.window_text.as_deref(), 512, "window text"),
+        (
+            filter.authorized_domain.as_deref(),
+            253,
+            "authorized domain",
+        ),
+    ] {
+        if value.is_some_and(|value| value.is_empty() || value.chars().count() > maximum) {
+            return Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "invalid-timeline-filter",
+                format!("timeline {label} filter is empty or exceeds its character limit"),
+            ));
+        }
+    }
+    if filter
+        .coverage_states
+        .iter()
+        .enumerate()
+        .any(|(index, state)| filter.coverage_states[..index].contains(state))
+    {
+        return Err(FfiError::new(
+            ChronicleStatus::Contract,
+            "invalid-timeline-filter",
+            "timeline coverage-state filters must be unique",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_timeline_page(page: &PageRequest, cursor_kind: &str) -> Result<(), FfiError> {
+    if page.limit == 0 || page.limit > MAX_TIMELINE_PAGE_ITEMS {
+        return Err(FfiError::new(
+            ChronicleStatus::Contract,
+            "invalid-timeline-page",
+            format!("timeline page limit must be 1..={MAX_TIMELINE_PAGE_ITEMS}"),
+        ));
+    }
+    if let Some(cursor) = page.cursor.as_deref() {
+        if cursor.is_empty() || cursor.len() > 255 {
+            return Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "invalid-pagination-cursor",
+                "timeline cursor is empty or exceeds its byte limit",
+            ));
+        }
+        let valid = match cursor_kind {
+            "chunk" => ChunkId::new(cursor.to_owned()).is_ok(),
+            "event" => EventId::new(cursor.to_owned()).is_ok(),
+            "artifact" => ArtifactId::new(cursor.to_owned()).is_ok(),
+            _ => false,
+        };
+        if !valid {
+            return Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "invalid-pagination-cursor",
+                "timeline cursor is not a valid stable ID",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn timeline_activity_filter(filter: &TimelineFilter) -> (ActivityFilter, bool) {
+    let mut evidence_states = Vec::new();
+    let mut include_missing_observation = false;
+    for state in &filter.coverage_states {
+        match state {
+            TimelineCoverageState::Captured => {
+                evidence_states.push(EvidenceState::CapturedNew);
+                evidence_states.push(EvidenceState::CapturedUnchanged);
+            }
+            TimelineCoverageState::Protected => evidence_states.push(EvidenceState::Protected),
+            TimelineCoverageState::Paused => evidence_states.push(EvidenceState::Paused),
+            TimelineCoverageState::Unavailable => {
+                evidence_states.push(EvidenceState::Unavailable);
+            }
+            TimelineCoverageState::Error => evidence_states.push(EvidenceState::CaptureFailed),
+            TimelineCoverageState::MissingObservation => include_missing_observation = true,
+        }
+    }
+    (
+        ActivityFilter {
+            range: filter.range.clone(),
+            application_bundle_id: filter.application_bundle_id.clone(),
+            window_text: filter.window_text.clone(),
+            authorized_domain: filter.authorized_domain.clone(),
+            evidence_states,
+        },
+        include_missing_observation,
+    )
+}
+
+fn timeline_scope_digest(
+    operation: &'static str,
+    stable_cutoff: DateTime<Utc>,
+    filter: &TimelineFilter,
+    query: Option<&str>,
+) -> Result<String, FfiError> {
+    let bytes = serde_json::to_vec(&TimelineSnapshotScope {
+        operation,
+        stable_cutoff,
+        filter,
+        query,
+    })
+    .map_err(|_| timeline_internal_error())?;
+    Ok(hex_encode(&Sha256::digest(bytes)))
+}
+
+fn analysis_scope_digest(
+    stable_cutoff: DateTime<Utc>,
+    range: &UtcRange,
+) -> Result<String, FfiError> {
+    let bytes = serde_json::to_vec(&AnalysisSnapshotScope {
+        operation: "analysis-page",
+        stable_cutoff,
+        range,
+    })
+    .map_err(|_| timeline_internal_error())?;
+    Ok(hex_encode(&Sha256::digest(bytes)))
+}
+
+fn resolve_timeline_snapshot(
+    token: Option<&str>,
+    stable_cutoff: DateTime<Utc>,
+    scope_digest: &str,
+    store_generation: u64,
+    queries: &StoreQueries,
+    page_has_cursor: bool,
+) -> Result<(TimelineSnapshotToken, String), FfiError> {
+    if token.is_none() && page_has_cursor {
+        return Err(FfiError::new(
+            ChronicleStatus::Contract,
+            "snapshot-token-required",
+            "timeline pagination requires the snapshot token returned by the first page",
+        ));
+    }
+    let snapshot = match token {
+        Some(token) => {
+            let snapshot = decode_snapshot_token(token)?;
+            validate_snapshot_token(
+                &snapshot,
+                stable_cutoff,
+                Some(scope_digest),
+                store_generation,
+            )?;
+            ensure_snapshot_projection_identity(queries, &snapshot)?;
+            snapshot
+        }
+        None => {
+            let projection_instance_id =
+                queries.projection_instance_id().map_err(FfiError::from)?;
+            let high_water = queries.projection_high_water().map_err(FfiError::from)?;
+            let anchors = queries
+                .projection_anchors(high_water)
+                .map_err(FfiError::from)?;
+            TimelineSnapshotToken {
+                version: SNAPSHOT_TOKEN_VERSION.to_owned(),
+                store_generation,
+                projection_instance_id,
+                stable_cutoff,
+                event_rowid_high_water: high_water.event_rowid,
+                chunk_revision_rowid_high_water: high_water.chunk_revision_rowid,
+                artifact_revision_rowid_high_water: high_water.artifact_revision_rowid,
+                event_anchor_id: anchors.event_id,
+                chunk_revision_anchor_id: anchors.chunk_revision_id,
+                artifact_revision_anchor_id: anchors.artifact_revision_id,
+                scope_digest: scope_digest.to_owned(),
+            }
+        }
+    };
+    let encoded = encode_snapshot_token(&snapshot)?;
+    Ok((snapshot, encoded))
+}
+
+fn validate_snapshot_token(
+    snapshot: &TimelineSnapshotToken,
+    stable_cutoff: DateTime<Utc>,
+    expected_scope_digest: Option<&str>,
+    store_generation: u64,
+) -> Result<(), FfiError> {
+    if snapshot.version != SNAPSHOT_TOKEN_VERSION
+        || snapshot.store_generation != store_generation
+        || snapshot.projection_instance_id.len() != 36
+        || snapshot.stable_cutoff != stable_cutoff
+        || snapshot.stable_cutoff.timestamp_subsec_nanos() != 0
+        || snapshot.scope_digest.len() != 64
+        || snapshot.event_anchor_id.is_some() != (snapshot.event_rowid_high_water > 0)
+        || snapshot.chunk_revision_anchor_id.is_some()
+            != (snapshot.chunk_revision_rowid_high_water > 0)
+        || snapshot.artifact_revision_anchor_id.is_some()
+            != (snapshot.artifact_revision_rowid_high_water > 0)
+        || expected_scope_digest.is_some_and(|expected| snapshot.scope_digest != expected)
+    {
+        return Err(FfiError::new(
+            ChronicleStatus::Contract,
+            "snapshot-scope-mismatch",
+            "timeline snapshot token does not match this store, cutoff, or query scope",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_projection_identity(
+    queries: &StoreQueries,
+    snapshot: &TimelineSnapshotToken,
+) -> Result<(), FfiError> {
+    if queries.projection_instance_id().map_err(FfiError::from)? != snapshot.projection_instance_id
+    {
+        return Err(snapshot_no_longer_available());
+    }
+    let current = queries.projection_high_water().map_err(FfiError::from)?;
+    if snapshot.event_rowid_high_water > current.event_rowid
+        || snapshot.chunk_revision_rowid_high_water > current.chunk_revision_rowid
+        || snapshot.artifact_revision_rowid_high_water > current.artifact_revision_rowid
+    {
+        return Err(snapshot_no_longer_available());
+    }
+    let current_anchors = queries
+        .projection_anchors(snapshot.high_water())
+        .map_err(FfiError::from)?;
+    let token_anchors = ProjectionAnchors {
+        event_id: snapshot.event_anchor_id.clone(),
+        chunk_revision_id: snapshot.chunk_revision_anchor_id.clone(),
+        artifact_revision_id: snapshot.artifact_revision_anchor_id.clone(),
+    };
+    if current_anchors != token_anchors {
+        return Err(snapshot_no_longer_available());
+    }
+    Ok(())
+}
+
+fn snapshot_no_longer_available() -> FfiError {
+    FfiError::new(
+        ChronicleStatus::StaleGeneration,
+        "snapshot-no-longer-available",
+        "the timeline projection changed incompatibly; refresh from the first page",
+    )
+}
+
+fn encode_snapshot_token(snapshot: &TimelineSnapshotToken) -> Result<String, FfiError> {
+    let body = serde_json::to_vec(snapshot).map_err(|_| timeline_internal_error())?;
+    let checksum = Sha256::digest(&body);
+    let token = format!("ocs1.{}.{}", hex_encode(&body), hex_encode(&checksum));
+    if token.len() > MAX_SNAPSHOT_TOKEN_BYTES {
+        return Err(timeline_internal_error());
+    }
+    Ok(token)
+}
+
+fn decode_snapshot_token(token: &str) -> Result<TimelineSnapshotToken, FfiError> {
+    if token.is_empty() || token.len() > MAX_SNAPSHOT_TOKEN_BYTES {
+        return Err(invalid_snapshot_token());
+    }
+    let mut parts = token.split('.');
+    let (Some(prefix), Some(body), Some(checksum), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid_snapshot_token());
+    };
+    if prefix != "ocs1" || checksum.len() != 64 {
+        return Err(invalid_snapshot_token());
+    }
+    let body = hex_decode(body).ok_or_else(invalid_snapshot_token)?;
+    let supplied_checksum = hex_decode(checksum).ok_or_else(invalid_snapshot_token)?;
+    if supplied_checksum.as_slice() != Sha256::digest(&body).as_slice() {
+        return Err(invalid_snapshot_token());
+    }
+    serde_json::from_slice(&body).map_err(|_| invalid_snapshot_token())
+}
+
+fn invalid_snapshot_token() -> FfiError {
+    FfiError::new(
+        ChronicleStatus::Contract,
+        "invalid-snapshot-token",
+        "timeline snapshot token is malformed or failed its integrity check",
+    )
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            Some((high << 4) | low)
+        })
+        .collect()
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn timeline_band(chunk: ChunkRevision) -> Result<TimelineChunkBand, FfiError> {
+    let extracts = chunk
+        .ocr_extracts
+        .into_iter()
+        .map(|extract| {
+            Ok(TimelineExtractMetadata {
+                source_event_id: extract.source_event_id,
+                character_count: u32::try_from(extract.text.chars().count())
+                    .map_err(|_| timeline_internal_error())?,
+                untrusted_evidence: true,
+            })
+        })
+        .collect::<Result<Vec<_>, FfiError>>()?;
+    Ok(TimelineChunkBand {
+        chunk_id: chunk.chunk_id,
+        revision_id: chunk.revision_id,
+        prior_revision_id: chunk.prior_revision_id,
+        supersedes_revision_id: chunk.supersedes_revision_id,
+        start: chunk.window.start,
+        end: chunk.window.end,
+        generated_at: chunk.generated_at,
+        display_timezone: chunk.display_timezone,
+        aggregator_version: chunk.aggregator_version,
+        input_digest: chunk.input_digest,
+        store_generation: chunk.store_generation,
+        finalization_cadence_seconds: chunk.finalization_cadence_seconds,
+        evidence_seconds: chunk.evidence_seconds,
+        presence_seconds: chunk.presence_seconds,
+        duration_estimates: chunk.duration_estimates,
+        transitions: chunk.transitions,
+        extracts,
+        gaps: chunk.gaps,
+        supporting_event_ids: chunk.supporting_event_ids,
+        late_input: chunk.late_input,
+    })
+}
+
+fn timeline_search_hit(hit: SearchHit) -> Result<TimelineSearchHit, FfiError> {
+    let event_id = hit.event.event_id;
+    let observed_at = hit.event.observed_at;
+    let QueryEventPayload::ObservationAttempt(attempt) = hit.event.payload else {
+        return Err(timeline_internal_error());
+    };
+    let QueryObservationContent::Captured { context, .. } = attempt.content else {
+        return Err(timeline_internal_error());
+    };
+    let snippet = hit.snippet.ok_or_else(timeline_internal_error)?;
+    Ok(TimelineSearchHit {
+        event_id,
+        observed_at,
+        context,
+        evidence_state: attempt.evidence_state,
+        presence_state: attempt.presence_state,
+        ocr_state: attempt.ocr_state,
+        snippet: TimelineSearchSnippet {
+            text: snippet.text,
+            highlights: snippet
+                .highlights
+                .into_iter()
+                .map(|range| TimelineHighlightRange {
+                    start: range.start,
+                    length: range.length,
+                })
+                .collect(),
+        },
+        untrusted_evidence: true,
+    })
+}
+
+fn app_query_provenance(
+    source_event_ids: impl IntoIterator<Item = EventId>,
+    source_chunk_revision_ids: impl IntoIterator<Item = ChunkRevisionId>,
+) -> FactualReportProvenance {
+    let source_event_ids = source_event_ids.into_iter().collect::<BTreeSet<_>>();
+    let source_chunk_revision_ids = source_chunk_revision_ids
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    FactualReportProvenance {
+        query_engine_version: env!("CARGO_PKG_VERSION"),
+        projection_build_id: chronicle_store::STORE_BUILD_ID,
+        sqlite_version: chronicle_store::SQLITE_BUNDLED_VERSION,
+        sqlite_source_id: chronicle_store::SQLITE_BUNDLED_SOURCE_ID,
+        source_event_ids: source_event_ids.into_iter().collect(),
+        source_chunk_revision_ids: source_chunk_revision_ids.into_iter().collect(),
+    }
+}
+
+fn analysis_provenance(artifacts: &[QueryArtifact]) -> AnalysisProvenance {
+    let source_event_ids = artifacts
+        .iter()
+        .flat_map(|artifact| artifact.evidence.event_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let source_chunk_ids = artifacts
+        .iter()
+        .flat_map(|artifact| artifact.evidence.chunk_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let source_artifact_revision_ids = artifacts
+        .iter()
+        .map(|artifact| artifact.revision_id.clone())
+        .collect::<BTreeSet<_>>();
+    AnalysisProvenance {
+        query_engine_version: env!("CARGO_PKG_VERSION"),
+        projection_build_id: chronicle_store::STORE_BUILD_ID,
+        sqlite_version: chronicle_store::SQLITE_BUNDLED_VERSION,
+        sqlite_source_id: chronicle_store::SQLITE_BUNDLED_SOURCE_ID,
+        source_event_ids: source_event_ids.into_iter().collect(),
+        source_chunk_ids: source_chunk_ids.into_iter().collect(),
+        source_artifact_revision_ids: source_artifact_revision_ids.into_iter().collect(),
+    }
+}
+
+fn serialize_bounded_timeline<T: Serialize>(
+    snapshot: T,
+    max_bytes: usize,
+    code: &'static str,
+) -> Result<Value, FfiError> {
+    let value = serialize_value(snapshot)?;
+    let size = serde_json::to_vec(&value)
+        .map_err(|_| timeline_internal_error())?
+        .len();
+    if size > max_bytes {
+        return Err(FfiError::new(
+            ChronicleStatus::TooLarge,
+            code,
+            "timeline response exceeds its app byte budget; narrow the range or page",
+        ));
+    }
+    Ok(value)
+}
+
+fn timeline_internal_error() -> FfiError {
+    FfiError::new(
+        ChronicleStatus::Internal,
+        "timeline-inconsistent",
+        "Chronicle could not reconcile the timeline snapshot",
+    )
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum DisclosureGrantMutation {
@@ -936,6 +1682,39 @@ impl CoreHandle {
                     .map_err(FfiError::from)?,
             ),
             AppControl::FactualReport { range } => self.factual_report(range, now),
+            AppControl::TimelinePage {
+                stable_cutoff,
+                snapshot_token,
+                filter,
+                page,
+            } => self.timeline_page(stable_cutoff, snapshot_token, filter, page, now),
+            AppControl::TimelineSearch {
+                stable_cutoff,
+                snapshot_token,
+                filter,
+                query,
+                page,
+            } => self.timeline_search(stable_cutoff, snapshot_token, filter, query, page, now),
+            AppControl::TimelineChunkDetail {
+                snapshot_token,
+                revision_id,
+                chunk_id,
+            } => self.timeline_chunk_detail(snapshot_token, revision_id, chunk_id, now),
+            AppControl::TimelineEventDetail {
+                snapshot_token,
+                event_id,
+            } => self.timeline_event_detail(snapshot_token, event_id, now),
+            AppControl::AnalysisPage {
+                stable_cutoff,
+                snapshot_token,
+                range,
+                page,
+            } => self.analysis_page(stable_cutoff, snapshot_token, range, page, now),
+            AppControl::AnalysisDetail {
+                snapshot_token,
+                artifact_id,
+                revision_id,
+            } => self.analysis_detail(snapshot_token, artifact_id, revision_id, now),
             AppControl::SetRecordingPreference { enabled } => self
                 .coordinator
                 .set_recording_preference(enabled)
@@ -1031,6 +1810,438 @@ impl CoreHandle {
             .map_err(FfiError::from)?;
         let snapshot = build_factual_report_snapshot(range, now, self.opened_generation, report)?;
         serialize_bounded_factual_report(snapshot, MAX_FACTUAL_REPORT_RESPONSE_BYTES)
+    }
+
+    fn timeline_page(
+        &self,
+        stable_cutoff: DateTime<Utc>,
+        snapshot_token: Option<String>,
+        filter: TimelineFilter,
+        page: PageRequest,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        validate_timeline_filter(&filter, stable_cutoff, now)?;
+        validate_timeline_page(&page, "chunk")?;
+        self.ensure_generation(self.opened_generation)?;
+        let queries = StoreQueries::new(self.sqlite.clone())
+            .snapshot()
+            .map_err(FfiError::from)?;
+        let scope_digest = timeline_scope_digest("timeline-page", stable_cutoff, &filter, None)?;
+        let (snapshot, encoded_token) = resolve_timeline_snapshot(
+            snapshot_token.as_deref(),
+            stable_cutoff,
+            &scope_digest,
+            self.opened_generation,
+            &queries,
+            page.cursor.is_some(),
+        )?;
+        let (activity_filter, include_missing_observation) = timeline_activity_filter(&filter);
+        let report = FactualStatistics::new(queries.clone())
+            .range_at_cutoff(&filter.range, stable_cutoff, snapshot.high_water())
+            .map_err(FfiError::from)?;
+        let (chunks, truncated) = queries
+            .chunk_page_at_cutoff(
+                &activity_filter,
+                stable_cutoff,
+                snapshot.high_water(),
+                include_missing_observation,
+                page.cursor.as_deref(),
+                page.limit,
+            )
+            .map_err(FfiError::from)?;
+        let next_cursor = truncated
+            .then(|| chunks.last().map(|chunk| chunk.chunk_id.to_string()))
+            .flatten();
+        let source_event_ids = report
+            .activity_chunks
+            .iter()
+            .flat_map(|chunk| chunk.supporting_event_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let domain_context_available = report.activity_chunks.iter().any(|chunk| {
+            chunk
+                .duration_estimates
+                .iter()
+                .any(|estimate| estimate.dimension == DimensionKind::AuthorizedDomain)
+        });
+        let provenance = app_query_provenance(
+            source_event_ids,
+            report.source_chunk_revision_ids.iter().cloned(),
+        );
+        let chunks = chunks
+            .into_iter()
+            .map(timeline_band)
+            .collect::<Result<Vec<_>, _>>()?;
+        let returned_items = u32::try_from(chunks.len()).map_err(|_| timeline_internal_error())?;
+        serialize_bounded_timeline(
+            TimelinePageSnapshot {
+                schema_version: ABI_SCHEMA_VERSION,
+                generated_at: now,
+                stable_cutoff,
+                snapshot_token: encoded_token,
+                store_generation: self.opened_generation,
+                filter,
+                coverage: report.coverage,
+                chunks,
+                page: PageInfo {
+                    next_cursor,
+                    returned_items,
+                    truncated,
+                },
+                domain_context_available,
+                provenance,
+            },
+            MAX_TIMELINE_PAGE_RESPONSE_BYTES,
+            "timeline-page-too-large",
+        )
+    }
+
+    fn timeline_search(
+        &self,
+        stable_cutoff: DateTime<Utc>,
+        snapshot_token: Option<String>,
+        filter: TimelineFilter,
+        query: String,
+        page: PageRequest,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        validate_timeline_filter(&filter, stable_cutoff, now)?;
+        validate_timeline_page(&page, "event")?;
+        self.ensure_generation(self.opened_generation)?;
+        let queries = StoreQueries::new(self.sqlite.clone())
+            .snapshot()
+            .map_err(FfiError::from)?;
+        let scope_digest =
+            timeline_scope_digest("timeline-search", stable_cutoff, &filter, Some(&query))?;
+        let (snapshot, encoded_token) = resolve_timeline_snapshot(
+            snapshot_token.as_deref(),
+            stable_cutoff,
+            &scope_digest,
+            self.opened_generation,
+            &queries,
+            page.cursor.is_some(),
+        )?;
+        let (activity_filter, include_missing_observation) = timeline_activity_filter(&filter);
+        let report = FactualStatistics::new(queries.clone())
+            .range_at_cutoff(&filter.range, stable_cutoff, snapshot.high_water())
+            .map_err(FfiError::from)?;
+        let search_page =
+            if include_missing_observation && activity_filter.evidence_states.is_empty() {
+                chronicle_store::SearchPage {
+                    hits: Vec::new(),
+                    page: PageInfo {
+                        next_cursor: None,
+                        returned_items: 0,
+                        truncated: false,
+                    },
+                }
+            } else {
+                ActivitySearch::from_queries(queries)
+                    .search_at_cutoff(
+                        &activity_filter,
+                        &query,
+                        true,
+                        &page,
+                        stable_cutoff,
+                        snapshot.event_rowid_high_water,
+                    )
+                    .map_err(FfiError::from)?
+            };
+        let source_event_ids = search_page
+            .hits
+            .iter()
+            .map(|hit| hit.event.event_id.clone())
+            .collect::<Vec<_>>();
+        let provenance = app_query_provenance(
+            source_event_ids,
+            report.source_chunk_revision_ids.iter().cloned(),
+        );
+        let hits = search_page
+            .hits
+            .into_iter()
+            .map(timeline_search_hit)
+            .collect::<Result<Vec<_>, _>>()?;
+        serialize_bounded_timeline(
+            TimelineSearchSnapshot {
+                schema_version: ABI_SCHEMA_VERSION,
+                generated_at: now,
+                stable_cutoff,
+                snapshot_token: encoded_token,
+                store_generation: self.opened_generation,
+                filter,
+                coverage: report.coverage,
+                query,
+                hits,
+                page: search_page.page,
+                provenance,
+            },
+            MAX_TIMELINE_SEARCH_RESPONSE_BYTES,
+            "timeline-search-too-large",
+        )
+    }
+
+    fn timeline_chunk_detail(
+        &self,
+        snapshot_token: String,
+        revision_id: Option<ChunkRevisionId>,
+        chunk_id: Option<ChunkId>,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        if revision_id.is_some() == chunk_id.is_some() {
+            return Err(FfiError::new(
+                ChronicleStatus::Contract,
+                "invalid-chunk-detail-selector",
+                "timeline chunk detail requires exactly one revision_id or chunk_id",
+            ));
+        }
+        self.ensure_generation(self.opened_generation)?;
+        let snapshot = decode_snapshot_token(&snapshot_token)?;
+        validate_snapshot_token(
+            &snapshot,
+            snapshot.stable_cutoff,
+            None,
+            self.opened_generation,
+        )?;
+        if snapshot.stable_cutoff > now {
+            return Err(invalid_snapshot_token());
+        }
+        let queries = StoreQueries::new(self.sqlite.clone())
+            .snapshot()
+            .map_err(FfiError::from)?;
+        // Detail navigation is intentionally app-private and exact-ID based, so
+        // it does not reapply the originating list/search scope digest. The
+        // immutable projection boundary still applies, and no shared/MCP
+        // operation maps to these app controls.
+        ensure_snapshot_projection_identity(&queries, &snapshot)?;
+        let chunk = match (revision_id, chunk_id) {
+            (Some(revision_id), None) => queries.chunk_revision_at_snapshot(
+                &revision_id,
+                snapshot.stable_cutoff,
+                snapshot.high_water(),
+            ),
+            (None, Some(chunk_id)) => {
+                queries.chunk_at_cutoff(&chunk_id, snapshot.stable_cutoff, snapshot.high_water())
+            }
+            (None, None) | (Some(_), Some(_)) => {
+                return Err(FfiError::new(
+                    ChronicleStatus::Contract,
+                    "invalid-chunk-detail-selector",
+                    "timeline chunk detail requires exactly one revision_id or chunk_id",
+                ));
+            }
+        }
+        .map_err(FfiError::from)?
+        .ok_or_else(|| {
+            FfiError::new(
+                ChronicleStatus::NotFound,
+                "not-found",
+                "requested chunk revision is not part of this timeline snapshot",
+            )
+        })?;
+        let provenance = app_query_provenance(
+            chunk.supporting_event_ids.iter().cloned(),
+            [chunk.revision_id.clone()],
+        );
+        serialize_bounded_timeline(
+            TimelineChunkDetailSnapshot {
+                schema_version: ABI_SCHEMA_VERSION,
+                generated_at: now,
+                stable_cutoff: snapshot.stable_cutoff,
+                snapshot_token,
+                store_generation: self.opened_generation,
+                chunk,
+                provenance,
+            },
+            MAX_TIMELINE_DETAIL_RESPONSE_BYTES,
+            "timeline-chunk-detail-too-large",
+        )
+    }
+
+    fn timeline_event_detail(
+        &self,
+        snapshot_token: String,
+        event_id: EventId,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        self.ensure_generation(self.opened_generation)?;
+        let snapshot = decode_snapshot_token(&snapshot_token)?;
+        validate_snapshot_token(
+            &snapshot,
+            snapshot.stable_cutoff,
+            None,
+            self.opened_generation,
+        )?;
+        if snapshot.stable_cutoff > now {
+            return Err(invalid_snapshot_token());
+        }
+        let queries = StoreQueries::new(self.sqlite.clone())
+            .snapshot()
+            .map_err(FfiError::from)?;
+        // See chunk detail above: app navigation may follow a supporting event
+        // outside the visible filter, but never beyond this token's boundary.
+        ensure_snapshot_projection_identity(&queries, &snapshot)?;
+        let event = queries
+            .event_at_snapshot(
+                &event_id,
+                true,
+                snapshot.stable_cutoff,
+                snapshot.high_water(),
+            )
+            .map_err(FfiError::from)?
+            .ok_or_else(|| {
+                FfiError::new(
+                    ChronicleStatus::NotFound,
+                    "not-found",
+                    "requested event is not part of this timeline snapshot",
+                )
+            })?;
+        let provenance = app_query_provenance([event.event_id.clone()], Vec::new());
+        serialize_bounded_timeline(
+            TimelineEventDetailSnapshot {
+                schema_version: ABI_SCHEMA_VERSION,
+                generated_at: now,
+                stable_cutoff: snapshot.stable_cutoff,
+                snapshot_token,
+                store_generation: self.opened_generation,
+                event,
+                provenance,
+            },
+            MAX_TIMELINE_DETAIL_RESPONSE_BYTES,
+            "timeline-event-detail-too-large",
+        )
+    }
+
+    fn analysis_page(
+        &self,
+        stable_cutoff: DateTime<Utc>,
+        snapshot_token: Option<String>,
+        range: UtcRange,
+        page: PageRequest,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        validate_timeline_filter(
+            &TimelineFilter {
+                range: range.clone(),
+                application_bundle_id: None,
+                window_text: None,
+                authorized_domain: None,
+                coverage_states: Vec::new(),
+            },
+            stable_cutoff,
+            now,
+        )?;
+        validate_timeline_page(&page, "artifact")?;
+        self.ensure_generation(self.opened_generation)?;
+        let queries = StoreQueries::new(self.sqlite.clone())
+            .snapshot()
+            .map_err(FfiError::from)?;
+        let scope_digest = analysis_scope_digest(stable_cutoff, &range)?;
+        let (snapshot, encoded_token) = resolve_timeline_snapshot(
+            snapshot_token.as_deref(),
+            stable_cutoff,
+            &scope_digest,
+            self.opened_generation,
+            &queries,
+            page.cursor.is_some(),
+        )?;
+        let (artifacts, truncated) = queries
+            .artifact_page_at_cutoff(
+                &range,
+                stable_cutoff,
+                snapshot.high_water(),
+                page.cursor.as_deref(),
+                page.limit,
+            )
+            .map_err(FfiError::from)?;
+        for artifact in &artifacts {
+            artifact
+                .validate_public()
+                .map_err(|_| timeline_internal_error())?;
+        }
+        let next_cursor = truncated
+            .then(|| {
+                artifacts
+                    .last()
+                    .map(|artifact| artifact.artifact_id.to_string())
+            })
+            .flatten();
+        let returned_items =
+            u32::try_from(artifacts.len()).map_err(|_| timeline_internal_error())?;
+        let provenance = analysis_provenance(&artifacts);
+        serialize_bounded_timeline(
+            AnalysisPageSnapshot {
+                schema_version: ABI_SCHEMA_VERSION,
+                generated_at: now,
+                stable_cutoff,
+                snapshot_token: encoded_token,
+                store_generation: self.opened_generation,
+                range,
+                artifacts,
+                page: PageInfo {
+                    next_cursor,
+                    returned_items,
+                    truncated,
+                },
+                provenance,
+            },
+            MAX_ANALYSIS_RESPONSE_BYTES,
+            "analysis-page-too-large",
+        )
+    }
+
+    fn analysis_detail(
+        &self,
+        snapshot_token: String,
+        artifact_id: ArtifactId,
+        revision_id: Option<ArtifactRevisionId>,
+        now: DateTime<Utc>,
+    ) -> Result<Value, FfiError> {
+        self.ensure_generation(self.opened_generation)?;
+        let snapshot = decode_snapshot_token(&snapshot_token)?;
+        validate_snapshot_token(
+            &snapshot,
+            snapshot.stable_cutoff,
+            None,
+            self.opened_generation,
+        )?;
+        if snapshot.stable_cutoff > now {
+            return Err(invalid_snapshot_token());
+        }
+        let queries = StoreQueries::new(self.sqlite.clone())
+            .snapshot()
+            .map_err(FfiError::from)?;
+        ensure_snapshot_projection_identity(&queries, &snapshot)?;
+        let artifact = queries
+            .artifact_at_snapshot(
+                &artifact_id,
+                revision_id.as_ref(),
+                snapshot.stable_cutoff,
+                snapshot.high_water(),
+            )
+            .map_err(FfiError::from)?
+            .ok_or_else(|| {
+                FfiError::new(
+                    ChronicleStatus::NotFound,
+                    "not-found",
+                    "requested analysis artifact is not part of this snapshot",
+                )
+            })?;
+        artifact
+            .validate_public()
+            .map_err(|_| timeline_internal_error())?;
+        let provenance = analysis_provenance(std::slice::from_ref(&artifact));
+        serialize_bounded_timeline(
+            AnalysisDetailSnapshot {
+                schema_version: ABI_SCHEMA_VERSION,
+                generated_at: now,
+                stable_cutoff: snapshot.stable_cutoff,
+                snapshot_token,
+                store_generation: self.opened_generation,
+                artifact,
+                provenance,
+            },
+            MAX_ANALYSIS_RESPONSE_BYTES,
+            "analysis-detail-too-large",
+        )
     }
 
     fn install_disclosure_grant(
@@ -1566,8 +2777,11 @@ pub unsafe extern "C" fn chronicle_buffer_free(buffer: *mut ChronicleBuffer) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronicle_domain::{ChunkRevision, DurationEstimate, QueryResponse};
-    use chronicle_store::{CanonicalJournal, Projector};
+    use chronicle_domain::{
+        ArtifactStatus, ArtifactType, AuthorIdentity, AuthorKind, ChunkRevision,
+        DerivedArtifactRevision, DurationEstimate, EvidenceReferences, QueryResponse,
+    };
+    use chronicle_store::{ArtifactStore, CanonicalJournal, Projector, RecoveryManager};
     use std::sync::{Arc, Barrier};
 
     fn response_bytes(buffer: ChronicleBuffer) -> Vec<u8> {
@@ -1756,6 +2970,115 @@ mod tests {
                 .map_err(FfiError::from)
         })
         .expect("seed report chunk");
+    }
+
+    fn seed_timeline_fixture(handle: u64) {
+        with_handle(handle, |core| {
+            let journal = CanonicalJournal::new(core.root.clone());
+            let projector = Projector::new(core.sqlite.clone());
+            for value in fixture_events().into_iter().take(9) {
+                let event = parse_event(&value)?;
+                let record = journal
+                    .append_event(&event, FaultInjector::none())
+                    .map_err(FfiError::from)?;
+                projector
+                    .project_record(&record, FaultInjector::none())
+                    .map_err(FfiError::from)?;
+            }
+            for line in include_str!("../../../fixtures/synthetic/session-v1/chunks.jsonl")
+                .lines()
+                .filter(|line| !line.is_empty())
+            {
+                let chunk = ChunkRevision::parse(line).map_err(|error| {
+                    FfiError::new(
+                        ChronicleStatus::Contract,
+                        "fixture-error",
+                        error.to_string(),
+                    )
+                })?;
+                let record = journal
+                    .append_chunk(&chunk, FaultInjector::none())
+                    .map_err(FfiError::from)?;
+                projector
+                    .project_record(&record, FaultInjector::none())
+                    .map_err(FfiError::from)?;
+            }
+            Ok(())
+        })
+        .expect("seed timeline fixture");
+    }
+
+    fn analysis_revision(
+        revision_id: &str,
+        prior_revision_id: Option<&str>,
+        statement: &str,
+    ) -> DerivedArtifactRevision {
+        let prior_revision_id = prior_revision_id
+            .map(|value| ArtifactRevisionId::new(value).expect("prior revision ID"));
+        DerivedArtifactRevision {
+            schema_version: "1.0".to_owned(),
+            artifact_id: ArtifactId::new("analysis-work-pattern").expect("artifact ID"),
+            revision_id: ArtifactRevisionId::new(revision_id).expect("revision ID"),
+            prior_revision_id: prior_revision_id.clone(),
+            expected_prior_revision_id: prior_revision_id,
+            artifact_type: ArtifactType::Hypothesis,
+            author: AuthorIdentity {
+                kind: AuthorKind::Model,
+                display_name: Some("Local analysis".to_owned()),
+                client_id: None,
+                model: Some("fixture-model".to_owned()),
+            },
+            created_at: "2026-07-13T09:04:00Z".parse().expect("created at"),
+            status: ArtifactStatus::Draft,
+            payload: json!({"statement": statement}),
+            evidence: EvidenceReferences {
+                event_ids: vec![EventId::new("evt-090015").expect("event ID")],
+                chunk_ids: vec![ChunkId::new("chunk-20260713T0900Z").expect("chunk ID")],
+            },
+            confidence: Some(0.75),
+            store_generation: 1,
+        }
+    }
+
+    fn write_analysis_revision(handle: u64, revision: &DerivedArtifactRevision) {
+        with_handle(handle, |core| {
+            ArtifactStore::new(core.root.clone(), Projector::new(core.sqlite.clone()))
+                .write_revision(revision, FaultInjector::none())
+                .map_err(FfiError::from)
+        })
+        .expect("write analysis revision");
+    }
+
+    fn timeline_filter(coverage_states: Value) -> Value {
+        json!({
+            "range": {
+                "start": "2026-07-13T09:00:00Z",
+                "end": "2026-07-13T09:05:00Z"
+            },
+            "application_bundle_id": null,
+            "window_text": null,
+            "authorized_domain": null,
+            "coverage_states": coverage_states
+        })
+    }
+
+    fn timeline_page_control(
+        handle: u64,
+        snapshot_token: Option<&str>,
+        cursor: Option<&str>,
+        coverage_states: Value,
+    ) -> (u32, Value) {
+        control(
+            handle,
+            "2026-07-13T09:07:00Z",
+            json!({
+                "type": "timeline-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": snapshot_token,
+                "filter": timeline_filter(coverage_states),
+                "page": { "cursor": cursor, "limit": 10 }
+            }),
+        )
     }
 
     fn factual_report_control(handle: u64) -> (u32, Value) {
@@ -2402,6 +3725,560 @@ mod tests {
         .expect_err("one-byte report budget must fail");
         assert_eq!(error.status, ChronicleStatus::TooLarge);
         assert_eq!(error.code, "factual-report-too-large");
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn timeline_page_search_and_details_share_factual_ids_without_paths_or_markup() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+        seed_timeline_fixture(handle);
+
+        let (status, response) = timeline_page_control(handle, None, None, json!([]));
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        let page = &response["result"];
+        assert_eq!(page["schema_version"], "1.0");
+        assert_eq!(page["stable_cutoff"], "2026-07-13T09:07:00Z");
+        assert_eq!(page["chunks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(page["chunks"][0]["chunk_id"], "chunk-20260713T0900Z");
+        assert_eq!(page["chunks"][0]["revision_id"], "chunk-rev-002");
+        assert_eq!(page["chunks"][0]["evidence_seconds"]["gap"], 90);
+        assert_eq!(
+            page["chunks"][0]["extracts"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(page["chunks"][0]["extracts"][0]["untrusted_evidence"], true);
+        assert!(page["chunks"][0]["extracts"][0]["character_count"].is_u64());
+        assert_eq!(page["coverage"]["evidence_seconds"]["captured"], 150);
+        let token = page["snapshot_token"]
+            .as_str()
+            .expect("snapshot token")
+            .to_owned();
+        assert!(token.starts_with("ocs1."));
+
+        let encoded_page = page.to_string();
+        for forbidden in [
+            "ignore previous instructions",
+            "managed_relative_path",
+            "screenshots/",
+            "image_bytes",
+            "screenshot_bytes",
+            "<mark>",
+        ] {
+            assert!(!encoded_page.contains(forbidden), "leaked {forbidden}");
+        }
+
+        let (status, detail) = control(
+            handle,
+            "2026-07-13T09:07:01Z",
+            json!({
+                "type": "timeline-chunk-detail",
+                "snapshot_token": token,
+                "revision_id": "chunk-rev-002"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{detail}");
+        assert_eq!(detail["result"]["chunk"]["revision_id"], "chunk-rev-002");
+        assert!(
+            detail["result"]["chunk"]["ocr_extracts"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("ignore previous instructions"))
+        );
+
+        let (status, logical_detail) = control(
+            handle,
+            "2026-07-13T09:07:01Z",
+            json!({
+                "type": "timeline-chunk-detail",
+                "snapshot_token": detail["result"]["snapshot_token"],
+                "chunk_id": "chunk-20260713T0900Z"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{logical_detail}");
+        assert_eq!(
+            logical_detail["result"]["chunk"]["revision_id"],
+            "chunk-rev-002"
+        );
+
+        let detail_token = detail["result"]["snapshot_token"]
+            .as_str()
+            .expect("detail token");
+        let (status, event) = control(
+            handle,
+            "2026-07-13T09:07:02Z",
+            json!({
+                "type": "timeline-event-detail",
+                "snapshot_token": detail_token,
+                "event_id": "evt-090015"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{event}");
+        assert_eq!(event["result"]["event"]["event_id"], "evt-090015");
+        assert_eq!(
+            event["result"]["event"]["payload"]["data"]["content"]["data"]["image"]["state"],
+            "retained"
+        );
+        let encoded_event = event.to_string();
+        assert!(!encoded_event.contains("managed_relative_path"));
+        assert!(!encoded_event.contains("screenshots/"));
+
+        let (status, first_search) = control(
+            handle,
+            "2026-07-13T09:07:03Z",
+            json!({
+                "type": "timeline-search",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "filter": timeline_filter(json!([])),
+                "query": "synthetic",
+                "page": { "cursor": null, "limit": 1 }
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{first_search}");
+        let search = &first_search["result"];
+        assert_eq!(search["hits"].as_array().map(Vec::len), Some(1));
+        assert_eq!(search["hits"][0]["untrusted_evidence"], true);
+        assert!(search["hits"][0]["snippet"]["text"].is_string());
+        assert!(search["hits"][0]["snippet"]["highlights"][0]["start"].is_u64());
+        assert!(!search.to_string().contains("<mark>"));
+        assert!(search["page"]["truncated"].as_bool().unwrap_or(false));
+        let search_token = search["snapshot_token"]
+            .as_str()
+            .expect("search snapshot token");
+        let cursor = search["page"]["next_cursor"]
+            .as_str()
+            .expect("search cursor");
+        let first_id = search["hits"][0]["event_id"].clone();
+        let (status, second_search) = control(
+            handle,
+            "2026-07-13T09:07:04Z",
+            json!({
+                "type": "timeline-search",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": search_token,
+                "filter": timeline_filter(json!([])),
+                "query": "synthetic",
+                "page": { "cursor": cursor, "limit": 1 }
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{second_search}");
+        assert_ne!(second_search["result"]["hits"][0]["event_id"], first_id);
+
+        let (status, forged_search_cursor) = control(
+            handle,
+            "2026-07-13T09:07:04Z",
+            json!({
+                "type": "timeline-search",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": search_token,
+                "filter": timeline_filter(json!([])),
+                "query": "synthetic",
+                "page": { "cursor": "evt-090045", "limit": 1 }
+            }),
+        );
+        assert_eq!(
+            status,
+            ChronicleStatus::Contract as u32,
+            "{forged_search_cursor}"
+        );
+        assert_eq!(
+            forged_search_cursor["error"]["code"],
+            "invalid-pagination-cursor"
+        );
+
+        let (status, missing) =
+            timeline_page_control(handle, None, None, json!(["missing-observation"]));
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{missing}");
+        assert_eq!(
+            missing["result"]["chunks"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let (status, missing_search) = control(
+            handle,
+            "2026-07-13T09:07:05Z",
+            json!({
+                "type": "timeline-search",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "filter": timeline_filter(json!(["missing-observation"])),
+                "query": "synthetic",
+                "page": { "cursor": null, "limit": 10 }
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{missing_search}");
+        assert!(
+            missing_search["result"]["hits"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+
+        let shared_private_call = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:07:06Z",
+            "request": {
+                "schema_version": "1.0",
+                "request_id": "req-shared-private-timeline",
+                "store_generation": page["store_generation"],
+                "operation": {
+                    "type": "timeline-event-detail",
+                    "data": {
+                        "snapshot_token": detail_token,
+                        "event_id": "evt-090015"
+                    }
+                }
+            }
+        });
+        let (status, rejected) = call_raw(
+            handle,
+            &serde_json::to_vec(&shared_private_call).expect("shared private timeline request"),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
+
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn timeline_snapshot_high_water_excludes_backfilled_revisions_and_rejects_scope_changes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+        seed_timeline_fixture(handle);
+        let (status, first) = timeline_page_control(handle, None, None, json!([]));
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{first}");
+        let token = first["result"]["snapshot_token"]
+            .as_str()
+            .expect("snapshot token")
+            .to_owned();
+        assert_eq!(first["result"]["chunks"][0]["revision_id"], "chunk-rev-002");
+
+        let mut late = include_str!("../../../fixtures/synthetic/session-v1/chunks.jsonl")
+            .lines()
+            .last()
+            .map(ChunkRevision::parse)
+            .expect("fixture chunk")
+            .expect("valid fixture chunk");
+        late.revision_id = ChunkRevisionId::new("chunk-rev-003").expect("revision ID");
+        late.prior_revision_id = Some(ChunkRevisionId::new("chunk-rev-002").expect("revision ID"));
+        late.supersedes_revision_id =
+            Some(ChunkRevisionId::new("chunk-rev-002").expect("revision ID"));
+        late.generated_at = "2026-07-13T09:06:45Z".parse().expect("generated at");
+        late.input_digest = "sha256-input-003".to_owned();
+        late.validate().expect("late revision valid");
+        with_handle(handle, |core| {
+            let record = CanonicalJournal::new(core.root.clone())
+                .append_chunk(&late, FaultInjector::none())
+                .map_err(FfiError::from)?;
+            Projector::new(core.sqlite.clone())
+                .project_record(&record, FaultInjector::none())
+                .map_err(FfiError::from)
+        })
+        .expect("project late revision");
+
+        let (status, stable) = timeline_page_control(handle, Some(&token), None, json!([]));
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{stable}");
+        assert_eq!(
+            stable["result"]["chunks"][0]["revision_id"],
+            "chunk-rev-002"
+        );
+        let (status, refreshed) = timeline_page_control(handle, None, None, json!([]));
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{refreshed}");
+        assert_eq!(
+            refreshed["result"]["chunks"][0]["revision_id"],
+            "chunk-rev-003"
+        );
+
+        let (status, hidden_detail) = control(
+            handle,
+            "2026-07-13T09:07:01Z",
+            json!({
+                "type": "timeline-chunk-detail",
+                "snapshot_token": token,
+                "revision_id": "chunk-rev-003"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::NotFound as u32, "{hidden_detail}");
+
+        let mut tampered = token.clone();
+        tampered.push('0');
+        let (status, rejected) = timeline_page_control(handle, Some(&tampered), None, json!([]));
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "invalid-snapshot-token");
+
+        let mut wrong_anchor = decode_snapshot_token(&token).expect("decode snapshot token");
+        wrong_anchor.event_anchor_id =
+            Some(EventId::new("evt-not-the-boundary").expect("event ID"));
+        let wrong_anchor = encode_snapshot_token(&wrong_anchor).expect("encode wrong anchor");
+        let (status, rejected) =
+            timeline_page_control(handle, Some(&wrong_anchor), None, json!([]));
+        assert_eq!(
+            status,
+            ChronicleStatus::StaleGeneration as u32,
+            "{rejected}"
+        );
+        assert_eq!(rejected["error"]["code"], "snapshot-no-longer-available");
+
+        let (status, scope_mismatch) =
+            timeline_page_control(handle, Some(&token), None, json!(["protected"]));
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{scope_mismatch}");
+        assert_eq!(scope_mismatch["error"]["code"], "snapshot-scope-mismatch");
+
+        let (status, cursor_without_token) =
+            timeline_page_control(handle, None, Some("chunk-20260713T0900Z"), json!([]));
+        assert_eq!(
+            status,
+            ChronicleStatus::Contract as u32,
+            "{cursor_without_token}"
+        );
+        assert_eq!(
+            cursor_without_token["error"]["code"],
+            "snapshot-token-required"
+        );
+
+        let root = with_handle(handle, |core| Ok(core.root.clone())).expect("managed root");
+        let _ = close(handle);
+        RecoveryManager::new(root)
+            .rebuild_index()
+            .expect("deterministic projection rebuild");
+        let (rebuilt_handle, _) = open(&temporary);
+        let (status, after_rebuild) =
+            timeline_page_control(rebuilt_handle, Some(&token), None, json!([]));
+        assert_eq!(
+            status,
+            ChronicleStatus::StaleGeneration as u32,
+            "{after_rebuild}"
+        );
+        assert_eq!(
+            after_rebuild["error"]["code"],
+            "snapshot-no-longer-available"
+        );
+        let _ = close(rebuilt_handle);
+    }
+
+    #[test]
+    fn timeline_controls_validate_ranges_filters_cursors_and_response_budgets() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+        seed_timeline_fixture(handle);
+
+        for control_value in [
+            json!({
+                "type": "timeline-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "filter": {
+                    "range": {"start":"2026-07-13T09:00:01Z","end":"2026-07-13T09:05:00Z"},
+                    "application_bundle_id": null,
+                    "window_text": null,
+                    "authorized_domain": null,
+                    "coverage_states": []
+                },
+                "page": {"cursor":null,"limit":10}
+            }),
+            json!({
+                "type": "timeline-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "filter": timeline_filter(json!(["captured", "captured"])),
+                "page": {"cursor":null,"limit":10}
+            }),
+            json!({
+                "type": "timeline-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "filter": timeline_filter(json!([])),
+                "page": {"cursor":null,"limit":101}
+            }),
+            json!({
+                "type": "timeline-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "filter": timeline_filter(json!([])),
+                "page": {"cursor":"not a valid ID!","limit":10}
+            }),
+            json!({
+                "type": "timeline-chunk-detail",
+                "snapshot_token": "not-used-because-selector-is-invalid"
+            }),
+            json!({
+                "type": "timeline-chunk-detail",
+                "snapshot_token": "not-used-because-selector-is-invalid",
+                "revision_id": "chunk-rev-002",
+                "chunk_id": "chunk-20260713T0900Z"
+            }),
+        ] {
+            let (status, rejected) = control(handle, "2026-07-13T09:07:00Z", control_value);
+            assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
+        }
+
+        let (status, response) = timeline_page_control(handle, None, None, json!([]));
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
+        let error =
+            serialize_bounded_timeline(response["result"].clone(), 1, "timeline-test-limit")
+                .expect_err("one-byte timeline budget must fail");
+        assert_eq!(error.status, ChronicleStatus::TooLarge);
+        assert_eq!(error.code, "timeline-test-limit");
+
+        let excluded_filter = json!({
+            "range": {
+                "start": "2026-07-13T09:00:00Z",
+                "end": "2026-07-13T09:05:00Z"
+            },
+            "application_bundle_id": "com.example.does-not-exist",
+            "window_text": null,
+            "authorized_domain": null,
+            "coverage_states": []
+        });
+        let (status, excluded) = control(
+            handle,
+            "2026-07-13T09:07:00Z",
+            json!({
+                "type": "timeline-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "filter": excluded_filter.clone(),
+                "page": {"cursor": null, "limit": 10}
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{excluded}");
+        assert!(
+            excluded["result"]["chunks"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        let (status, forged_chunk_cursor) = control(
+            handle,
+            "2026-07-13T09:07:00Z",
+            json!({
+                "type": "timeline-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": excluded["result"]["snapshot_token"],
+                "filter": excluded_filter,
+                "page": {"cursor": "chunk-20260713T0900Z", "limit": 10}
+            }),
+        );
+        assert_eq!(
+            status,
+            ChronicleStatus::Contract as u32,
+            "{forged_chunk_cursor}"
+        );
+        assert_eq!(
+            forged_chunk_cursor["error"]["code"],
+            "invalid-pagination-cursor"
+        );
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn analysis_controls_page_real_immutable_artifacts_without_shared_grants() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, _) = open(&temporary);
+        seed_timeline_fixture(handle);
+        write_analysis_revision(
+            handle,
+            &analysis_revision("analysis-rev-001", None, "Initial derived finding"),
+        );
+        write_analysis_revision(
+            handle,
+            &analysis_revision(
+                "analysis-rev-002",
+                Some("analysis-rev-001"),
+                "Reviewed derived finding",
+            ),
+        );
+
+        let (status, page) = control(
+            handle,
+            "2026-07-13T09:07:00Z",
+            json!({
+                "type": "analysis-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": null,
+                "range": {
+                    "start": "2026-07-13T09:00:00Z",
+                    "end": "2026-07-13T09:05:00Z"
+                },
+                "page": {"cursor": null, "limit": 10}
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{page}");
+        assert_eq!(
+            page["result"]["artifacts"][0]["revision_id"],
+            "analysis-rev-002"
+        );
+        assert_eq!(
+            page["result"]["artifacts"][0]["payload"]["statement"],
+            "Reviewed derived finding"
+        );
+        assert_eq!(
+            page["result"]["provenance"]["source_event_ids"][0],
+            "evt-090015"
+        );
+        let token = page["result"]["snapshot_token"]
+            .as_str()
+            .expect("analysis snapshot token")
+            .to_owned();
+
+        let (status, detail) = control(
+            handle,
+            "2026-07-13T09:07:01Z",
+            json!({
+                "type": "analysis-detail",
+                "snapshot_token": token,
+                "artifact_id": "analysis-work-pattern",
+                "revision_id": "analysis-rev-001"
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{detail}");
+        assert_eq!(
+            detail["result"]["artifact"]["revision_id"],
+            "analysis-rev-001"
+        );
+
+        write_analysis_revision(
+            handle,
+            &analysis_revision(
+                "analysis-rev-003",
+                Some("analysis-rev-002"),
+                "Late projected derived finding",
+            ),
+        );
+        let (status, stable) = control(
+            handle,
+            "2026-07-13T09:07:02Z",
+            json!({
+                "type": "analysis-page",
+                "stable_cutoff": "2026-07-13T09:07:00Z",
+                "snapshot_token": token,
+                "range": {
+                    "start": "2026-07-13T09:00:00Z",
+                    "end": "2026-07-13T09:05:00Z"
+                },
+                "page": {"cursor": null, "limit": 10}
+            }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{stable}");
+        assert_eq!(
+            stable["result"]["artifacts"][0]["revision_id"],
+            "analysis-rev-002"
+        );
+
+        let shared_private_call = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:07:03Z",
+            "request": {
+                "schema_version": "1.0",
+                "request_id": "req-shared-private-analysis",
+                "store_generation": page["result"]["store_generation"],
+                "operation": {
+                    "type": "analysis-page",
+                    "data": {}
+                }
+            }
+        });
+        let (status, rejected) = call_raw(
+            handle,
+            &serde_json::to_vec(&shared_private_call).expect("shared private analysis request"),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{rejected}");
         let _ = close(handle);
     }
 
