@@ -7,7 +7,9 @@ production="$root/macos/OpenChronicle"
 # Whitespace is removed before matching so split Swift and Objective-C calls are
 # covered identically. Keep the Objective-C selector spellings explicit: merely
 # scanning .m/.mm/.h files is not sufficient when their API names differ.
-forbidden='CGWindowListCreateImage|screencapture|SCContentFilter\(display:|initWithDisplay:|SCScreenshotManager\.captureImage\(in:|captureImageInRect:|SCStream(\(|\*|alloc|new)|CGDisplayCreateImage|CGDisplayStream|CGEventTapCreate|CGEvent\.tapCreate|NSEvent\.add(Global|Local)MonitorForEvents|NSEventadd(Global|Local)MonitorForEventsMatchingMask:|CGImageDestinationCreateWithURL|\.write\(to:|writeTo(File|URL):|temporaryDirectory|NSTemporaryDirectory'
+forbidden_capture='CGWindowListCreateImage|screencapture|SCContentFilter\(display:|initWithDisplay:|SCScreenshotManager\.captureImage\(in:|captureImageInRect:|SCStream(\(|\*|alloc|new)|CGDisplayCreateImage|CGDisplayStream|CGEventTapCreate|CGEvent\.tapCreate|NSEvent\.add(Global|Local)MonitorForEvents|NSEventadd(Global|Local)MonitorForEventsMatchingMask:'
+forbidden_pixel_persistence='CGImageDestinationCreateWithURL|\.write\(to:|writeTo(File|URL):|temporaryDirectory|NSTemporaryDirectory'
+forbidden="$forbidden_capture|$forbidden_pixel_persistence"
 
 rejects() {
   printf '%s' "$1" | grep -E "$forbidden" >/dev/null
@@ -61,8 +63,25 @@ compact=$(find "$production" -type f \( \
   -name '*.mm' -o \
   -name '*.h' \
 \) -exec sed 's://.*$::' {} \; | tr -d '[:space:]')
-if rejects "$compact"; then
+if printf '%s' "$compact" | grep -E "$forbidden_capture" >/dev/null; then
   echo "forbidden broad or legacy capture API found" >&2
+  exit 1
+fi
+
+# Package assembly may legitimately use temporary files. Pixel-bearing capture and
+# onboarding proof code may not: keep that stricter policy scoped to the only
+# production paths that can receive captured images.
+pixel_pipeline_compact=$(find \
+  "$production/Capture" \
+  "$production/Onboarding/CaptureProofService.swift" \
+  -type f \( \
+    -name '*.swift' -o \
+    -name '*.m' -o \
+    -name '*.mm' -o \
+    -name '*.h' \
+  \) -exec sed 's://.*$::' {} \; | tr -d '[:space:]')
+if printf '%s' "$pixel_pipeline_compact" | grep -E "$forbidden_pixel_persistence" >/dev/null; then
+  echo "forbidden captured-pixel persistence API found" >&2
   exit 1
 fi
 
