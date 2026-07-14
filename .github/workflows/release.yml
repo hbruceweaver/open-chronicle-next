@@ -1,0 +1,296 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unsigned-proof:
+    name: Unsigned universal DMG proof
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # 1.96.1
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: macos-release-universal
+      - name: Build unsigned universal app
+        run: ./scripts/build-app.sh --configuration Release --unsigned --build-number "$GITHUB_RUN_NUMBER"
+      - name: Package unsigned DMG
+        run: ./scripts/package-dmg.sh --unsigned
+      - name: Verify copied bundle and bundled MCP runtime
+        run: ./scripts/smoke-installed-app.sh 'dist/Open Chronicle.dmg'
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: "dist/Open Chronicle.app"
+          format: spdx-json
+          output-file: "dist/Open Chronicle.spdx.json"
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Reverify unsigned development artifacts after SBOM generation
+        run: |
+          (cd dist && shasum -a 256 -c 'Open Chronicle.dmg.sha256')
+          ./scripts/verify-bundle.sh 'dist/Open Chronicle.app' --unsigned
+          ./scripts/smoke-installed-app.sh 'dist/Open Chronicle.dmg'
+      - name: Upload unsigned development proof
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: open-chronicle-unsigned-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            dist/Open Chronicle.app
+            dist/Open Chronicle.dmg
+            dist/Open Chronicle.dmg.sha256
+            dist/Open Chronicle.provenance.json
+            dist/Open Chronicle.spdx.json
+
+  signed-build:
+    name: Build signed and notarized candidate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-14
+    environment: release
+    permissions:
+      contents: read
+    env:
+      MACOS_DEVELOPER_ID_APPLICATION: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION }}
+      MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+      MACOS_NOTARY_KEYCHAIN_PROFILE: open-chronicle-release
+      MACOS_SIGNING_KEYCHAIN: ${{ runner.temp }}/open-chronicle-signing.keychain-db
+      MACOS_NOTARY_KEYCHAIN: ${{ runner.temp }}/open-chronicle-notary.keychain-db
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Refuse an existing release or ambiguous lookup failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          lookup="$RUNNER_TEMP/open-chronicle-release-lookup.txt"
+          if gh release view "$GITHUB_REF_NAME" > "$lookup" 2>&1; then
+            echo "release already exists for $GITHUB_REF_NAME; refusing to replace it" >&2
+            exit 1
+          fi
+          if ! grep -Fx 'release not found' "$lookup" >/dev/null; then
+            echo "could not prove release absence for $GITHUB_REF_NAME" >&2
+            sed -n '1,20p' "$lookup" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # 1.96.1
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: macos-release-universal
+      - name: Build unsigned release-candidate inputs
+        run: ./scripts/build-app.sh --configuration Release --prepare-signing --tag "$GITHUB_REF_NAME" --build-number "$GITHUB_RUN_NUMBER"
+      - name: Package unsigned release-candidate inputs
+        run: ./scripts/package-dmg.sh --unsigned-candidate --output 'build/u14-release-input/Open Chronicle.dmg'
+      - name: Require protected release credentials
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          test -n "$MACOS_DEVELOPER_ID_APPLICATION"
+          test -n "$MACOS_TEAM_ID"
+          test -n "$CERTIFICATE_P12"
+          test -n "$CERTIFICATE_PASSWORD"
+          test -n "$APPLE_API_KEY_P8"
+          test -n "$APPLE_API_KEY_ID"
+          test -n "$APPLE_API_ISSUER_ID"
+      - name: Materialize signer, sign app and DMG, then destroy signer
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_BUILD_KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$KEYCHAIN_PASSWORD"
+          certificate="$RUNNER_TEMP/open-chronicle-release.p12"
+          keychain="$MACOS_SIGNING_KEYCHAIN"
+          destroy_signer() {
+            primary_status=$?
+            trap - EXIT
+            cleanup_status=0
+            rm -f "$certificate"
+            if [ -e "$keychain" ]; then
+              security lock-keychain "$keychain" || cleanup_status=1
+              security delete-keychain "$keychain" || cleanup_status=1
+            fi
+            test ! -e "$certificate" || cleanup_status=1
+            test ! -e "$keychain" || cleanup_status=1
+            if [ "$primary_status" -ne 0 ]; then exit "$primary_status"; fi
+            exit "$cleanup_status"
+          }
+          trap destroy_signer EXIT
+          printf '%s' "$CERTIFICATE_P12" | base64 -D > "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$certificate"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          ./scripts/sign-app.sh
+          ./scripts/package-dmg.sh --sign-only
+      - name: Materialize notary credential, submit, then destroy credential
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_BUILD_KEYCHAIN_PASSWORD }}
+        run: |
+          api_key="$RUNNER_TEMP/open-chronicle-notary-key.p8"
+          keychain="$MACOS_NOTARY_KEYCHAIN"
+          destroy_notary() {
+            cleanup_status=0
+            rm -f "$api_key"
+            if [ -e "$keychain" ]; then
+              security lock-keychain "$keychain" || cleanup_status=1
+              security delete-keychain "$keychain" || cleanup_status=1
+            fi
+            test ! -e "$api_key" || cleanup_status=1
+            test ! -e "$keychain" || cleanup_status=1
+            return "$cleanup_status"
+          }
+          cleanup_notary_on_exit() {
+            primary_status=$?
+            trap - EXIT
+            cleanup_status=0
+            destroy_notary || cleanup_status=1
+            if [ "$primary_status" -ne 0 ]; then exit "$primary_status"; fi
+            exit "$cleanup_status"
+          }
+          trap cleanup_notary_on_exit EXIT
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          printf '%s' "$APPLE_API_KEY_P8" > "$api_key"
+          xcrun notarytool store-credentials "$MACOS_NOTARY_KEYCHAIN_PROFILE" \
+            --key "$api_key" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --keychain "$keychain"
+          rm -f "$api_key"
+          xcrun notarytool submit 'dist/Open Chronicle.dmg' \
+            --keychain-profile "$MACOS_NOTARY_KEYCHAIN_PROFILE" \
+            --keychain "$keychain" \
+            --wait
+          destroy_notary
+          trap - EXIT
+          xcrun stapler staple 'dist/Open Chronicle.dmg'
+          xcrun stapler validate 'dist/Open Chronicle.dmg'
+          ./scripts/write-checksum.sh 'dist/Open Chronicle.dmg'
+      - name: Verify signed release
+        run: ./scripts/verify-release.sh 'dist/Open Chronicle.dmg'
+      - name: Destroy temporary signing and notarization credentials
+        if: ${{ always() }}
+        run: |
+          cleanup_failed=0
+          certificate="$RUNNER_TEMP/open-chronicle-release.p12"
+          api_key="$RUNNER_TEMP/open-chronicle-notary-key.p8"
+          for keychain in "$MACOS_SIGNING_KEYCHAIN" "$MACOS_NOTARY_KEYCHAIN"; do
+            if [ -e "$keychain" ]; then
+              security lock-keychain "$keychain" || cleanup_failed=1
+              security delete-keychain "$keychain" || cleanup_failed=1
+            fi
+          done
+          rm -f "$certificate" "$api_key"
+          test ! -e "$certificate" || cleanup_failed=1
+          test ! -e "$api_key" || cleanup_failed=1
+          test ! -e "$MACOS_SIGNING_KEYCHAIN" || cleanup_failed=1
+          test ! -e "$MACOS_NOTARY_KEYCHAIN" || cleanup_failed=1
+          exit "$cleanup_failed"
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: "dist/Open Chronicle.app"
+          format: spdx-json
+          output-file: "dist/Open Chronicle.spdx.json"
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Reverify signed artifacts after SBOM generation
+        run: |
+          ./scripts/verify-release.sh 'dist/Open Chronicle.dmg'
+      - name: Upload signed candidate assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: open-chronicle-signed-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            dist/Open Chronicle.dmg
+            dist/Open Chronicle.dmg.sha256
+            dist/Open Chronicle.provenance.json
+            dist/Open Chronicle.spdx.json
+
+  signed-publish:
+    name: Publish immutable draft prerelease candidate
+    needs: signed-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-14
+    permissions:
+      actions: read
+      contents: write
+    env:
+      MACOS_DEVELOPER_ID_APPLICATION: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION }}
+      MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+    steps:
+      - name: Fetch exact tagged verification source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh repo clone "$GITHUB_REPOSITORY" source -- --no-checkout --filter=blob:none
+          git -C source fetch --force --depth=1 origin \
+            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          tag_commit=$(git -C source rev-parse --verify \
+            "refs/tags/$GITHUB_REF_NAME^{commit}")
+          test "$tag_commit" = "$GITHUB_SHA"
+          git -C source checkout --detach "$tag_commit"
+          test -z "$(git -C source status --porcelain --untracked-files=normal)"
+      - name: Download signed candidate assets
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: open-chronicle-signed-${{ github.sha }}
+          path: source/dist
+      - name: Reverify and create immutable draft prerelease candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          lookup="$RUNNER_TEMP/open-chronicle-release-final-lookup.txt"
+          if gh release view "$GITHUB_REF_NAME" > "$lookup" 2>&1; then
+            echo "release appeared during the build for $GITHUB_REF_NAME; refusing to replace it" >&2
+            exit 1
+          fi
+          if ! grep -Fx 'release not found' "$lookup" >/dev/null; then
+            echo "could not prove release absence immediately before candidate creation" >&2
+            sed -n '1,20p' "$lookup" >&2
+            exit 1
+          fi
+          (cd source && ./scripts/verify-release.sh 'dist/Open Chronicle.dmg')
+          gh release create "$GITHUB_REF_NAME" \
+            'source/dist/Open Chronicle.dmg' \
+            'source/dist/Open Chronicle.dmg.sha256' \
+            'source/dist/Open Chronicle.provenance.json' \
+            'source/dist/Open Chronicle.spdx.json' \
+            --verify-tag \
+            --generate-notes \
+            --draft \
+            --prerelease
