@@ -10,6 +10,7 @@ final class CaptureIngestorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let instant = Date(timeIntervalSince1970: 1_784_016_000)
         let core = try InProcessCore(applicationSupportURL: temporary, now: instant)
+        try await startRecording(core, at: instant)
         let source = FixedMetadataSource(metadata(instant: instant))
         let ingestor = CoreCaptureIngestor(core: core, metadata: source)
 
@@ -34,6 +35,29 @@ final class CaptureIngestorTests: XCTestCase {
         XCTAssertEqual(acknowledgement.ocrEventID, "event-u7-1")
         XCTAssertEqual(acknowledgement.imageArtifactID, "image-u7-1")
         try await core.close()
+    }
+
+    private func startRecording(_ core: InProcessCore, at instant: Date) async throws {
+        let now = ISO8601DateFormatter().string(from: instant)
+        for control in [
+            [
+                "type": "startup-reconcile",
+                "session_id": "swift-u7-capture-test",
+                "device_id": "device-u7",
+                "display_timezone": "Europe/Zurich",
+            ] as [String: Any],
+            [
+                "type": "set-recording-preference",
+                "enabled": true,
+            ] as [String: Any],
+        ] {
+            let request = try JSONSerialization.data(withJSONObject: [
+                "schema_version": "1.0",
+                "now": now,
+                "control": control,
+            ])
+            _ = try await core.call(request)
+        }
     }
 
     func testFailedOCRFactoryEmitsNoCanonicalOCRPayload() async throws {
