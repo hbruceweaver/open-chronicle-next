@@ -485,6 +485,9 @@ impl EventEnvelope {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.recorded_at < self.observed_at {
+            return Err("recorded_at must not precede observed_at".to_owned());
+        }
         let kind_matches = matches!(
             (&self.kind, &self.payload),
             (
@@ -500,8 +503,11 @@ impl EventEnvelope {
             return Err("event kind and payload type disagree".to_owned());
         }
         if let EventPayload::ObservationAttempt(attempt) = &self.payload {
-            if self.scheduled_at.is_none() {
-                return Err("observation attempts require scheduled_at".to_owned());
+            let scheduled_at = self
+                .scheduled_at
+                .ok_or_else(|| "observation attempts require scheduled_at".to_owned())?;
+            if self.observed_at < scheduled_at {
+                return Err("observed_at must not precede scheduled_at".to_owned());
             }
             attempt.validate()?;
             if let ObservationContent::Captured(content) = &attempt.content

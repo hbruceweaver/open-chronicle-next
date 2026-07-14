@@ -2,6 +2,7 @@ use chronicle_domain::{
     ChunkRevision, DerivedArtifactRevision, EventEnvelope, EventPayload, ObservationContent,
     ScreenshotLifecycle, ScreenshotLifecycleAction, ScreenshotProjectedState,
 };
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
@@ -164,6 +165,18 @@ fn project_event(
     faults.check(FaultPoint::AfterRowInsert)?;
     match &event.payload {
         EventPayload::ObservationAttempt(attempt) => {
+            let scheduled_at = event.scheduled_at.ok_or_else(|| {
+                StoreError::SqliteIdentity(
+                    "projected observation attempt has no scheduled_at".to_owned(),
+                )
+            })?;
+            mark_pending_bucket(
+                transaction,
+                &event.device_id,
+                &event.event_id,
+                scheduled_at,
+                attempt.cadence_seconds,
+            )?;
             let (application, process, title, domain, hash, ocr) = match &attempt.content {
                 ObservationContent::Captured(content) => (
                     Some(content.context.application_bundle_id.as_str()),
@@ -233,8 +246,53 @@ fn project_event(
                 ],
             )?;
         }
-        EventPayload::RecordingGap(_) => {}
+        EventPayload::RecordingGap(gap) => {
+            let mut bucket = utc_bucket_start(gap.start)?;
+            while bucket < gap.end {
+                mark_pending_bucket(transaction, &event.device_id, &event.event_id, bucket, 30)?;
+                bucket += Duration::seconds(300);
+            }
+        }
     }
+    Ok(())
+}
+
+fn utc_bucket_start(at: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let seconds = at.timestamp().div_euclid(300) * 300;
+    Utc.timestamp_opt(seconds, 0)
+        .single()
+        .ok_or_else(|| StoreError::InvalidPath("aggregation bucket timestamp overflow".to_owned()))
+}
+
+fn mark_pending_bucket(
+    transaction: &Transaction<'_>,
+    device_id: &chronicle_domain::DeviceId,
+    event_id: &chronicle_domain::EventId,
+    at: DateTime<Utc>,
+    cadence_seconds: u32,
+) -> Result<()> {
+    let bucket = utc_bucket_start(at)?;
+    transaction.execute(
+        "INSERT INTO aggregation_pending_buckets(
+             device_id, bucket_start, bucket_start_epoch,
+             finalization_cadence_seconds, generation_at)
+         VALUES(?1, ?2, ?3, ?4, NULL)
+         ON CONFLICT(device_id, bucket_start) DO UPDATE SET
+           finalization_cadence_seconds=max(
+             aggregation_pending_buckets.finalization_cadence_seconds,
+             excluded.finalization_cadence_seconds)",
+        params![
+            device_id.as_str(),
+            bucket.to_rfc3339(),
+            bucket.timestamp(),
+            cadence_seconds,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO aggregation_bucket_events(device_id, bucket_start, event_id)
+         VALUES(?1, ?2, ?3)",
+        params![device_id.as_str(), bucket.to_rfc3339(), event_id.as_str()],
+    )?;
     Ok(())
 }
 
@@ -452,6 +510,44 @@ fn project_chunk(
         params![chunk.window.end.to_rfc3339(), chunk.revision_id.as_str()],
     )?;
     faults.check(FaultPoint::AfterWatermarkUpdate)?;
+    let device_id: Option<String> = transaction
+        .query_row(
+            "SELECT json_extract(events.body_json, '$.device_id')
+             FROM chunk_evidence_refs refs
+             JOIN events ON events.event_id=refs.event_id
+             WHERE refs.revision_id=?1
+             ORDER BY refs.ordinal
+             LIMIT 1",
+            [chunk.revision_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(device_id) = device_id {
+        transaction.execute(
+            "DELETE FROM aggregation_pending_buckets
+             WHERE device_id=?1 AND bucket_start=?2
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM aggregation_bucket_events membership
+                 WHERE membership.device_id=?1 AND membership.bucket_start=?2
+                   AND NOT EXISTS (
+                     SELECT 1 FROM chunk_evidence_refs refs
+                     WHERE refs.revision_id=?3 AND refs.event_id=membership.event_id))
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM chunk_evidence_refs refs
+                 WHERE refs.revision_id=?3
+                   AND NOT EXISTS (
+                     SELECT 1 FROM aggregation_bucket_events membership
+                     WHERE membership.device_id=?1 AND membership.bucket_start=?2
+                       AND membership.event_id=refs.event_id))",
+            params![
+                device_id,
+                chunk.window.start.to_rfc3339(),
+                chunk.revision_id.as_str()
+            ],
+        )?;
+    }
     Ok(())
 }
 

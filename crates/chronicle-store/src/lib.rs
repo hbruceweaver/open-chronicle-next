@@ -8,8 +8,11 @@ pub mod layout;
 pub mod locks;
 pub mod permissions;
 pub mod projection;
+pub mod queries;
 pub mod recovery;
+pub mod search;
 pub mod sqlite;
+pub mod statistics;
 
 use std::io;
 
@@ -25,8 +28,11 @@ pub use journal::*;
 pub use layout::*;
 pub use locks::*;
 pub use projection::*;
+pub use queries::*;
 pub use recovery::*;
+pub use search::*;
 pub use sqlite::*;
+pub use statistics::*;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -86,6 +92,7 @@ pub fn critical_storage_health(observed_at: DateTime<Utc>) -> HealthSnapshot {
 pub enum FaultPoint {
     AfterJournalAppend,
     AfterJournalSync,
+    BeforeJournalManifestUpdate,
     AfterRowInsert,
     AfterCursorUpdate,
     AfterCurrentPointerUpdate,

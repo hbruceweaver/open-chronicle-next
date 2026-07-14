@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::checksum::checksum_bytes;
@@ -57,7 +58,7 @@ impl SqliteStore {
             .optional()?;
         let user_version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if identity != Some((1, STORE_BUILD_ID.to_owned())) || user_version != 1 {
+        if identity != Some((2, STORE_BUILD_ID.to_owned())) || user_version != 2 {
             return Err(StoreError::SqliteIdentity(
                 "projection migration/build identity mismatch".to_owned(),
             ));
@@ -104,6 +105,73 @@ impl SqliteStore {
         file.sync_all()?;
         let root_file = std::fs::File::open(self.root.path())?;
         root_file.sync_all()?;
+        Ok(())
+    }
+
+    /// Materialize algorithm/store-generation upgrades into the durable derived
+    /// dirty set once. Normal aggregation ticks then read only forward buckets
+    /// and this bounded pending set instead of rescanning all current chunks.
+    pub fn prepare_aggregation_build(
+        &self,
+        aggregator_version: &str,
+        store_generation: u64,
+        generation_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if aggregator_version.is_empty() || store_generation == 0 {
+            return Err(StoreError::InvalidPath(
+                "aggregation build provenance must be non-empty and nonzero".to_owned(),
+            ));
+        }
+        let generation = i64::try_from(store_generation)
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT aggregator_version, store_generation
+                 FROM aggregation_build_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if current
+            .as_ref()
+            .is_some_and(|(version, existing_generation)| {
+                version == aggregator_version && *existing_generation == generation
+            })
+        {
+            return Ok(());
+        }
+        transaction.execute(
+            "INSERT INTO aggregation_pending_buckets(
+                 device_id, bucket_start, bucket_start_epoch,
+                 finalization_cadence_seconds, generation_at)
+             SELECT json_extract(events.body_json, '$.device_id'), revision.window_start,
+                    unixepoch(revision.window_start),
+                    json_extract(revision.body_json, '$.finalization_cadence_seconds'), ?3
+             FROM current_chunks current
+             JOIN chunk_revisions revision ON revision.revision_id=current.revision_id
+             JOIN chunk_evidence_refs refs
+               ON refs.revision_id=revision.revision_id AND refs.ordinal=0
+             JOIN events ON events.event_id=refs.event_id
+             WHERE json_extract(revision.body_json, '$.aggregator_version') <> ?1
+                OR json_extract(revision.body_json, '$.store_generation') <> ?2
+             ON CONFLICT(device_id, bucket_start) DO UPDATE SET
+               finalization_cadence_seconds=max(
+                 aggregation_pending_buckets.finalization_cadence_seconds,
+                 excluded.finalization_cadence_seconds),
+               generation_at=excluded.generation_at",
+            params![aggregator_version, generation, generation_at.to_rfc3339()],
+        )?;
+        transaction.execute(
+            "INSERT INTO aggregation_build_state(singleton, aggregator_version, store_generation)
+             VALUES(1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+               aggregator_version=excluded.aggregator_version,
+               store_generation=excluded.store_generation",
+            params![aggregator_version, generation],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -154,10 +222,48 @@ impl SqliteStore {
         })
     }
 
-    fn migrate(&self, connection: &Connection) -> Result<()> {
-        connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+    pub fn event_checksum(&self, event_id: &chronicle_domain::EventId) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT checksum FROM events WHERE event_id=?1",
+                [event_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn clear_pending_aggregation_bucket(
+        &self,
+        device_id: &chronicle_domain::DeviceId,
+        bucket_start: DateTime<Utc>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 1, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
+            "DELETE FROM aggregation_pending_buckets WHERE device_id=?1 AND bucket_start=?2",
+            params![device_id.as_str(), bucket_start.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    fn migrate(&self, connection: &Connection) -> Result<()> {
+        let mut user_version: i64 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if user_version == 0 {
+            connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+            user_version = 1;
+        }
+        if user_version == 1 {
+            connection.execute_batch(include_str!("../migrations/0002_aggregation_index.sql"))?;
+            user_version = 2;
+        }
+        if user_version != 2 {
+            return Err(StoreError::SqliteIdentity(format!(
+                "unsupported projection schema version {user_version}"
+            )));
+        }
+        connection.execute(
+            "INSERT INTO schema_versions(component, version, build_id) VALUES('store', 2, ?1) ON CONFLICT(component) DO UPDATE SET version=excluded.version, build_id=excluded.build_id",
             [STORE_BUILD_ID],
         )?;
         let generation_number = i64::try_from(self.generation.generation).map_err(|_| {
@@ -246,6 +352,18 @@ fn projection_digest(connection: &Connection) -> Result<String> {
         ("SELECT * FROM retention_state ORDER BY artifact_id", 3),
         ("SELECT * FROM store_generation ORDER BY singleton", 3),
         ("SELECT * FROM aggregation_watermark ORDER BY singleton", 3),
+        (
+            "SELECT * FROM aggregation_pending_buckets ORDER BY device_id, bucket_start",
+            5,
+        ),
+        (
+            "SELECT * FROM aggregation_bucket_events ORDER BY device_id, bucket_start, event_id",
+            3,
+        ),
+        (
+            "SELECT * FROM aggregation_build_state ORDER BY singleton",
+            3,
+        ),
         ("SELECT * FROM registration_receipts ORDER BY receipt_id", 4),
     ] {
         bytes.extend_from_slice(sql.as_bytes());

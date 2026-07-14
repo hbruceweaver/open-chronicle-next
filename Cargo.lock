@@ -139,6 +139,12 @@ version = "0.1.0"
 dependencies = [
  "chronicle-domain",
  "chronicle-store",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

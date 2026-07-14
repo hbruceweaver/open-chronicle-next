@@ -457,11 +457,18 @@ impl QueryObservation {
                 if content_hash.is_empty() {
                     return Err("query captured content requires a hash".to_owned());
                 }
-                let has_ocr = ocr.is_some();
-                let ocr_matches = match self.ocr_state {
-                    OcrState::Complete | OcrState::Empty | OcrState::Partial => has_ocr,
-                    OcrState::Failed => !has_ocr,
-                    OcrState::NotRun => false,
+                // The factual OCR outcome remains visible even when a bounded
+                // query omits OCR content. Presence of the payload still has to
+                // agree with a successful OCR state.
+                let ocr_matches = match (self.ocr_state, ocr.is_some()) {
+                    (OcrState::Complete | OcrState::Empty | OcrState::Partial, true)
+                    | (
+                        OcrState::Complete | OcrState::Empty | OcrState::Partial | OcrState::Failed,
+                        false,
+                    ) => true,
+                    (OcrState::Failed | OcrState::NotRun, true) | (OcrState::NotRun, false) => {
+                        false
+                    }
                 };
                 if !ocr_matches {
                     return Err("query OCR state and payload disagree".to_owned());
@@ -561,7 +568,9 @@ impl QueryEvent {
         }
         match (&self.kind, &self.payload) {
             (EventKind::ObservationAttempt, QueryEventPayload::ObservationAttempt(attempt))
-                if self.scheduled_at.is_some() =>
+                if self
+                    .scheduled_at
+                    .is_some_and(|scheduled| scheduled <= self.observed_at) =>
             {
                 attempt.validate()
             }

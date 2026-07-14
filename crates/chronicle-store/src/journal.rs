@@ -1,4 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use chronicle_domain::{
     ChunkRevision, DeviceId, EventEnvelope, EventId, EventKind, EventPayload, EvidenceSource,
@@ -10,7 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::checksum::{canonical_json, checksum_bytes};
-use crate::{FaultInjector, FaultPoint, ManagedRoot, Result, StoreError};
+use crate::{FaultInjector, FaultPoint, LockManager, ManagedRoot, Result, StoreError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JournalFamily {
@@ -139,11 +144,96 @@ pub struct ScanReport {
 #[derive(Clone, Debug)]
 pub struct CanonicalJournal {
     root: ManagedRoot,
+    index: Arc<Mutex<JournalIndex>>,
+}
+
+#[derive(Clone, Debug)]
+struct JournalIndexEntry {
+    family: JournalFamily,
+    shard: String,
+    start_offset: u64,
+    end_offset: u64,
+    stable_id: String,
+    checksum: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct JournalManifestEntry {
+    shard: String,
+    start_offset: u64,
+    end_offset: u64,
+    stable_id: String,
+    checksum: String,
+}
+
+impl From<&JournalIndexEntry> for JournalManifestEntry {
+    fn from(entry: &JournalIndexEntry) -> Self {
+        Self {
+            shard: entry.shard.clone(),
+            start_offset: entry.start_offset,
+            end_offset: entry.end_offset,
+            stable_id: entry.stable_id.clone(),
+            checksum: entry.checksum.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingJournalMutation {
+    schema_version: u32,
+    shard: String,
+    prior_size: u64,
+    requires_full_scan: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManifestIdentity {
+    inode: u64,
+    length: u64,
+}
+
+impl From<&VerifiedRecord> for JournalIndexEntry {
+    fn from(record: &VerifiedRecord) -> Self {
+        Self {
+            family: record.family,
+            shard: record.shard.clone(),
+            start_offset: record.start_offset,
+            end_offset: record.end_offset,
+            stable_id: record.stable_id.clone(),
+            checksum: record.checksum.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct JournalIndex {
+    loaded_families: HashSet<JournalFamily>,
+    shard_sizes: HashMap<(JournalFamily, String), u64>,
+    records: HashMap<(JournalFamily, String), JournalIndexEntry>,
+    manifested_records: HashSet<(JournalFamily, String)>,
+    active_shards: HashMap<(JournalFamily, String), String>,
+    manifest_identities: HashMap<JournalFamily, ManifestIdentity>,
+    full_scan_count: HashMap<JournalFamily, u64>,
+    directory_enumeration_count: HashMap<JournalFamily, u64>,
+}
+
+fn shared_journal_index(root: &ManagedRoot) -> Arc<Mutex<JournalIndex>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<JournalIndex>>>>> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap_or_else(|poison| poison.into_inner());
+    let key = root.path().to_path_buf();
+    if let Some(index) = registry.get(&key).and_then(Weak::upgrade) {
+        return index;
+    }
+    let index = Arc::new(Mutex::new(JournalIndex::default()));
+    registry.insert(key, Arc::downgrade(&index));
+    index
 }
 
 impl CanonicalJournal {
-    pub const fn new(root: ManagedRoot) -> Self {
-        Self { root }
+    pub fn new(root: ManagedRoot) -> Self {
+        let index = shared_journal_index(&root);
+        Self { root, index }
     }
 
     pub fn append_event(
@@ -181,7 +271,21 @@ impl CanonicalJournal {
     }
 
     pub fn scan_all(&self, family: JournalFamily, repair_partial: bool) -> Result<ScanReport> {
+        let _writer =
+            LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
+        self.scan_all_locked(family, repair_partial)
+    }
+
+    fn scan_all_locked(&self, family: JournalFamily, repair_partial: bool) -> Result<ScanReport> {
         let directory = self.root.path().join(family.directory());
+        {
+            let mut index = self
+                .index
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let count = index.directory_enumeration_count.entry(family).or_default();
+            *count = count.saturating_add(1);
+        }
         let mut shards = Vec::new();
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
@@ -197,13 +301,68 @@ impl CanonicalJournal {
         let mut records = Vec::new();
         let mut health = ScanHealth::default();
         let mut verified_through = 0;
-        for shard in shards {
-            let report = self.scan_shard(family, &shard, repair_partial)?;
+        for shard in &shards {
+            let report = self.scan_shard(family, shard, repair_partial)?;
             verified_through = report.verified_through;
             if report.health.partial_tail_bytes > 0 {
                 health = report.health.clone();
             }
             records.extend(report.records);
+        }
+        {
+            let mut index = self
+                .index
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if index.loaded_families.insert(family) {
+                let scans = index.full_scan_count.entry(family).or_default();
+                *scans = scans.saturating_add(1);
+            }
+            index
+                .records
+                .retain(|(entry_family, _), _| *entry_family != family);
+            index
+                .shard_sizes
+                .retain(|(entry_family, _), _| *entry_family != family);
+            index
+                .active_shards
+                .retain(|(entry_family, _), _| *entry_family != family);
+            for record in &records {
+                index.records.insert(
+                    (family, record.stable_id.clone()),
+                    JournalIndexEntry::from(record),
+                );
+            }
+            for shard in &shards {
+                let size =
+                    std::fs::metadata(self.root.path().join(family.directory()).join(shard))?.len();
+                index.shard_sizes.insert((family, shard.clone()), size);
+                index
+                    .active_shards
+                    .insert((family, shard[..10].to_owned()), shard.clone());
+            }
+            // The manifest is a disposable acceleration structure. Canonical
+            // replay remains available if its rewrite cannot be persisted.
+            let _ = self.rebuild_manifest(family, &mut index);
+        }
+        if let Some(pending) = self.read_pending_mutation(family)? {
+            if pending.schema_version != 1 {
+                return Err(StoreError::RepairIncomplete(
+                    "unsupported pending journal mutation version".to_owned(),
+                ));
+            }
+            let relative = format!("{}/{}", family.directory(), pending.shard);
+            if self.root.exists(&relative)? {
+                let file = self.root.open_file(&relative, false, false, false)?;
+                if file.metadata()?.len() < pending.prior_size {
+                    return Err(StoreError::RepairIncomplete(
+                        "pending journal mutation regressed its shard size".to_owned(),
+                    ));
+                }
+                file.sync_all()?;
+            }
+            self.root.sync_directory(family.directory())?;
+            self.clear_pending_mutation(family)?;
         }
         Ok(ScanReport {
             records,
@@ -282,6 +441,8 @@ impl CanonicalJournal {
         faults: FaultInjector,
     ) -> Result<RepairReport> {
         validate_shard_name(shard)?;
+        let _writer =
+            LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
         let relative = format!("{}/{shard}", family.directory());
         let family_name = family.cursor_name();
         let pending = find_repair_receipt(&self.root, family_name, shard)?;
@@ -295,6 +456,23 @@ impl CanonicalJournal {
                 .ok_or_else(|| StoreError::RepairIncomplete("repair receipt vanished".to_owned()))?
                 .report);
         }
+        let prior_size = if self.root.exists(&relative)? {
+            self.root
+                .open_file(&relative, false, false, false)?
+                .metadata()?
+                .len()
+        } else {
+            0
+        };
+        self.write_pending_mutation(
+            family,
+            &PendingJournalMutation {
+                schema_version: 1,
+                shard: shard.to_owned(),
+                prior_size,
+                requires_full_scan: true,
+            },
+        )?;
 
         let (mut receipt, receipt_relative, bytes) = if let Some(receipt) = pending {
             let bytes = self.root.read(&receipt.report.archived_original)?;
@@ -410,6 +588,7 @@ impl CanonicalJournal {
             self.append_event(&repair_event, FaultInjector::none())?;
         }
         faults.check(FaultPoint::AfterRepairMarker)?;
+        self.scan_all_locked(family, false)?;
         receipt.completed = true;
         self.root
             .atomic_write(&receipt_relative, &canonical_json(&receipt)?)?;
@@ -425,80 +604,465 @@ impl CanonicalJournal {
         faults: FaultInjector,
     ) -> Result<VerifiedRecord> {
         let (line, body_bytes, checksum) = encode_line(body)?;
-        if let Some(record) = self.find_stable_id(family, stable_id)? {
-            if record.checksum() != checksum {
+        let _writer =
+            LockManager::new(self.root.clone(), Duration::from_secs(1)).journal(family)?;
+        self.refresh_index(family)?;
+        let mut index = self
+            .index
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let date = timestamp.format("%Y-%m-%d").to_string();
+        let shard = index
+            .active_shards
+            .get(&(family, date.clone()))
+            .cloned()
+            .unwrap_or_else(|| format!("{date}.jsonl"));
+        self.refresh_changed_shard(family, &shard, &mut index)?;
+        if let Some(entry) = index.records.get(&(family, stable_id.to_owned())).cloned() {
+            if entry.checksum != checksum {
                 return Err(StoreError::StableIdConflict {
                     id: stable_id.to_owned(),
                 });
             }
-            let relative = format!("{}/{}", family.directory(), record.shard());
+            let relative = format!("{}/{}", family.directory(), entry.shard);
             self.root
                 .open_file(&relative, false, false, false)?
                 .sync_all()?;
             self.root.sync_directory(family.directory())?;
-            return Ok(record);
+            return self.read_indexed_record(&entry);
         }
-        let date = timestamp.format("%Y-%m-%d").to_string();
-        let shard = self.active_shard(family, &date)?;
         let relative = format!("{}/{shard}", family.directory());
         let existed = self.root.exists(&relative)?;
         let mut file = self.root.open_file(&relative, true, true, false)?;
         let start_offset = file.seek(SeekFrom::End(0))?;
+        self.write_pending_mutation(
+            family,
+            &PendingJournalMutation {
+                schema_version: 1,
+                shard: shard.clone(),
+                prior_size: start_offset,
+                requires_full_scan: false,
+            },
+        )?;
+        let end_offset = start_offset
+            .checked_add(u64::try_from(line.len()).map_err(|_| {
+                StoreError::InvalidPath("journal line exceeds supported length".to_owned())
+            })?)
+            .ok_or_else(|| StoreError::InvalidPath("journal offset overflow".to_owned()))?;
+        let record = VerifiedRecord {
+            family,
+            shard: shard.clone(),
+            start_offset,
+            end_offset,
+            stable_id: stable_id.to_owned(),
+            checksum,
+            body_bytes,
+        };
         file.write_all(&line)?;
+        index.records.insert(
+            (family, stable_id.to_owned()),
+            JournalIndexEntry::from(&record),
+        );
+        index
+            .shard_sizes
+            .insert((family, shard.clone()), end_offset);
+        index.active_shards.insert((family, date), shard.clone());
         faults.check(FaultPoint::AfterJournalAppend)?;
         file.sync_all()?;
         faults.check(FaultPoint::AfterJournalSync)?;
         if !existed {
             self.root.sync_directory(family.directory())?;
         }
-        let end_offset = start_offset
-            .checked_add(u64::try_from(line.len()).map_err(|_| {
-                StoreError::InvalidPath("journal line exceeds supported length".to_owned())
-            })?)
-            .ok_or_else(|| StoreError::InvalidPath("journal offset overflow".to_owned()))?;
-        Ok(VerifiedRecord {
-            family,
-            shard,
-            start_offset,
-            end_offset,
-            stable_id: stable_id.to_owned(),
-            checksum,
-            body_bytes,
-        })
+        let entry = index
+            .records
+            .get(&(family, stable_id.to_owned()))
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidPath("journal index entry vanished".to_owned()))?;
+        let manifest_result = faults
+            .check(FaultPoint::BeforeJournalManifestUpdate)
+            .and_then(|()| self.append_manifest_entry(family, &entry, &mut index));
+        if manifest_result.is_ok() {
+            let _ = self.clear_pending_mutation(family);
+        }
+        Ok(record)
     }
 
-    fn active_shard(&self, family: JournalFamily, date: &str) -> Result<String> {
-        let mut candidates = Vec::new();
-        for entry in std::fs::read_dir(self.root.path().join(family.directory()))? {
-            let entry = entry?;
-            let name = entry.file_name().into_string().map_err(|_| {
-                StoreError::InvalidPath("journal shard name is not valid UTF-8".to_owned())
-            })?;
-            if name.starts_with(date) && name.ends_with(".jsonl") {
-                validate_shard_name(&name)?;
-                candidates.push(name);
+    fn refresh_index(&self, family: JournalFamily) -> Result<()> {
+        let loaded = self
+            .index
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .loaded_families
+            .contains(&family);
+        if !loaded {
+            self.scan_all_locked(family, false)?;
+        }
+        let manifest_requires_scan = {
+            let mut index = self
+                .index
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            self.refresh_manifest(family, &mut index)?
+        };
+        if manifest_requires_scan {
+            self.scan_all_locked(family, false)?;
+        }
+        if let Some(pending) = self.read_pending_mutation(family)? {
+            if pending.schema_version != 1 {
+                return Err(StoreError::RepairIncomplete(
+                    "unsupported pending journal mutation version".to_owned(),
+                ));
+            }
+            if pending.requires_full_scan {
+                self.scan_all_locked(family, false)?;
+            } else {
+                let mut index = self
+                    .index
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                // A prior writer may have cached the canonical size before its
+                // disposable manifest update failed. Force the named-shard
+                // pass so every unmanifested record is durably re-indexed.
+                index.shard_sizes.remove(&(family, pending.shard.clone()));
+                self.refresh_changed_shard(family, &pending.shard, &mut index)?;
+                let relative = format!("{}/{}", family.directory(), pending.shard);
+                self.root
+                    .open_file(&relative, false, false, false)?
+                    .sync_all()?;
+                let actual_size = self
+                    .root
+                    .open_file(&relative, false, false, false)?
+                    .metadata()?
+                    .len();
+                if actual_size < pending.prior_size {
+                    return Err(StoreError::RepairIncomplete(
+                        "pending journal mutation regressed its shard size".to_owned(),
+                    ));
+                }
+                self.root.sync_directory(family.directory())?;
+                self.clear_pending_mutation(family)?;
             }
         }
-        candidates.sort();
-        match candidates.as_slice() {
-            [] => Ok(format!("{date}.jsonl")),
-            [one] => Ok(one.clone()),
-            _ => Err(StoreError::RepairIncomplete(format!(
+        Ok(())
+    }
+
+    fn manifest_path(family: JournalFamily) -> String {
+        format!("receipts/journal-{}-index.jsonl", family.cursor_name())
+    }
+
+    fn pending_path(family: JournalFamily) -> String {
+        format!("receipts/journal-{}-pending.json", family.cursor_name())
+    }
+
+    fn rebuild_manifest(&self, family: JournalFamily, index: &mut JournalIndex) -> Result<()> {
+        let mut entries = index
+            .records
+            .iter()
+            .filter(|((entry_family, _), _)| *entry_family == family)
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.shard
+                .cmp(&right.shard)
+                .then(left.start_offset.cmp(&right.start_offset))
+        });
+        let mut bytes = Vec::new();
+        for entry in &entries {
+            bytes.extend(canonical_json(&JournalManifestEntry::from(entry))?);
+            bytes.push(b'\n');
+        }
+        let path = Self::manifest_path(family);
+        if !self.root.exists(&path)? || self.root.read(&path)? != bytes {
+            self.root.atomic_write(&path, &bytes)?;
+        }
+        let metadata = self
+            .root
+            .open_file(&path, false, false, false)?
+            .metadata()?;
+        index.manifest_identities.insert(
+            family,
+            ManifestIdentity {
+                inode: metadata.ino(),
+                length: metadata.len(),
+            },
+        );
+        index
+            .manifested_records
+            .retain(|(entry_family, _)| *entry_family != family);
+        index
+            .manifested_records
+            .extend(entries.into_iter().map(|entry| (family, entry.stable_id)));
+        Ok(())
+    }
+
+    fn refresh_manifest(&self, family: JournalFamily, index: &mut JournalIndex) -> Result<bool> {
+        let path = Self::manifest_path(family);
+        if !self.root.exists(&path)? {
+            return Ok(true);
+        }
+        let mut file = self.root.open_file(&path, false, false, false)?;
+        let metadata = file.metadata()?;
+        let actual = ManifestIdentity {
+            inode: metadata.ino(),
+            length: metadata.len(),
+        };
+        let Some(prior) = index.manifest_identities.get(&family).copied() else {
+            return Ok(true);
+        };
+        if actual == prior {
+            return Ok(false);
+        }
+        if actual.inode != prior.inode || actual.length < prior.length {
+            return Ok(true);
+        }
+        file.seek(SeekFrom::Start(prior.length))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        if !tail.is_empty() && tail.last() != Some(&b'\n') {
+            return Ok(true);
+        }
+        for line in tail
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let Ok(entry) = serde_json::from_slice::<JournalManifestEntry>(line) else {
+                return Ok(true);
+            };
+            if self.integrate_manifest_entry(family, entry, index).is_err() {
+                return Ok(true);
+            }
+        }
+        index.manifest_identities.insert(family, actual);
+        Ok(false)
+    }
+
+    fn integrate_manifest_entry(
+        &self,
+        family: JournalFamily,
+        entry: JournalManifestEntry,
+        index: &mut JournalIndex,
+    ) -> Result<()> {
+        validate_shard_name(&entry.shard)?;
+        if entry.start_offset >= entry.end_offset {
+            return Err(StoreError::RepairIncomplete(
+                "journal index manifest has invalid offsets".to_owned(),
+            ));
+        }
+        let indexed = JournalIndexEntry {
+            family,
+            shard: entry.shard,
+            start_offset: entry.start_offset,
+            end_offset: entry.end_offset,
+            stable_id: entry.stable_id,
+            checksum: entry.checksum,
+        };
+        let verified = self.read_indexed_record(&indexed)?;
+        let key = (family, indexed.stable_id.clone());
+        if let Some(existing) = index.records.get(&key)
+            && (existing.checksum != indexed.checksum
+                || existing.shard != indexed.shard
+                || existing.start_offset != indexed.start_offset
+                || existing.end_offset != indexed.end_offset)
+        {
+            return Err(StoreError::StableIdConflict {
+                id: indexed.stable_id,
+            });
+        }
+        let date = indexed.shard[..10].to_owned();
+        if let Some(active) = index.active_shards.get(&(family, date.clone()))
+            && active != &indexed.shard
+        {
+            return Err(StoreError::RepairIncomplete(format!(
                 "multiple active shards exist for {date}"
-            ))),
+            )));
+        }
+        index
+            .shard_sizes
+            .entry((family, indexed.shard.clone()))
+            .and_modify(|size| *size = (*size).max(indexed.end_offset))
+            .or_insert(indexed.end_offset);
+        index
+            .active_shards
+            .insert((family, date), indexed.shard.clone());
+        index.manifested_records.insert(key.clone());
+        index
+            .records
+            .insert(key, JournalIndexEntry::from(&verified));
+        Ok(())
+    }
+
+    fn refresh_changed_shard(
+        &self,
+        family: JournalFamily,
+        shard: &str,
+        index: &mut JournalIndex,
+    ) -> Result<()> {
+        validate_shard_name(shard)?;
+        let relative = format!("{}/{shard}", family.directory());
+        if !self.root.exists(&relative)? {
+            return Ok(());
+        }
+        let size = self
+            .root
+            .open_file(&relative, false, false, false)?
+            .metadata()?
+            .len();
+        if index.shard_sizes.get(&(family, shard.to_owned())).copied() == Some(size) {
+            return Ok(());
+        }
+        let report = self.scan_shard(family, shard, false)?;
+        if report.health.partial_tail_bytes != 0 {
+            return Err(StoreError::RepairIncomplete(format!(
+                "journal shard {shard} has an incomplete external tail"
+            )));
+        }
+        index
+            .records
+            .retain(|(entry_family, _), entry| *entry_family != family || entry.shard != shard);
+        for record in &report.records {
+            let entry = JournalIndexEntry::from(record);
+            let key = (family, entry.stable_id.clone());
+            if let Some(existing) = index.records.get(&key)
+                && (existing.checksum != entry.checksum
+                    || existing.shard != entry.shard
+                    || existing.start_offset != entry.start_offset)
+            {
+                return Err(StoreError::StableIdConflict {
+                    id: entry.stable_id,
+                });
+            }
+            index.records.insert(key.clone(), entry.clone());
+            if !index.manifested_records.contains(&key) {
+                self.append_manifest_entry(family, &entry, index)?;
+            }
+        }
+        index.shard_sizes.insert((family, shard.to_owned()), size);
+        let date = shard[..10].to_owned();
+        if let Some(active) = index.active_shards.get(&(family, date.clone()))
+            && active != shard
+        {
+            return Err(StoreError::RepairIncomplete(format!(
+                "multiple active shards exist for {date}"
+            )));
+        }
+        index.active_shards.insert((family, date), shard.to_owned());
+        Ok(())
+    }
+
+    fn append_manifest_entry(
+        &self,
+        family: JournalFamily,
+        entry: &JournalIndexEntry,
+        index: &mut JournalIndex,
+    ) -> Result<()> {
+        let key = (family, entry.stable_id.clone());
+        if index.manifested_records.contains(&key) {
+            return Ok(());
+        }
+        let path = Self::manifest_path(family);
+        let existed = self.root.exists(&path)?;
+        let mut file = self.root.open_file(&path, true, true, false)?;
+        let mut line = canonical_json(&JournalManifestEntry::from(entry))?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+        file.sync_all()?;
+        if !existed {
+            self.root.sync_directory("receipts")?;
+        }
+        let metadata = file.metadata()?;
+        index.manifest_identities.insert(
+            family,
+            ManifestIdentity {
+                inode: metadata.ino(),
+                length: metadata.len(),
+            },
+        );
+        index.manifested_records.insert(key);
+        Ok(())
+    }
+
+    fn write_pending_mutation(
+        &self,
+        family: JournalFamily,
+        pending: &PendingJournalMutation,
+    ) -> Result<()> {
+        self.root
+            .atomic_write(&Self::pending_path(family), &canonical_json(pending)?)
+    }
+
+    fn read_pending_mutation(
+        &self,
+        family: JournalFamily,
+    ) -> Result<Option<PendingJournalMutation>> {
+        let path = Self::pending_path(family);
+        if !self.root.exists(&path)? {
+            return Ok(None);
+        }
+        let pending = serde_json::from_slice(&self.root.read(&path)?)?;
+        Ok(Some(pending))
+    }
+
+    fn clear_pending_mutation(&self, family: JournalFamily) -> Result<()> {
+        let path = Self::pending_path(family);
+        match self.root.unlink(&path) {
+            Ok(()) => Ok(()),
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
-    fn find_stable_id(
-        &self,
-        family: JournalFamily,
-        stable_id: &str,
-    ) -> Result<Option<VerifiedRecord>> {
-        Ok(self
-            .scan_all(family, false)?
-            .records
-            .into_iter()
-            .find(|record| record.stable_id() == stable_id))
+    fn read_indexed_record(&self, entry: &JournalIndexEntry) -> Result<VerifiedRecord> {
+        let relative = format!("{}/{}", entry.family.directory(), entry.shard);
+        let mut file = self.root.open_file(&relative, false, false, false)?;
+        file.seek(SeekFrom::Start(entry.start_offset))?;
+        let length = entry.end_offset.saturating_sub(entry.start_offset);
+        let mut line = vec![
+            0_u8;
+            usize::try_from(length).map_err(|_| {
+                StoreError::InvalidPath("journal record length exceeds memory bounds".to_owned())
+            })?
+        ];
+        file.read_exact(&mut line)?;
+        if line.pop() != Some(b'\n') {
+            return Err(StoreError::CorruptRecord {
+                shard: entry.shard.clone(),
+                offset: entry.start_offset,
+                reason: "indexed journal record is not newline terminated".to_owned(),
+            });
+        }
+        let record = parse_verified_line(
+            entry.family,
+            &entry.shard,
+            entry.start_offset,
+            entry.end_offset,
+            &line,
+        )?;
+        if record.stable_id != entry.stable_id || record.checksum != entry.checksum {
+            return Err(StoreError::StableIdConflict {
+                id: entry.stable_id.clone(),
+            });
+        }
+        Ok(record)
+    }
+
+    pub fn index_full_scan_count(&self, family: JournalFamily) -> u64 {
+        self.index
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .full_scan_count
+            .get(&family)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn directory_enumeration_count(&self, family: JournalFamily) -> u64 {
+        self.index
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .directory_enumeration_count
+            .get(&family)
+            .copied()
+            .unwrap_or_default()
     }
 }
 

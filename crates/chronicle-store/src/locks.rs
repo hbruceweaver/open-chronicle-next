@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use rustix::fs::{FlockOperation, flock};
 
 use crate::permissions::io_error;
-use crate::{ManagedRoot, Result, StoreError};
+use crate::{JournalFamily, ManagedRoot, Result, StoreError};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -39,6 +39,14 @@ impl LockManager {
         lock_bounded(&file, true, self.timeout, "exclusive store")?;
         Ok(ExclusiveStoreGuard { file })
     }
+
+    pub fn journal(&self, family: JournalFamily) -> Result<JournalGuard> {
+        let label = family.cursor_name();
+        let relative = format!("locks/journal-{label}.lock");
+        let file = self.root.open_file(&relative, true, false, false)?;
+        lock_bounded(&file, true, self.timeout, "journal writer")?;
+        Ok(JournalGuard { file })
+    }
 }
 
 #[derive(Debug)]
@@ -71,6 +79,11 @@ pub struct ExclusiveStoreGuard {
 
 #[derive(Debug)]
 pub struct ArtifactGuard {
+    file: File,
+}
+
+#[derive(Debug)]
+pub struct JournalGuard {
     file: File,
 }
 
@@ -110,3 +123,4 @@ macro_rules! unlock_on_drop {
 unlock_on_drop!(SharedStoreGuard);
 unlock_on_drop!(ExclusiveStoreGuard);
 unlock_on_drop!(ArtifactGuard);
+unlock_on_drop!(JournalGuard);

@@ -108,6 +108,138 @@ fn failed_sync_boundary_has_not_durable_critical_health() -> chronicle_store::Re
 }
 
 #[test]
+fn steady_state_append_does_not_enumerate_growing_historical_shards() -> chronicle_store::Result<()>
+{
+    let (_temporary, root, _sqlite, _projector) = common::store()?;
+    let journal = CanonicalJournal::new(root);
+    journal.scan_all(JournalFamily::Events, false)?;
+    let baseline = journal.directory_enumeration_count(JournalFamily::Events);
+    let base = common::events()?.remove(2);
+    for day in 0_i64..128 {
+        let mut event = base.clone();
+        event.event_id = chronicle_domain::EventId::new(format!("evt-shard-growth-{day:03}"))
+            .map_err(|error| StoreError::InvalidPath(error.to_string()))?;
+        let shift = chrono::Duration::days(day);
+        event.scheduled_at = event.scheduled_at.map(|value| value + shift);
+        event.observed_at += shift;
+        event.recorded_at += shift;
+        journal.append_event(&event, FaultInjector::none())?;
+    }
+    assert_eq!(
+        journal.directory_enumeration_count(JournalFamily::Events),
+        baseline,
+        "steady append must not enumerate the historical shard directory"
+    );
+    assert_eq!(journal.index_full_scan_count(JournalFamily::Events), 1);
+    Ok(())
+}
+
+#[test]
+fn cross_process_manifest_tail_detects_conflict_without_directory_scan()
+-> chronicle_store::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root_path = temporary.path().join("store");
+    let root = chronicle_store::ManagedRoot::initialize(&root_path)?;
+    let journal = CanonicalJournal::new(root.clone());
+    let events = common::events()?;
+    journal.append_event(&events[2], FaultInjector::none())?;
+    let baseline = journal.directory_enumeration_count(JournalFamily::Events);
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("journal_append_process_child")
+        .arg("--nocapture")
+        .env("CHRONICLE_JOURNAL_APPEND_ROOT", &root_path)
+        .status()?;
+    assert!(status.success());
+
+    let mut conflict = events[3].clone();
+    conflict.display_timezone = "UTC".to_owned();
+    assert!(matches!(
+        journal.append_event(&conflict, FaultInjector::none()),
+        Err(StoreError::StableIdConflict { .. })
+    ));
+    journal.append_event(&events[4], FaultInjector::none())?;
+    assert_eq!(
+        journal.directory_enumeration_count(JournalFamily::Events),
+        baseline,
+        "cross-process manifest tail refresh must not enumerate all shards"
+    );
+    assert_eq!(
+        journal
+            .scan_all(JournalFamily::Events, false)?
+            .records
+            .len(),
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn journal_append_process_child() -> chronicle_store::Result<()> {
+    let Some(root_path) = std::env::var_os("CHRONICLE_JOURNAL_APPEND_ROOT") else {
+        return Ok(());
+    };
+    let root = chronicle_store::ManagedRoot::initialize(root_path)?;
+    CanonicalJournal::new(root).append_event(&common::events()?[3], FaultInjector::none())?;
+    Ok(())
+}
+
+#[test]
+fn malformed_disposable_manifest_self_heals_from_canonical_journal() -> chronicle_store::Result<()>
+{
+    let (_temporary, root, _sqlite, _projector) = common::store()?;
+    let journal = CanonicalJournal::new(root.clone());
+    let events = common::events()?;
+    journal.append_event(&events[2], FaultInjector::none())?;
+    let mut manifest = root.open_file("receipts/journal-events-index.jsonl", false, true, false)?;
+    manifest.write_all(b"{partial")?;
+    manifest.sync_all()?;
+    drop(manifest);
+
+    journal.append_event(&events[3], FaultInjector::none())?;
+    assert_eq!(
+        journal
+            .scan_all(JournalFamily::Events, false)?
+            .records
+            .len(),
+        2
+    );
+    assert!(
+        !root
+            .read("receipts/journal-events-index.jsonl")?
+            .ends_with(b"{partial")
+    );
+    Ok(())
+}
+
+#[test]
+fn manifest_write_failure_cannot_downgrade_synced_canonical_append() -> chronicle_store::Result<()>
+{
+    let (_temporary, root, _sqlite, _projector) = common::store()?;
+    let journal = CanonicalJournal::new(root.clone());
+    let events = common::events()?;
+    journal.append_event(&events[2], FaultInjector::none())?;
+    let durable = journal.append_event(
+        &events[3],
+        FaultInjector::at(chronicle_store::FaultPoint::BeforeJournalManifestUpdate),
+    )?;
+    assert_eq!(durable.stable_id(), events[3].event_id.as_str());
+    assert!(root.exists("receipts/journal-events-pending.json")?);
+
+    let recovered = journal.append_event(&events[3], FaultInjector::none())?;
+    assert_eq!(recovered.start_offset(), durable.start_offset());
+    assert!(!root.exists("receipts/journal-events-pending.json")?);
+    assert_eq!(
+        journal
+            .scan_all(JournalFamily::Events, false)?
+            .records
+            .len(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
 fn confirmed_repair_resumes_from_every_persisted_boundary() -> chronicle_store::Result<()> {
     for point in [
         chronicle_store::FaultPoint::AfterRepairArchive,
