@@ -484,7 +484,10 @@ struct CaptureCoordinatorSnapshot: Equatable, Sendable {
     let nextTick: PlannedCaptureTick?
     let attemptInFlight: Bool
     let executionGeneration: UInt64?
+    let lastDenial: CaptureDenial?
 }
+
+typealias CaptureCoordinatorUpdateSink = @Sendable (CaptureCoordinatorSnapshot) async -> Void
 
 actor CaptureCoordinator {
     private let clock: any CaptureSchedulerClock
@@ -507,6 +510,9 @@ actor CaptureCoordinator {
     private var pendingClockChange: CaptureClockSample?
     private var pendingWake = false
     private var suspendTransitionInFlight = false
+    private var lastDenial: CaptureDenial?
+    private var updateSink: CaptureCoordinatorUpdateSink?
+    private var updateDeliveryTask: Task<Void, Never>?
 
     init(
         cadenceSeconds: UInt32,
@@ -540,6 +546,10 @@ actor CaptureCoordinator {
             startLoop: true,
             operation: operation
         )
+    }
+
+    func setUpdateSink(_ sink: @escaping CaptureCoordinatorUpdateSink) {
+        updateSink = sink
     }
 
     func stop() async {
@@ -631,12 +641,31 @@ actor CaptureCoordinator {
         }
     }
 
+    func privacyBoundaryChanged() async {
+        guard state == .running,
+              let operation = beginLifecycleOperation()
+        else { return }
+        defer { finishLifecycleOperation(operation) }
+        let previousGeneration = executionGeneration
+        await epoch.invalidate(
+            generation: previousGeneration,
+            reason: .superseded
+        )
+        guard isCurrentLifecycleOperation(operation), state == .running else { return }
+        if executionGeneration == previousGeneration {
+            executionGeneration = await epoch.beginGeneration()
+        }
+        lastDenial = nil
+        publishSnapshot()
+    }
+
     func snapshot() -> CaptureCoordinatorSnapshot {
         CaptureCoordinatorSnapshot(
             state: state,
             nextTick: planner.nextTick,
             attemptInFlight: attemptInFlight,
-            executionGeneration: executionGeneration
+            executionGeneration: executionGeneration,
+            lastDenial: lastDenial
         )
     }
 
@@ -668,7 +697,9 @@ actor CaptureCoordinator {
         planner.rebase(at: sample)
         executionGeneration = await epoch.beginGeneration()
         state = .running
+        lastDenial = nil
         if startLoop { restartLoop() }
+        publishSnapshot()
     }
 
     private func execute(
@@ -723,7 +754,13 @@ actor CaptureCoordinator {
             await handle(failure: failure)
         case .invalidated(.clockChanged):
             await captureClockDiscontinuityDetected()
-        case .stored, .proofSucceeded, .denied, .invalidated:
+        case .stored, .proofSucceeded:
+            lastDenial = nil
+            publishSnapshot()
+        case let .denied(reason):
+            lastDenial = reason
+            publishSnapshot()
+        case .invalidated:
             break
         }
     }
@@ -760,6 +797,8 @@ actor CaptureCoordinator {
                 break
             case .blockedFreeSpace, .blockedImageQuota:
                 state = .storageFailure
+                lastDenial = nil
+                publishSnapshot()
                 return
             case let .failed(failure):
                 await handle(failure: failure)
@@ -848,7 +887,9 @@ actor CaptureCoordinator {
                 }
                 executionGeneration = generation
                 state = .running
+                lastDenial = nil
                 if startLoop { restartLoop() }
+                publishSnapshot()
                 return true
             case .runtimeInactive:
                 await transition(to: .stopped, invalidation: .stopping)
@@ -952,6 +993,7 @@ actor CaptureCoordinator {
     ) async {
         let invalidatedGeneration = executionGeneration
         state = newState
+        lastDenial = nil
         planner.disarm()
         loopGeneration &+= 1
         loopTask?.cancel()
@@ -962,6 +1004,22 @@ actor CaptureCoordinator {
         )
         if executionGeneration == invalidatedGeneration {
             executionGeneration = nil
+        }
+        publishSnapshot()
+    }
+
+    func flushUpdates() async {
+        await updateDeliveryTask?.value
+    }
+
+    private func publishSnapshot() {
+        guard let updateSink else { return }
+        let previous = updateDeliveryTask
+        let update = snapshot()
+        updateDeliveryTask = Task {
+            await previous?.value
+            guard !Task.isCancelled else { return }
+            await updateSink(update)
         }
     }
 

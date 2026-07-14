@@ -2,7 +2,105 @@ import Foundation
 import XCTest
 @testable import OpenChronicle
 
+private actor CoordinatorUpdateRecorder {
+    private(set) var values: [CaptureCoordinatorSnapshot] = []
+
+    func append(_ value: CaptureCoordinatorSnapshot) {
+        values.append(value)
+    }
+}
+
+private actor BlockingFirstCoordinatorUpdateSink {
+    private var snapshots: [CaptureCoordinatorSnapshot] = []
+    private var firstStarted = false
+    private var firstStartedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstRelease: CheckedContinuation<Void, Never>?
+
+    func receive(_ snapshot: CaptureCoordinatorSnapshot) async {
+        snapshots.append(snapshot)
+        guard snapshots.count == 1 else { return }
+
+        firstStarted = true
+        let waiters = firstStartedWaiters
+        firstStartedWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            firstRelease = continuation
+        }
+    }
+
+    func waitUntilFirstStarted() async {
+        guard !firstStarted else { return }
+        await withCheckedContinuation { continuation in
+            firstStartedWaiters.append(continuation)
+        }
+    }
+
+    func releaseFirst() {
+        firstRelease?.resume()
+        firstRelease = nil
+    }
+
+    func values() -> [CaptureCoordinatorSnapshot] {
+        snapshots
+    }
+}
+
 final class CoordinatorTests: XCTestCase {
+    func testUpdateSinkPublishesTickDenialAndStorageTransition() async {
+        let failure = CapturePersistenceFailure(
+            category: .retryableStorage,
+            code: "fixture-storage",
+            retryable: true
+        )
+        let executor = RecordingCaptureExecutor(results: [
+            .denied(.permissionDenied),
+            .persistenceFailed(failure),
+        ])
+        let updates = CoordinatorUpdateRecorder()
+        let coordinator = makeCoordinator(executor: executor)
+        await coordinator.setUpdateSink { snapshot in
+            await updates.append(snapshot)
+        }
+        await coordinator.activate(at: sample(wall: 0, monotonic: 0), startLoop: false)
+
+        await coordinator.processDue(at: sample(wall: 15, monotonic: 15_000_000_000))
+        await coordinator.processDue(at: sample(wall: 45, monotonic: 45_000_000_000))
+        await coordinator.flushUpdates()
+
+        let snapshots = await updates.values
+        XCTAssertTrue(snapshots.contains(where: { snapshot in
+            snapshot.state == .running && snapshot.lastDenial == .permissionDenied
+        }))
+        XCTAssertEqual(snapshots.last?.state, .storageFailure)
+        XCTAssertNil(snapshots.last?.lastDenial)
+    }
+
+    func testUpdateSinkDeliversTransitionsSeriallyInPublicationOrder() async {
+        let updates = BlockingFirstCoordinatorUpdateSink()
+        let coordinator = makeCoordinator(executor: RecordingCaptureExecutor())
+        await coordinator.setUpdateSink { snapshot in
+            await updates.receive(snapshot)
+        }
+
+        await coordinator.activate(at: sample(wall: 0, monotonic: 0), startLoop: false)
+        await updates.waitUntilFirstStarted()
+        await coordinator.stop()
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+
+        let whileBlocked = await updates.values()
+        XCTAssertEqual(whileBlocked.map(\.state), [.running])
+
+        await updates.releaseFirst()
+        await coordinator.flushUpdates()
+        let delivered = await updates.values()
+        XCTAssertEqual(delivered.map(\.state), [.running, .stopped])
+    }
+
     func testCoreControlClientRoundTripsAdmissionAndRuntimeGap() async throws {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
