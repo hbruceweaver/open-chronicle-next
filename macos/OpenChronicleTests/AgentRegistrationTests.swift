@@ -311,6 +311,94 @@ final class AgentRegistrationServiceTests: XCTestCase {
     }
 }
 
+@MainActor
+final class CoreDisclosureGrantTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_784_016_000)
+
+    func testDefaultGrantDeniesOCRPersistsAndRevokesExactlyAcrossReopen() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let firstCore = try InProcessCore(applicationSupportURL: directory, now: now)
+        let firstService = CoreDisclosureGrantService(core: firstCore)
+        let grant = try await firstService.provision(for: .codex, now: now)
+
+        XCTAssertEqual(grant.contentClasses, [.metadata, .derived])
+        XCTAssertFalse(grant.contentClasses.contains(.ocr))
+        XCTAssertEqual(grant.timeScope, .rollingHorizon(seconds: 86_400))
+        let generation = await firstCore.openedStoreGeneration()
+        XCTAssertEqual(grant.storeGeneration, generation)
+        let installed = try await firstService.install(
+            grant,
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertEqual(installed.mutation, .installed)
+        XCTAssertEqual(installed.grant, grant)
+        let replayed = try await firstService.install(
+            grant,
+            now: now.addingTimeInterval(2)
+        )
+        XCTAssertEqual(replayed.mutation, .alreadyInstalled)
+        try await firstCore.close()
+
+        let reopened = try InProcessCore(
+            applicationSupportURL: directory,
+            now: now.addingTimeInterval(3)
+        )
+        let reopenedService = CoreDisclosureGrantService(core: reopened)
+        let revoked = try await reopenedService.revoke(
+            grantID: grant.grantID,
+            clientID: grant.clientID,
+            receiptID: grant.receiptID,
+            now: now.addingTimeInterval(4)
+        )
+        XCTAssertEqual(revoked.mutation, .revoked)
+        XCTAssertEqual(revoked.grant.state, "revoked")
+        let revokeReplay = try await reopenedService.revoke(
+            grantID: grant.grantID,
+            clientID: grant.clientID,
+            receiptID: grant.receiptID,
+            now: now.addingTimeInterval(5)
+        )
+        XCTAssertEqual(revokeReplay.mutation, .alreadyRevoked)
+        try await reopened.close()
+    }
+
+    func testGrantIdentityMismatchIsRedactedAndDoesNotRevoke() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let core = try InProcessCore(applicationSupportURL: directory, now: now)
+        let service = CoreDisclosureGrantService(core: core)
+        let grant = try await service.provision(for: .claudeCode, now: now)
+        _ = try await service.install(grant, now: now.addingTimeInterval(1))
+
+        do {
+            _ = try await service.revoke(
+                grantID: grant.grantID,
+                clientID: "SECRET_WRONG_CLIENT",
+                receiptID: grant.receiptID,
+                now: now.addingTimeInterval(2)
+            )
+            XCTFail("identity mismatch must fail")
+        } catch let ChronicleBridgeError.bridgeStatus(_, payload) {
+            XCTAssertEqual(payload?.code, "disclosure-grant-identity-mismatch")
+            XCTAssertFalse(payload?.message.contains("SECRET_WRONG_CLIENT") ?? true)
+        }
+
+        let revoked = try await service.revoke(
+            grantID: grant.grantID,
+            clientID: grant.clientID,
+            receiptID: grant.receiptID,
+            now: now.addingTimeInterval(3)
+        )
+        XCTAssertEqual(revoked.mutation, .revoked)
+        try await core.close()
+    }
+}
+
 final class InstallLocationTests: XCTestCase {
     func testPackagedHelperAndExternalManagedRootAreReady() throws {
         let fixture = try InstallFixture()
