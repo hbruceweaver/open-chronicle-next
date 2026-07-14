@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration as StdDuration;
 
 use chronicle_domain::{
@@ -81,6 +82,17 @@ pub struct SharedService {
 }
 
 impl SharedService {
+    /// Opens the authoritative service directly from a managed Chronicle root.
+    ///
+    /// Transport adapters use this constructor so store bootstrap and schema
+    /// generation remain engine-owned instead of being reimplemented at each
+    /// trust boundary.
+    pub fn open_path(path: impl AsRef<Path>) -> Result<Self, SharedServiceError> {
+        let root = ManagedRoot::initialize(path).map_err(map_store)?;
+        let sqlite = SqliteStore::open(root.clone()).map_err(map_store)?;
+        Self::open(root, sqlite)
+    }
+
     pub fn open(root: ManagedRoot, sqlite: SqliteStore) -> Result<Self, SharedServiceError> {
         let generation = StoreGeneration::load(&root).map_err(map_store)?;
         Ok(Self {
@@ -93,6 +105,13 @@ impl SharedService {
             artifact_faults: FaultInjector::none(),
             receipt_faults: FaultInjector::none(),
         })
+    }
+
+    /// Returns the generation against which requests to this service must be
+    /// authored. Callers still receive fail-closed stale-generation errors if
+    /// another process replaces the store after this service opens.
+    pub const fn store_generation(&self) -> u64 {
+        self.opened_generation
     }
 
     /// Installs deterministic fault boundaries used by crash-recovery proof.

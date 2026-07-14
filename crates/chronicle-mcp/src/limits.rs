@@ -1,0 +1,3 @@
+pub const DEFAULT_PAGE_ITEMS: u32 = 50;
+pub const MAX_PAGE_ITEMS: u32 = 100;
+pub const DEFAULT_CONTEXT_BYTES: u64 = 256 * 1024;

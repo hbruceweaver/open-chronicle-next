@@ -1,6 +1,16 @@
-//! Bundled stdio MCP adapter.
-//!
-//! U12 supplies the protocol runtime. The scaffold deliberately writes nothing to
-//! stdout because stdio will be reserved for MCP frames.
+//! Bundled stdio MCP adapter. Stdout is reserved exclusively for MCP frames.
 
-fn main() {}
+use chronicle_mcp::{ServerConfig, run_stdio};
+
+#[tokio::main]
+async fn main() {
+    let result = ServerConfig::parse_args(std::env::args_os().skip(1));
+    let result = match result {
+        Ok(config) => run_stdio(config).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        eprintln!("chronicle-mcp: {}", error.code());
+        std::process::exit(1);
+    }
+}

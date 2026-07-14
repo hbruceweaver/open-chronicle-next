@@ -103,6 +103,19 @@ fn event_request_id(
 }
 
 #[test]
+fn engine_owned_path_bootstrap_exposes_the_authoritative_generation() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let root_path = temporary.path().join("managed-root");
+    let service = SharedService::open_path(&root_path)?;
+
+    assert_eq!(service.store_generation(), 1);
+    assert!(root_path.join("store-generation").is_file());
+    assert!(root_path.join("index.sqlite3").is_file());
+    Ok(())
+}
+
+#[test]
 fn schema_discovery_lists_every_published_u5_contract() -> Result<(), Box<dyn Error>> {
     let (_temporary, root, sqlite, _projector) = common::store()?;
     let service = SharedService::open(root, sqlite)?;

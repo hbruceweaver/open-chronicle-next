@@ -12,9 +12,20 @@ name = "chronicle-mcp"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 chronicle-domain = { path = "../chronicle-domain" }
 chronicle-engine = { path = "../chronicle-engine" }
+rmcp = { version = "2.2.0", default-features = false, features = ["macros", "server", "transport-io"] }
+schemars = "1.2.1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.49.0", features = ["io-std", "macros", "rt-multi-thread"] }
+uuid.workspace = true
+
+[dev-dependencies]
+chronicle-store = { path = "../chronicle-store" }
+tempfile.workspace = true
 
 [lints]
 workspace = true
-
