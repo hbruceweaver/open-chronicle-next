@@ -40,6 +40,15 @@ for target in $targets; do
         --release \
         --locked \
         --target "$target"
+    MACOSX_DEPLOYMENT_TARGET=14.0 \
+        CARGO_TARGET_DIR="$target_dir" \
+        RUSTC="$rustc" \
+        "$cargo" build \
+        --manifest-path "$root/Cargo.toml" \
+        --package chronicle-mcp \
+        --release \
+        --locked \
+        --target "$target"
 done
 
 universal_dir="$root/build/universal"
@@ -51,8 +60,21 @@ xcrun lipo -create \
     -output "$temporary_archive"
 mv -f "$temporary_archive" "$universal_dir/libchronicle_ffi.a"
 
+temporary_mcp=$(mktemp "$universal_dir/chronicle-mcp.XXXXXX")
+xcrun lipo -create \
+    "$root/build/rust/aarch64-apple-darwin/aarch64-apple-darwin/release/chronicle-mcp" \
+    "$root/build/rust/x86_64-apple-darwin/x86_64-apple-darwin/release/chronicle-mcp" \
+    -output "$temporary_mcp"
+chmod 755 "$temporary_mcp"
+mv -f "$temporary_mcp" "$universal_dir/chronicle-mcp"
+
 architectures=$(xcrun lipo -archs "$universal_dir/libchronicle_ffi.a")
 case " $architectures " in *" arm64 "*) ;; *) echo "universal archive is missing arm64: $architectures" >&2; exit 1 ;; esac
 case " $architectures " in *" x86_64 "*) ;; *) echo "universal archive is missing x86_64: $architectures" >&2; exit 1 ;; esac
 
+mcp_architectures=$(xcrun lipo -archs "$universal_dir/chronicle-mcp")
+case " $mcp_architectures " in *" arm64 "*) ;; *) echo "MCP helper is missing arm64: $mcp_architectures" >&2; exit 1 ;; esac
+case " $mcp_architectures " in *" x86_64 "*) ;; *) echo "MCP helper is missing x86_64: $mcp_architectures" >&2; exit 1 ;; esac
+
 echo "built $universal_dir/libchronicle_ffi.a ($architectures)"
+echo "built $universal_dir/chronicle-mcp ($mcp_architectures)"

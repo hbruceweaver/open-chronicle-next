@@ -62,7 +62,22 @@
 		A10000000000000000000036 /* AgentRegistrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000003B /* AgentRegistrationService.swift */; };
 		A10000000000000000000037 /* DisclosureGrantService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000003C /* DisclosureGrantService.swift */; };
 		A10000000000000000000038 /* AgentConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000003D /* AgentConnectionService.swift */; };
+		A10000000000000000000039 /* chronicle-mcp in Embed MCP Helper */ = {isa = PBXBuildFile; fileRef = A2000000000000000000003E /* chronicle-mcp */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 /* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A40000000000000000000008 /* Embed MCP Helper */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = Contents/Helpers;
+			dstSubfolderSpec = 1;
+			files = (
+				A10000000000000000000039 /* chronicle-mcp in Embed MCP Helper */,
+			);
+			name = "Embed MCP Helper";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXContainerItemProxy section */
 		A30000000000000000000001 /* PBXContainerItemProxy */ = {
@@ -136,6 +151,7 @@
 		A2000000000000000000003B /* AgentRegistrationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRegistrationService.swift; sourceTree = "<group>"; };
 		A2000000000000000000003C /* DisclosureGrantService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisclosureGrantService.swift; sourceTree = "<group>"; };
 		A2000000000000000000003D /* AgentConnectionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConnectionService.swift; sourceTree = "<group>"; };
+		A2000000000000000000003E /* chronicle-mcp */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; path = ../build/universal/chronicle-mcp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -149,6 +165,7 @@
 			children = (
 				A50000000000000000000002 /* OpenChronicle */,
 				A50000000000000000000006 /* OpenChronicleTests */,
+				A2000000000000000000003E /* chronicle-mcp */,
 				A50000000000000000000008 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -214,6 +231,7 @@
 				A40000000000000000000003 /* Sources */,
 				A40000000000000000000002 /* Frameworks */,
 				A40000000000000000000004 /* Resources */,
+				A40000000000000000000008 /* Embed MCP Helper */,
 			);
 			buildRules = ();
 			dependencies = ();
@@ -275,7 +293,7 @@
 			inputPaths = ();
 			name = "Build Rust Core";
 			outputFileListPaths = ();
-			outputPaths = ("$(SRCROOT)/../build/universal/libchronicle_ffi.a");
+			outputPaths = ("$(SRCROOT)/../build/universal/libchronicle_ffi.a", "$(SRCROOT)/../build/universal/chronicle-mcp");
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"$SRCROOT/../scripts/build-rust-universal.sh\"\n";
