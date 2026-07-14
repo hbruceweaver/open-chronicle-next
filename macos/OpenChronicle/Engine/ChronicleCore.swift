@@ -1,6 +1,7 @@
 import Foundation
 
 protocol CoreService: Sendable {
+    func openedStoreGeneration() async -> UInt64
     func schemaIdentity() async throws -> ChronicleSchemaIdentity
     func call(_ request: Data) async throws -> Data
     func ingest(_ request: Data, image: Data?) async throws -> Data
@@ -29,6 +30,10 @@ actor InProcessCore: CoreService {
         let (handle, opened) = try ChronicleFFI.open(request: encoded)
         self.handle = handle
         storeGeneration = opened.storeGeneration
+    }
+
+    func openedStoreGeneration() -> UInt64 {
+        storeGeneration
     }
 
     func schemaIdentity() throws -> ChronicleSchemaIdentity {

@@ -69,12 +69,19 @@ private struct ShellView: View {
                     .foregroundStyle(statusColor)
                 Text(captureStatusText)
                     .foregroundStyle(.secondary)
+                HealthView(viewModel: appModel.healthViewModel)
                 Spacer()
             }
             .padding(32)
             .navigationDestination(for: AppRoute.self) { route in
-                Text(title(for: route))
-                    .navigationTitle(title(for: route))
+                if route == .health {
+                    HealthView(viewModel: appModel.healthViewModel)
+                        .padding(32)
+                        .navigationTitle(title(for: route))
+                } else {
+                    Text(title(for: route))
+                        .navigationTitle(title(for: route))
+                }
             }
         }
     }
@@ -115,6 +122,7 @@ private struct ShellView: View {
     private func title(for route: AppRoute) -> String {
         switch route {
         case .home: "Home"
+        case .health: "Health"
         case .timeline: "Timeline"
         case let .chunk(id): "Chunk \(id)"
         case let .event(id): "Event \(id)"

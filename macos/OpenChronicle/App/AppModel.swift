@@ -11,9 +11,11 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var health = ChronicleHealthState(status: .connecting)
     @Published private(set) var captureStatus: CapturePresentationState = .starting
+    let healthViewModel = HealthViewModel()
     private var core: (any CoreService)?
     private var runtime: AppCaptureRuntime?
     private var lifecycleMonitor: LifecycleMonitor?
+    private var storageMonitor: StorageMonitor?
     private var connectionTask: Task<Void, Never>?
     private var isShuttingDown = false
     private let coreFactory: CoreFactory
@@ -74,6 +76,8 @@ final class AppModel: ObservableObject {
         connectionTask = nil
         lifecycleMonitor?.stop()
         lifecycleMonitor = nil
+        await storageMonitor?.stop()
+        storageMonitor = nil
         if let runtime {
             try? await runtime.shutdown()
         }
@@ -129,6 +133,19 @@ final class AppModel: ObservableObject {
             } else {
                 captureStatus = .setupRequired
             }
+            let diagnosticClient = CoreDiagnosticHealthClient(core: opened)
+            healthViewModel.attach(fetcher: diagnosticClient)
+            let monitor = StorageMonitor(fetcher: diagnosticClient) { [weak self] update in
+                await self?.applyStorageMonitorUpdate(update)
+            }
+            storageMonitor = monitor
+            await monitor.start()
+            guard !isShuttingDown else {
+                await monitor.stop()
+                storageMonitor = nil
+                try? await opened.close()
+                return
+            }
             core = opened
             openedCore = nil
             health = ChronicleHealthState(status: .ready)
@@ -158,6 +175,16 @@ final class AppModel: ObservableObject {
 
     private func updateCaptureStatus(_ status: CapturePresentationState) {
         captureStatus = status
+    }
+
+    private func applyStorageMonitorUpdate(_ update: StorageMonitorUpdate) {
+        guard !isShuttingDown else { return }
+        switch update {
+        case let .snapshot(snapshot):
+            healthViewModel.apply(snapshot)
+        case let .failed(message):
+            healthViewModel.fail(message)
+        }
     }
 
     private static func isDuplicateInstance(_ error: Error) -> Bool {

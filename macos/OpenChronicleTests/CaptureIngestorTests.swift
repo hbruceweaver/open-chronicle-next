@@ -287,6 +287,8 @@ private actor SpyCoreService: CoreService {
     private(set) var lastRequest: Data?
     private(set) var lastImage: Data?
 
+    func openedStoreGeneration() -> UInt64 { 1 }
+
     func schemaIdentity() -> ChronicleSchemaIdentity {
         ChronicleSchemaIdentity(abiSchemaVersion: "1.0", contractSchemaVersion: "1.0")
     }

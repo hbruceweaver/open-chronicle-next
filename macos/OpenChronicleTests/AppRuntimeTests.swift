@@ -408,6 +408,8 @@ private actor RuntimeFactoryProbe {
 private actor AppCoreProbe: CoreService {
     private(set) var closeCount = 0
 
+    func openedStoreGeneration() -> UInt64 { 1 }
+
     func schemaIdentity() -> ChronicleSchemaIdentity {
         ChronicleSchemaIdentity(abiSchemaVersion: "1.0", contractSchemaVersion: "1.0")
     }

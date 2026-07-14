@@ -2,6 +2,7 @@ import Foundation
 
 enum AppRoute: Hashable {
     case home
+    case health
     case timeline
     case chunk(String)
     case event(String)

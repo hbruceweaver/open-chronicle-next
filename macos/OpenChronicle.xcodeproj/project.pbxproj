@@ -39,6 +39,11 @@
 		A1000000000000000000001F /* LaunchAtLoginService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000024 /* LaunchAtLoginService.swift */; };
 		A10000000000000000000020 /* AppRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000025 /* AppRuntimeTests.swift */; };
 		A10000000000000000000021 /* LaunchAtLoginTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000026 /* LaunchAtLoginTests.swift */; };
+		A10000000000000000000022 /* DiagnosticHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000027 /* DiagnosticHealth.swift */; };
+		A10000000000000000000023 /* StorageMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000028 /* StorageMonitor.swift */; };
+		A10000000000000000000024 /* HealthViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000029 /* HealthViewModel.swift */; };
+		A10000000000000000000025 /* HealthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000002A /* HealthView.swift */; };
+		A10000000000000000000026 /* HealthTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000002B /* HealthTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -90,6 +95,11 @@
 		A20000000000000000000024 /* LaunchAtLoginService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLoginService.swift; sourceTree = "<group>"; };
 		A20000000000000000000025 /* AppRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntimeTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000026 /* LaunchAtLoginTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLoginTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000027 /* DiagnosticHealth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticHealth.swift; sourceTree = "<group>"; };
+		A20000000000000000000028 /* StorageMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageMonitor.swift; sourceTree = "<group>"; };
+		A20000000000000000000029 /* HealthViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthViewModel.swift; sourceTree = "<group>"; };
+		A2000000000000000000002A /* HealthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthView.swift; sourceTree = "<group>"; };
+		A2000000000000000000002B /* HealthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -114,6 +124,7 @@
 				A50000000000000000000004 /* Engine */,
 				A50000000000000000000009 /* Capture */,
 				A5000000000000000000000A /* Services */,
+				A5000000000000000000000B /* Features */,
 				A50000000000000000000005 /* Resources */,
 				A2000000000000000000000A /* OpenChronicle-Bridging-Header.h */,
 			);
@@ -121,9 +132,11 @@
 			sourceTree = "<group>";
 		};
 		A50000000000000000000003 /* App */ = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000021, A20000000000000000000022); path = App; sourceTree = "<group>"; };
-		A50000000000000000000004 /* Engine */ = {isa = PBXGroup; children = (A20000000000000000000004, A20000000000000000000005, A20000000000000000000006); path = Engine; sourceTree = "<group>"; };
+		A50000000000000000000004 /* Engine */ = {isa = PBXGroup; children = (A20000000000000000000004, A20000000000000000000005, A20000000000000000000006, A20000000000000000000027); path = Engine; sourceTree = "<group>"; };
 		A50000000000000000000009 /* Capture */ = {isa = PBXGroup; children = (A20000000000000000000011, A20000000000000000000012, A20000000000000000000013, A20000000000000000000014, A20000000000000000000015, A20000000000000000000016, A20000000000000000000017, A2000000000000000000001F); path = Capture; sourceTree = "<group>"; };
-		A5000000000000000000000A /* Services */ = {isa = PBXGroup; children = (A20000000000000000000023, A20000000000000000000024); path = Services; sourceTree = "<group>"; };
+		A5000000000000000000000A /* Services */ = {isa = PBXGroup; children = (A20000000000000000000023, A20000000000000000000024, A20000000000000000000028); path = Services; sourceTree = "<group>"; };
+		A5000000000000000000000B /* Features */ = {isa = PBXGroup; children = (A5000000000000000000000C /* Health */); path = Features; sourceTree = "<group>"; };
+		A5000000000000000000000C /* Health */ = {isa = PBXGroup; children = (A20000000000000000000029, A2000000000000000000002A); path = Health; sourceTree = "<group>"; };
 		A50000000000000000000005 /* Resources */ = {isa = PBXGroup; children = (A20000000000000000000007, A20000000000000000000008, A20000000000000000000009); path = Resources; sourceTree = "<group>"; };
 		A50000000000000000000006 /* OpenChronicleTests */ = {
 			isa = PBXGroup;
@@ -141,6 +154,7 @@
 				A20000000000000000000020 /* CoordinatorTests.swift */,
 				A20000000000000000000025 /* AppRuntimeTests.swift */,
 				A20000000000000000000026 /* LaunchAtLoginTests.swift */,
+				A2000000000000000000002B /* HealthTests.swift */,
 				A50000000000000000000007 /* Fixtures */,
 			);
 			path = OpenChronicleTests;
@@ -228,8 +242,8 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A40000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A1000000000000000000000C, A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F, A10000000000000000000010, A10000000000000000000011, A10000000000000000000012, A1000000000000000000001A, A1000000000000000000001C, A1000000000000000000001D, A1000000000000000000001E, A1000000000000000000001F); runOnlyForDeploymentPostprocessing = 0; };
-		A40000000000000000000005 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008, A10000000000000000000009, A1000000000000000000000B, A10000000000000000000013, A10000000000000000000014, A10000000000000000000015, A10000000000000000000016, A10000000000000000000017, A10000000000000000000018, A10000000000000000000019, A1000000000000000000001B, A10000000000000000000020, A10000000000000000000021); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A1000000000000000000000C, A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F, A10000000000000000000010, A10000000000000000000011, A10000000000000000000012, A1000000000000000000001A, A1000000000000000000001C, A1000000000000000000001D, A1000000000000000000001E, A1000000000000000000001F, A10000000000000000000022, A10000000000000000000023, A10000000000000000000024, A10000000000000000000025); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000005 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008, A10000000000000000000009, A1000000000000000000000B, A10000000000000000000013, A10000000000000000000014, A10000000000000000000015, A10000000000000000000016, A10000000000000000000017, A10000000000000000000018, A10000000000000000000019, A1000000000000000000001B, A10000000000000000000020, A10000000000000000000021, A10000000000000000000026); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */

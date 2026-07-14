@@ -101,6 +101,8 @@ private actor ProbeCore: CoreService {
         self.identityFails = identityFails
     }
 
+    func openedStoreGeneration() -> UInt64 { 1 }
+
     func schemaIdentity() throws -> ChronicleSchemaIdentity {
         if identityFails {
             throw ChronicleBridgeError.malformedResponse
