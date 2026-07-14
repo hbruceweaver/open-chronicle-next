@@ -5,6 +5,46 @@ release_provenance_error() {
     return 1
 }
 
+release_remove_generated_directory() {
+    root=$1
+    candidate=$2
+
+    [ -n "$root" ] && [ -n "$candidate" ] \
+        || release_provenance_error "generated-directory cleanup requires a root and candidate" \
+        || return 1
+    build_root=$(CDPATH= cd -- "$root/build" 2>/dev/null && pwd -P) \
+        || release_provenance_error "could not resolve generated build root: $root/build" \
+        || return 1
+    candidate_name=$(basename -- "$candidate")
+
+    [ "$candidate" = "$build_root/$candidate_name" ] \
+        || release_provenance_error "refusing a non-canonical generated-directory path: $candidate" \
+        || return 1
+    case "$candidate_name" in
+        u14-dmg-work.*|u14-release-probe.*|u14-cleanup-probe.*) ;;
+        *)
+            release_provenance_error "refusing to clean an unrecognized generated directory: $candidate" \
+                || return 1
+            ;;
+    esac
+    [ -e "$candidate" ] || [ -L "$candidate" ] || return 0
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] \
+        || release_provenance_error "refusing to clean a non-directory or symlink: $candidate" \
+        || return 1
+
+    if command -v trash >/dev/null 2>&1; then
+        trash "$candidate" || return 1
+    else
+        command -v find >/dev/null 2>&1 \
+            || release_provenance_error "find is required when trash is unavailable" \
+            || return 1
+        find -P "$candidate" -depth -delete || return 1
+    fi
+
+    [ ! -e "$candidate" ] && [ ! -L "$candidate" ] \
+        || release_provenance_error "generated directory still exists after cleanup: $candidate"
+}
+
 release_semver_from_tag() {
     tag=$1
     printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \

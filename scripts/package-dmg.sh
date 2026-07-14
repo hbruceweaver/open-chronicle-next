@@ -79,13 +79,7 @@ temporary_dmg="$work/Open Chronicle.dmg"
 mkdir -p "$stage"
 
 remove_work() {
-    [ ! -e "$work" ] && return 0
-    if command -v trash >/dev/null 2>&1; then
-        trash "$work"
-        return
-    fi
-    echo "package-dmg: preserved working directory because trash is unavailable: $work" >&2
-    return 1
+    release_remove_generated_directory "$root" "$work"
 }
 
 cleanup_work_on_exit() {

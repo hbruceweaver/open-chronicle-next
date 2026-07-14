@@ -3,6 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+. "$script_dir/release-common.sh"
 app="$root/dist/Open Chronicle.app"
 workflow="$root/.github/workflows/release.yml"
 probe_mode=full
@@ -21,15 +22,20 @@ fi
 if [ "$probe_mode" = full ]; then
     [ -d "$app" ] || fail "build the unsigned app before running this probe"
 fi
-command -v trash >/dev/null 2>&1 || fail "trash is required for probe cleanup"
 
 work=$(mktemp -d "$root/build/u14-release-probe.XXXXXX")
 dirty_marker="$root/.u14-release-dirty-probe-$$"
 
 remove_probe_files() {
     cleanup_status=0
-    if [ -e "$dirty_marker" ] && ! trash "$dirty_marker"; then cleanup_status=1; fi
-    if [ -e "$work" ] && ! trash "$work"; then cleanup_status=1; fi
+    if [ -e "$dirty_marker" ]; then
+        if command -v trash >/dev/null 2>&1; then
+            trash "$dirty_marker" || cleanup_status=1
+        else
+            rm -f "$dirty_marker" || cleanup_status=1
+        fi
+    fi
+    release_remove_generated_directory "$root" "$work" || cleanup_status=1
     [ "$cleanup_status" -eq 0 ]
 }
 
@@ -53,6 +59,43 @@ trap cleanup_probe_on_exit EXIT
 trap 'cleanup_probe_on_signal 129' HUP
 trap 'cleanup_probe_on_signal 130' INT
 trap 'cleanup_probe_on_signal 143' TERM
+
+cleanup_fixture=$(mktemp -d "$root/build/u14-cleanup-probe.XXXXXX")
+mkdir -p "$cleanup_fixture/nested"
+printf '%s\n' fallback > "$cleanup_fixture/nested/evidence.txt"
+fallback_bin="$work/fallback-bin"
+mkdir -p "$fallback_bin"
+for command_name in basename find; do
+    command_path=$(command -v "$command_name")
+    ln -s "$command_path" "$fallback_bin/$command_name"
+done
+PATH="$fallback_bin" /bin/sh -c \
+    '. "$1"; release_remove_generated_directory "$2" "$3"' \
+    sh "$script_dir/release-common.sh" "$root" "$cleanup_fixture"
+[ ! -e "$cleanup_fixture" ] \
+    || fail "find-based generated-directory cleanup left its fixture behind"
+scope_fixture="$work/u14-cleanup-probe.outside"
+mkdir -p "$scope_fixture"
+if PATH="$fallback_bin" /bin/sh -c \
+    '. "$1"; release_remove_generated_directory "$2" "$3"' \
+    sh "$script_dir/release-common.sh" "$root" "$scope_fixture" \
+    >/dev/null 2>&1; then
+    fail "generated-directory cleanup accepted a nested out-of-scope directory"
+fi
+fake_root="$work/cleanup-fake-root"
+mkdir -p "$fake_root/build/victim"
+printf '%s\n' keep > "$fake_root/build/victim/evidence.txt"
+symlink_fixture="$fake_root/build/u14-cleanup-probe.loop"
+ln -s "$fake_root/build" "$symlink_fixture"
+if PATH="$fallback_bin" /bin/sh -c \
+    '. "$1"; release_remove_generated_directory "$2" "$3"' \
+    sh "$script_dir/release-common.sh" "$fake_root" "$symlink_fixture/" \
+    > "$work/trailing-symlink-cleanup.log" 2>&1; then
+    fail "generated-directory cleanup accepted a trailing-slash symlink"
+fi
+[ -f "$fake_root/build/victim/evidence.txt" ] \
+    || fail "trailing-slash symlink probe deleted the fake build victim"
+echo "probe passed: anchored cleanup fallback without trash"
 
 expect_failure() {
     label=$1
@@ -82,7 +125,11 @@ expect_failure dirty-signed-refusal 'requires a clean git tree' \
     env -u MACOS_DEVELOPER_ID_APPLICATION \
     "$script_dir/build-app.sh" --configuration Release --prepare-signing \
     --tag v0.1.0 --build-number 1
-trash "$dirty_marker"
+if command -v trash >/dev/null 2>&1; then
+    trash "$dirty_marker"
+else
+    rm -f "$dirty_marker"
+fi
 
 checksum_dmg="$work/Checksum Fixture.dmg"
 checksum_sidecar="$checksum_dmg.sha256"
