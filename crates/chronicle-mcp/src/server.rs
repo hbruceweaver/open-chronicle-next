@@ -21,7 +21,8 @@ use crate::artifact_tools::{
     CreateArtifactParams, PreparedArtifactWrite, PreparedStatusWrite, ReviseArtifactParams,
     SetArtifactStatusParams,
 };
-use crate::logging::McpServerError;
+use crate::limits::SafeInput;
+use crate::logging::{McpServerError, structured_result};
 use crate::read_tools::{
     ArtifactParams, ChunkParams, CompareParams, ContextPacketParams, CurrentContextParams,
     EventParams, ListArtifactsParams, ListChunksParams, MomentParams, SearchParams,
@@ -105,11 +106,27 @@ impl ChronicleMcp {
     async fn query(&self, operation: QueryOperation) -> CallToolResult {
         match self.query_response(operation).await {
             Ok(response) => match serde_json::to_value(response) {
-                Ok(value) => CallToolResult::structured(value),
+                Ok(value) => structured_result(value, false),
                 Err(_) => McpServerError::Worker.tool_result(),
             },
             Err(error) => error.tool_result(),
         }
+    }
+
+    async fn query_input<T, F>(&self, input: SafeInput<T>, operation: F) -> CallToolResult
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(T) -> Result<QueryOperation, McpServerError>,
+    {
+        let params = match input.parse() {
+            Ok(params) => params,
+            Err(error) => return error.tool_result(),
+        };
+        let operation = match operation(params) {
+            Ok(operation) => operation,
+            Err(error) => return error.tool_result(),
+        };
+        self.query(operation).await
     }
 
     async fn query_response(
@@ -165,7 +182,7 @@ impl ChronicleMcp {
         let server = self.clone();
         match tokio::task::spawn_blocking(move || server.write_prepared_blocking(prepared)).await {
             Ok(Ok(response)) => match serde_json::to_value(response) {
-                Ok(value) => CallToolResult::structured(value),
+                Ok(value) => structured_result(value, false),
                 Err(_) => McpServerError::Worker.tool_result(),
             },
             Ok(Err(error)) => error.tool_result(),
@@ -195,7 +212,7 @@ impl ChronicleMcp {
         let server = self.clone();
         match tokio::task::spawn_blocking(move || server.write_status_blocking(prepared)).await {
             Ok(Ok(response)) => match serde_json::to_value(response) {
-                Ok(value) => CallToolResult::structured(value),
+                Ok(value) => structured_result(value, false),
                 Err(_) => McpServerError::Worker.tool_result(),
             },
             Ok(Err(error)) => error.tool_result(),
@@ -260,14 +277,6 @@ impl ChronicleMcp {
         }
     }
 
-    fn invalid_input(error: McpServerError) -> ErrorData {
-        let message = match error {
-            McpServerError::InvalidInput(message) => message,
-            _ => "invalid tool input".to_owned(),
-        };
-        ErrorData::invalid_params(message, None)
-    }
-
     fn resource_error(error: McpServerError) -> ErrorData {
         ErrorData::internal_error(
             error.caller_message(),
@@ -280,7 +289,7 @@ impl ChronicleMcp {
 impl ChronicleMcp {
     #[tool(
         name = "chronicle_status",
-        description = "Read grant-bounded recording and projection status. Returns facts and provenance only.",
+        description = "Read grant-bounded historical evidence availability and projection freshness. This does not report whether capture is currently active.",
         annotations(
             title = "Chronicle status",
             read_only_hint = true,
@@ -306,11 +315,9 @@ impl ChronicleMcp {
     )]
     pub async fn list_chunks(
         &self,
-        Parameters(params): Parameters<ListChunksParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<ListChunksParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, ListChunksParams::operation).await
     }
 
     #[tool(
@@ -326,11 +333,9 @@ impl ChronicleMcp {
     )]
     pub async fn get_chunk(
         &self,
-        Parameters(params): Parameters<ChunkParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.read_operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<ChunkParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, ChunkParams::read_operation).await
     }
 
     #[tool(
@@ -346,16 +351,14 @@ impl ChronicleMcp {
     )]
     pub async fn get_event(
         &self,
-        Parameters(params): Parameters<EventParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<EventParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, EventParams::operation).await
     }
 
     #[tool(
         name = "chronicle_search",
-        description = "Search grant-visible factual activity. OCR search requires both an explicit parameter and an OCR disclosure grant.",
+        description = "Search grant-visible factual activity through the OCR index. An OCR disclosure grant is always required; include_ocr controls whether matching OCR text is returned.",
         annotations(
             title = "Search Chronicle evidence",
             read_only_hint = true,
@@ -366,11 +369,9 @@ impl ChronicleMcp {
     )]
     pub async fn search(
         &self,
-        Parameters(params): Parameters<SearchParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<SearchParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, SearchParams::operation).await
     }
 
     #[tool(
@@ -386,11 +387,9 @@ impl ChronicleMcp {
     )]
     pub async fn inspect_moment(
         &self,
-        Parameters(params): Parameters<MomentParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<MomentParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, MomentParams::operation).await
     }
 
     #[tool(
@@ -406,11 +405,9 @@ impl ChronicleMcp {
     )]
     pub async fn statistics(
         &self,
-        Parameters(params): Parameters<StatisticsParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<StatisticsParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, StatisticsParams::operation).await
     }
 
     #[tool(
@@ -426,11 +423,9 @@ impl ChronicleMcp {
     )]
     pub async fn compare_periods(
         &self,
-        Parameters(params): Parameters<CompareParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<CompareParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, CompareParams::operation).await
     }
 
     #[tool(
@@ -446,11 +441,10 @@ impl ChronicleMcp {
     )]
     pub async fn supporting_evidence(
         &self,
-        Parameters(params): Parameters<SupportingEvidenceParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<SupportingEvidenceParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, SupportingEvidenceParams::operation)
+            .await
     }
 
     #[tool(
@@ -466,11 +460,10 @@ impl ChronicleMcp {
     )]
     pub async fn context_packet(
         &self,
-        Parameters(params): Parameters<ContextPacketParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<ContextPacketParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, ContextPacketParams::operation)
+            .await
     }
 
     #[tool(
@@ -486,11 +479,10 @@ impl ChronicleMcp {
     )]
     pub async fn current_context(
         &self,
-        Parameters(params): Parameters<CurrentContextParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation(Utc::now()).map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<CurrentContextParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, |params| params.operation(Utc::now()))
+            .await
     }
 
     #[tool(
@@ -506,11 +498,10 @@ impl ChronicleMcp {
     )]
     pub async fn list_artifacts(
         &self,
-        Parameters(params): Parameters<ListArtifactsParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<ListArtifactsParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, ListArtifactsParams::operation)
+            .await
     }
 
     #[tool(
@@ -526,11 +517,9 @@ impl ChronicleMcp {
     )]
     pub async fn get_artifact(
         &self,
-        Parameters(params): Parameters<ArtifactParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(self
-            .query(params.operation().map_err(Self::invalid_input)?)
-            .await)
+        Parameters(params): Parameters<SafeInput<ArtifactParams>>,
+    ) -> CallToolResult {
+        self.query_input(params, ArtifactParams::operation).await
     }
 
     #[tool(
@@ -546,12 +535,17 @@ impl ChronicleMcp {
     )]
     pub async fn create_artifact(
         &self,
-        Parameters(params): Parameters<CreateArtifactParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let prepared = params
-            .prepare(&self.config.client_id)
-            .map_err(Self::invalid_input)?;
-        Ok(self.write_prepared(prepared).await)
+        Parameters(params): Parameters<SafeInput<CreateArtifactParams>>,
+    ) -> CallToolResult {
+        let params = match params.parse() {
+            Ok(params) => params,
+            Err(error) => return error.tool_result(),
+        };
+        let prepared = match params.prepare(&self.config.client_id) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.tool_result(),
+        };
+        self.write_prepared(prepared).await
     }
 
     #[tool(
@@ -567,12 +561,17 @@ impl ChronicleMcp {
     )]
     pub async fn revise_artifact(
         &self,
-        Parameters(params): Parameters<ReviseArtifactParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let prepared = params
-            .prepare(&self.config.client_id)
-            .map_err(Self::invalid_input)?;
-        Ok(self.write_prepared(prepared).await)
+        Parameters(params): Parameters<SafeInput<ReviseArtifactParams>>,
+    ) -> CallToolResult {
+        let params = match params.parse() {
+            Ok(params) => params,
+            Err(error) => return error.tool_result(),
+        };
+        let prepared = match params.prepare(&self.config.client_id) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.tool_result(),
+        };
+        self.write_prepared(prepared).await
     }
 
     #[tool(
@@ -588,12 +587,17 @@ impl ChronicleMcp {
     )]
     pub async fn set_artifact_status(
         &self,
-        Parameters(params): Parameters<SetArtifactStatusParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let prepared = params
-            .prepare(&self.config.client_id)
-            .map_err(Self::invalid_input)?;
-        Ok(self.write_status(prepared).await)
+        Parameters(params): Parameters<SafeInput<SetArtifactStatusParams>>,
+    ) -> CallToolResult {
+        let params = match params.parse() {
+            Ok(params) => params,
+            Err(error) => return error.tool_result(),
+        };
+        let prepared = match params.prepare(&self.config.client_id) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.tool_result(),
+        };
+        self.write_status(prepared).await
     }
 }
 

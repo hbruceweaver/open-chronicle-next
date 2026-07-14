@@ -9,6 +9,7 @@ pub use artifact_tools::{
     ArtifactAuthorKindParam, ArtifactAuthorParams, ArtifactStatusParam, ArtifactTypeParam,
     CreateArtifactParams, EvidenceReferenceParams, ReviseArtifactParams, SetArtifactStatusParams,
 };
+pub use limits::SafeInput;
 pub use logging::McpServerError;
 pub use read_tools::{
     ActivityFilterParams, ArtifactParams, ChunkParams, CompareParams, ContextPacketParams,

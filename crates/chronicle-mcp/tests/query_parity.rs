@@ -5,14 +5,13 @@ use std::error::Error;
 use chronicle_mcp::{
     ActivityFilterParams, ListChunksParams, RangeParams, SearchParams, StatisticsParams,
 };
-use rmcp::handler::server::wrapper::Parameters;
 
 #[tokio::test]
 async fn search_result_matches_the_language_neutral_u2_golden() -> Result<(), Box<dyn Error>> {
     let fixture = common::fixture_server()?;
     let result = fixture
         .server
-        .search(Parameters(SearchParams {
+        .search(common::parameters(SearchParams {
             filter: ActivityFilterParams {
                 range: RangeParams {
                     start: "2026-07-13T09:00:00Z".to_owned(),
@@ -28,7 +27,7 @@ async fn search_result_matches_the_language_neutral_u2_golden() -> Result<(), Bo
             cursor: None,
             limit: 20,
         }))
-        .await?;
+        .await;
     assert_eq!(result.is_error, Some(false));
     let actual = result
         .structured_content
@@ -60,18 +59,18 @@ async fn chunks_and_statistics_match_language_neutral_u2_goldens() -> Result<(),
     };
     let chunks = fixture
         .server
-        .list_chunks(Parameters(ListChunksParams {
+        .list_chunks(common::parameters(ListChunksParams {
             filter: filter(),
             cursor: None,
             limit: 20,
         }))
-        .await?
+        .await
         .structured_content
         .ok_or("missing chunks")?;
     let statistics = fixture
         .server
-        .statistics(Parameters(StatisticsParams { filter: filter() }))
-        .await?
+        .statistics(common::parameters(StatisticsParams { filter: filter() }))
+        .await
         .structured_content
         .ok_or("missing statistics")?;
     let expected: serde_json::Value =

@@ -6,10 +6,17 @@ use chronicle_domain::{ChunkRevision, DisclosureGrant, EventEnvelope, GrantTimeS
 use chronicle_engine::SharedService;
 use chronicle_mcp::{ChronicleMcp, ServerConfig};
 use chronicle_store::{CanonicalJournal, FaultInjector, ManagedRoot, Projector, SqliteStore};
+use rmcp::handler::server::wrapper::Parameters;
 
 pub struct TestServer {
     pub _temporary: tempfile::TempDir,
     pub server: ChronicleMcp,
+}
+
+pub fn parameters<T: serde::de::DeserializeOwned>(
+    value: T,
+) -> Parameters<chronicle_mcp::SafeInput<T>> {
+    Parameters(chronicle_mcp::SafeInput::trusted(value))
 }
 
 pub fn empty_server(client: &str, grant: &str) -> Result<TestServer, Box<dyn Error>> {
@@ -24,14 +31,11 @@ pub fn empty_server(client: &str, grant: &str) -> Result<TestServer, Box<dyn Err
 }
 
 pub fn fixture_server() -> Result<TestServer, Box<dyn Error>> {
-    let packet: serde_json::Value = serde_json::from_str(&fixture("queries.json")?)?;
-    let grant: DisclosureGrant = serde_json::from_value(packet["grant"].clone())?;
-    seeded_fixture_server(grant)
+    seeded_fixture_server(fixture_grant()?)
 }
 
 pub fn fixture_server_for_writes() -> Result<TestServer, Box<dyn Error>> {
-    let packet: serde_json::Value = serde_json::from_str(&fixture("queries.json")?)?;
-    let mut grant: DisclosureGrant = serde_json::from_value(packet["grant"].clone())?;
+    let mut grant = fixture_grant()?;
     let now = chrono::Utc::now();
     grant.time_scope = GrantTimeScope::Absolute {
         range: UtcRange {
@@ -43,7 +47,12 @@ pub fn fixture_server_for_writes() -> Result<TestServer, Box<dyn Error>> {
     seeded_fixture_server(grant)
 }
 
-fn seeded_fixture_server(grant: DisclosureGrant) -> Result<TestServer, Box<dyn Error>> {
+pub fn fixture_grant() -> Result<DisclosureGrant, Box<dyn Error>> {
+    let packet: serde_json::Value = serde_json::from_str(&fixture("queries.json")?)?;
+    Ok(serde_json::from_value(packet["grant"].clone())?)
+}
+
+pub fn seeded_fixture_server(grant: DisclosureGrant) -> Result<TestServer, Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root_path = temporary.path().join("store");
     let root = ManagedRoot::initialize(&root_path)?;

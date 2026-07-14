@@ -46,26 +46,29 @@ network calls, model calls, screenshot bytes, and filesystem paths.
 
 | URI | MIME type | Purpose |
 | --- | --- | --- |
-| `chronicle://status/v1` | `application/json` | Grant-bounded recording and projection status |
-| `chronicle://schemas/event/v1` | `text/markdown` | Factual event contract |
-| `chronicle://schemas/chunk/v1` | `text/markdown` | Five-minute chunk contract |
-| `chronicle://schemas/derived-artifact/v1` | `text/markdown` | Separate analysis contract |
-| `chronicle://schemas/query/v1` | `text/markdown` | Query envelope and result contract |
+| `chronicle://status/v1` | `application/json` | Grant-bounded historical evidence availability and projection freshness |
+| `chronicle://schemas/event/v1` | `application/schema+json` | Factual event contract |
+| `chronicle://schemas/chunk/v1` | `application/schema+json` | Five-minute chunk contract |
+| `chronicle://schemas/derived-artifact/v1` | `application/schema+json` | Separate analysis contract |
+| `chronicle://schemas/query/v1` | `application/schema+json` | Query envelope and result contract |
+| `chronicle://schemas/shared-service/v1` | `application/schema+json` | Shared health/query/write/export transport and safe MCP error contract |
 
-Resource listing is descriptive. Reading any resource requires the registered active
-grant. Schema reads perform a metadata-granted schema query first; status returns the
-same inner `QueryResponse` shape as `chronicle_status`.
+Reading any resource requires the registered active grant. Schema reads perform a
+metadata-granted schema query first and return executable Draft 2020-12 JSON Schema;
+the shared-service schema resolves its sibling references against the other schema
+resources. Status returns the same inner `QueryResponse` shape as
+`chronicle_status`.
 
 ## Factual read tools
 
 | Tool | Purpose |
 | --- | --- |
-| `chronicle_status` | Recording, projection, study, and grant-visible health |
+| `chronicle_status` | Historical evidence availability and projection freshness; not current capture lifecycle |
 | `chronicle_get_current_context` | Context for the last fully completed five-minute UTC bucket |
 | `chronicle_list_chunks` | Paged factual chunk summaries for a UTC range/filter |
 | `chronicle_get_chunk` | One complete chunk and opaque image lifecycle metadata |
 | `chronicle_get_event` | One factual event; OCR appears only when granted |
-| `chronicle_search` | Bounded factual search; OCR is separately opt-in and grant-gated |
+| `chronicle_search` | Bounded OCR-index search; OCR permission is always required, while `include_ocr` controls returned OCR text |
 | `chronicle_inspect_moment` | Evidence bucket containing one UTC instant |
 | `chronicle_statistics` | Factual durations, coverage, gaps, apps, and transitions |
 | `chronicle_compare_periods` | Factual comparison of two authorized UTC ranges |
@@ -78,6 +81,10 @@ All input objects reject unknown fields. Page size must be 1 through 100 and rem
 subject to the grant's lower limit. Explicit time ranges use inclusive-start,
 exclusive-end RFC 3339 UTC timestamps. The current-context convenience tool never
 presents an in-progress bucket as settled evidence.
+
+Status deliberately reports `has_recorded_evidence`, `projection_current`, and the
+latest projected timestamp. Current pause state, capture permission, and study expiry
+belong to the app lifecycle/health surface and are not inferred by MCP.
 
 Read tools are annotated read-only and closed-world. Their idempotency hint is false
 because each successful disclosure has a new receipt/request identity and consumes
@@ -114,6 +121,11 @@ versioned inner `DerivedArtifactWriteResponse`. Results include the effective gr
 scope/capabilities, stable cutoff, coverage/gaps where applicable, opaque IDs,
 pagination/truncation, and provenance.
 
+Successful and failed tool calls use `structuredContent` only; the text `content`
+array is empty. This prevents JSON from being duplicated below the engine's charged
+response boundary. The real-stdio suite asserts that the complete serialized MCP
+result remains within the disclosure bytes charged by the engine.
+
 Tool failures use a structured, content-free body:
 
 ```json
@@ -143,4 +155,8 @@ initialization over stdio, verifies the exact tool/resource inventory, reads a
 grant-gated schema, calls status, checks stderr isolation, and shuts down cleanly.
 The Rust suite additionally covers language-neutral chunk/search/statistics parity,
 unknown fields, bounds, no-grant leakage, dangling evidence, exact retry, immutable
-revision/status behavior, and concurrent expected-prior conflicts.
+revision/status behavior, sanitized malformed inputs, transport-level byte accounting,
+and two real MCP child processes racing reads and immutable revisions while an app
+writer projects canonical evidence. Post-race checks compare exact canonical and
+SQLite identities, the one-tip artifact chain, SQLite integrity/foreign keys, chunk
+count, and stale-generation rejection.

@@ -47,6 +47,23 @@ fn initialization_and_tool_inventory_are_restrictive() -> Result<(), Box<dyn Err
             "chronicle_supporting_evidence",
         ]
     );
+    let list_chunks_schema = tools
+        .iter()
+        .find(|tool| tool.name == "chronicle_list_chunks")
+        .ok_or("list chunks tool missing")?
+        .input_schema
+        .as_ref();
+    assert_eq!(
+        list_chunks_schema.get("additionalProperties"),
+        Some(&serde_json::Value::Bool(false)),
+        "safe raw decoding must not weaken the published typed schema"
+    );
+    assert!(
+        list_chunks_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|properties| properties.contains_key("filter"))
+    );
     let retry_safe_writes = ["chronicle_create_artifact", "chronicle_revise_artifact"];
     let status_write = "chronicle_set_artifact_status";
     for tool in &tools {

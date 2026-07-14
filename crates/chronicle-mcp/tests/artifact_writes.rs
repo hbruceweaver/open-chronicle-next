@@ -6,7 +6,6 @@ use chronicle_mcp::{
     ArtifactAuthorKindParam, ArtifactAuthorParams, ArtifactStatusParam, ArtifactTypeParam,
     CreateArtifactParams, EvidenceReferenceParams, ReviseArtifactParams, SetArtifactStatusParams,
 };
-use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
 
 fn model_author() -> ArtifactAuthorParams {
@@ -43,8 +42,8 @@ async fn create_revise_and_status_append_immutable_evidence_linked_revisions()
     };
     let first = fixture
         .server
-        .create_artifact(Parameters(create.clone()))
-        .await?;
+        .create_artifact(common::parameters(create.clone()))
+        .await;
     assert_eq!(
         first.is_error,
         Some(false),
@@ -58,7 +57,10 @@ async fn create_revise_and_status_append_immutable_evidence_linked_revisions()
         "client-codex-synthetic"
     );
 
-    let retry = fixture.server.create_artifact(Parameters(create)).await?;
+    let retry = fixture
+        .server
+        .create_artifact(common::parameters(create))
+        .await;
     assert_eq!(retry.is_error, Some(false));
     let retry = retry.structured_content.ok_or("missing retry result")?;
     assert_eq!(retry["artifact"], first["artifact"]);
@@ -69,7 +71,7 @@ async fn create_revise_and_status_append_immutable_evidence_linked_revisions()
 
     let revised = fixture
         .server
-        .revise_artifact(Parameters(ReviseArtifactParams {
+        .revise_artifact(common::parameters(ReviseArtifactParams {
             request_id: "mcp-revise-artifact-001".to_owned(),
             artifact_id: "mcp-artifact-001".to_owned(),
             revision_id: "mcp-artifact-revision-002".to_owned(),
@@ -81,14 +83,14 @@ async fn create_revise_and_status_append_immutable_evidence_linked_revisions()
             evidence: evidence(),
             confidence: Some(0.8),
         }))
-        .await?;
+        .await;
     assert_eq!(revised.is_error, Some(false));
     let revised = revised.structured_content.ok_or("missing revise result")?;
     assert_eq!(revised["artifact"]["status"], "accepted");
 
     let status = fixture
         .server
-        .set_artifact_status(Parameters(SetArtifactStatusParams {
+        .set_artifact_status(common::parameters(SetArtifactStatusParams {
             request_id: "mcp-status-artifact-001".to_owned(),
             artifact_id: "mcp-artifact-001".to_owned(),
             revision_id: "mcp-artifact-revision-003".to_owned(),
@@ -96,7 +98,7 @@ async fn create_revise_and_status_append_immutable_evidence_linked_revisions()
             author: model_author(),
             status: ArtifactStatusParam::Superseded,
         }))
-        .await?;
+        .await;
     assert_eq!(status.is_error, Some(false));
     let status = status.structured_content.ok_or("missing status result")?;
     assert_eq!(status["artifact"]["status"], "superseded");
@@ -117,7 +119,7 @@ async fn artifact_write_rejects_unbound_author_and_dangling_evidence() -> Result
     let fixture = common::fixture_server_for_writes()?;
     let invalid_author = fixture
         .server
-        .create_artifact(Parameters(CreateArtifactParams {
+        .create_artifact(common::parameters(CreateArtifactParams {
             request_id: "mcp-create-invalid-author".to_owned(),
             artifact_id: "mcp-invalid-author".to_owned(),
             revision_id: "mcp-invalid-author-revision".to_owned(),
@@ -132,11 +134,17 @@ async fn artifact_write_rejects_unbound_author_and_dangling_evidence() -> Result
             confidence: None,
         }))
         .await;
-    assert!(invalid_author.is_err());
+    assert_eq!(invalid_author.is_error, Some(true));
+    assert_eq!(
+        invalid_author
+            .structured_content
+            .ok_or("missing invalid input")?["error"]["code"],
+        "invalid-input"
+    );
 
     let dangling = fixture
         .server
-        .create_artifact(Parameters(CreateArtifactParams {
+        .create_artifact(common::parameters(CreateArtifactParams {
             request_id: "mcp-create-dangling".to_owned(),
             artifact_id: "mcp-dangling".to_owned(),
             revision_id: "mcp-dangling-revision".to_owned(),
@@ -149,7 +157,7 @@ async fn artifact_write_rejects_unbound_author_and_dangling_evidence() -> Result
             },
             confidence: None,
         }))
-        .await?;
+        .await;
     assert_eq!(dangling.is_error, Some(true));
     assert_eq!(
         dangling.structured_content.ok_or("missing error")?["error"]["code"],

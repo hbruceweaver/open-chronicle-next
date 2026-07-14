@@ -149,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "jsonschema",
+ "referencing",
  "serde",
  "serde_json",
  "sha2",

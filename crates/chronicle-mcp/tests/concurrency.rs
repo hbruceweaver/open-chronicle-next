@@ -7,7 +7,6 @@ use chronicle_mcp::{
     ChronicleMcp, CreateArtifactParams, EvidenceReferenceParams, ReviseArtifactParams,
     ServerConfig,
 };
-use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
 
 fn author() -> ArtifactAuthorParams {
@@ -31,7 +30,7 @@ async fn two_servers_revising_one_expected_prior_have_exactly_one_winner()
     let fixture = common::fixture_server_for_writes()?;
     let created = fixture
         .server
-        .create_artifact(Parameters(CreateArtifactParams {
+        .create_artifact(common::parameters(CreateArtifactParams {
             request_id: "race-create-request".to_owned(),
             artifact_id: "race-artifact".to_owned(),
             revision_id: "race-base".to_owned(),
@@ -41,7 +40,7 @@ async fn two_servers_revising_one_expected_prior_have_exactly_one_winner()
             evidence: evidence(),
             confidence: Some(0.5),
         }))
-        .await?;
+        .await;
     assert_eq!(created.is_error, Some(false));
 
     let second = ChronicleMcp::new(ServerConfig::new(
@@ -68,10 +67,12 @@ async fn two_servers_revising_one_expected_prior_have_exactly_one_winner()
         ..first_revision.clone()
     };
     let (first, second_result) = tokio::join!(
-        fixture.server.revise_artifact(Parameters(first_revision)),
-        second.revise_artifact(Parameters(second_revision))
+        fixture
+            .server
+            .revise_artifact(common::parameters(first_revision)),
+        second.revise_artifact(common::parameters(second_revision))
     );
-    let results = [first?, second_result?];
+    let results = [first, second_result];
     assert_eq!(
         results
             .iter()

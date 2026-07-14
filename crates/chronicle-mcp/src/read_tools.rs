@@ -118,7 +118,8 @@ impl EventParams {
 pub struct SearchParams {
     pub filter: ActivityFilterParams,
     pub query: String,
-    /// Full OCR is excluded unless both this flag and the disclosure grant allow it.
+    /// Search always uses the grant-gated OCR index. This flag controls whether
+    /// matching OCR text may be returned in the result.
     #[serde(default)]
     pub include_ocr: bool,
     pub cursor: Option<String>,

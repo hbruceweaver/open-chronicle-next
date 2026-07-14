@@ -63,14 +63,27 @@ impl McpServerError {
     }
 
     pub fn tool_result(&self) -> CallToolResult {
-        CallToolResult::structured_error(json!({
+        structured_result(
+            json!({
             "schema_version": "1.0",
             "error": {
                 "code": self.code(),
                 "message": self.caller_message(),
             }
-        }))
+            }),
+            true,
+        )
     }
+}
+
+pub fn structured_result(value: serde_json::Value, is_error: bool) -> CallToolResult {
+    let mut result = if is_error {
+        CallToolResult::structured_error(value)
+    } else {
+        CallToolResult::structured(value)
+    };
+    result.content.clear();
+    result
 }
 
 fn service_code(error: &SharedServiceError) -> &'static str {

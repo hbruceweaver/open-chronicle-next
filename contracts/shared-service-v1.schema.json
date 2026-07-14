@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openchronicle.dev/contracts/shared-service-v1.schema.json",
+  "title": "Open Chronicle shared service transport v1",
+  "description": "Language-neutral outer transport for health, factual query, immutable derived writes, and bounded exports. Sibling $refs are published as separate MCP schema resources.",
+  "oneOf": [
+    {"$ref": "#/$defs/request"},
+    {"$ref": "#/$defs/response"},
+    {"$ref": "#/$defs/mcpError"}
+  ],
+  "$defs": {
+    "version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "id": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^(?!.*\\.\\.)[A-Za-z0-9_.:-]+$"},
+    "dateTime": {"type": "string", "format": "date-time"},
+    "nullableDateTime": {"oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]},
+    "request": {
+      "type": "object",
+      "required": ["schema_version", "request_id", "store_generation", "operation"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "request_id": {"$ref": "#/$defs/id"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "operation": {"$ref": "#/$defs/operation"}
+      },
+      "additionalProperties": true
+    },
+    "operation": {
+      "oneOf": [
+        {"type": "object", "required": ["type"], "properties": {"type": {"const": "health"}}, "additionalProperties": false},
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "query"}, "data": {"$ref": "query-v1.schema.json#/$defs/request"}}, "additionalProperties": false},
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "write-derived"}, "data": {"$ref": "#/$defs/writeRequest"}}, "additionalProperties": false},
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "export"}, "data": {"$ref": "#/$defs/exportRequest"}}, "additionalProperties": false}
+      ]
+    },
+    "response": {
+      "type": "object",
+      "required": ["schema_version", "request_id", "generated_at", "store_generation", "result"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "request_id": {"$ref": "#/$defs/id"},
+        "generated_at": {"$ref": "#/$defs/dateTime"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "result": {"$ref": "#/$defs/result"}
+      },
+      "additionalProperties": true
+    },
+    "result": {
+      "oneOf": [
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "health"}, "data": {"$ref": "#/$defs/health"}}, "additionalProperties": false},
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "query"}, "data": {"$ref": "query-v1.schema.json#/$defs/response"}}, "additionalProperties": false},
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "derived-written"}, "data": {"$ref": "#/$defs/writeResponse"}}, "additionalProperties": false},
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "export"}, "data": {"$ref": "#/$defs/exportResponse"}}, "additionalProperties": false}
+      ]
+    },
+    "writeRequest": {
+      "type": "object",
+      "required": ["schema_version", "request_id", "client_id", "grant_id", "store_generation", "revision"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "request_id": {"$ref": "#/$defs/id"},
+        "client_id": {"$ref": "#/$defs/id"},
+        "grant_id": {"$ref": "#/$defs/id"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "revision": {"$ref": "derived-artifact-v1.schema.json"}
+      },
+      "additionalProperties": true
+    },
+    "writeResponse": {
+      "type": "object",
+      "required": ["schema_version", "request_id", "generated_at", "store_generation", "grant", "artifact"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "request_id": {"$ref": "#/$defs/id"},
+        "generated_at": {"$ref": "#/$defs/dateTime"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "grant": {"$ref": "query-v1.schema.json#/$defs/grantSummary"},
+        "artifact": {"$ref": "query-v1.schema.json#/$defs/queryArtifact"}
+      },
+      "additionalProperties": true
+    },
+    "exportRequest": {
+      "type": "object",
+      "required": ["schema_version", "request_id", "client_id", "grant_id", "store_generation", "range", "include_ocr", "include_derived", "format", "max_bytes"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "request_id": {"$ref": "#/$defs/id"},
+        "client_id": {"$ref": "#/$defs/id"},
+        "grant_id": {"$ref": "#/$defs/id"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "range": {"$ref": "query-v1.schema.json#/$defs/utcRange"},
+        "include_ocr": {"type": "boolean"},
+        "include_derived": {"type": "boolean"},
+        "format": {"enum": ["json", "markdown"]},
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 4194304}
+      },
+      "additionalProperties": true
+    },
+    "exportResponse": {
+      "type": "object",
+      "required": ["schema_version", "request_id", "generated_at", "store_generation", "grant", "manifest", "payload"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "request_id": {"$ref": "#/$defs/id"},
+        "generated_at": {"$ref": "#/$defs/dateTime"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "grant": {"$ref": "query-v1.schema.json#/$defs/grantSummary"},
+        "manifest": {"$ref": "#/$defs/exportManifest"},
+        "payload": {"$ref": "#/$defs/exportPayload"}
+      },
+      "additionalProperties": true
+    },
+    "counts": {
+      "type": "object",
+      "required": ["events", "chunks", "artifacts"],
+      "properties": {"events": {"type": "integer", "minimum": 0}, "chunks": {"type": "integer", "minimum": 0}, "artifacts": {"type": "integer", "minimum": 0}},
+      "additionalProperties": false
+    },
+    "journalCutoff": {
+      "type": "object",
+      "required": ["family", "shard", "byte_offset"],
+      "properties": {"family": {"type": "string", "minLength": 1}, "shard": {"type": "string", "minLength": 1}, "byte_offset": {"type": "integer", "minimum": 0}},
+      "additionalProperties": false
+    },
+    "checksum": {
+      "type": "object",
+      "required": ["component", "sha256"],
+      "properties": {"component": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+      "additionalProperties": false
+    },
+    "exportManifest": {
+      "type": "object",
+      "required": ["schema_version", "range", "stable_cutoff", "store_generation", "included_counts", "available_counts", "included_content_classes", "excluded_content_classes", "journal_cutoffs", "checksums", "coverage", "truncated"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "range": {"$ref": "query-v1.schema.json#/$defs/utcRange"},
+        "stable_cutoff": {"$ref": "#/$defs/dateTime"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "included_counts": {"$ref": "#/$defs/counts"},
+        "available_counts": {"$ref": "#/$defs/counts"},
+        "included_content_classes": {"type": "array", "uniqueItems": true, "items": {"enum": ["metadata", "ocr", "derived", "screenshots"]}},
+        "excluded_content_classes": {"type": "array", "uniqueItems": true, "items": {"enum": ["metadata", "ocr", "derived", "screenshots"]}},
+        "journal_cutoffs": {"type": "array", "items": {"$ref": "#/$defs/journalCutoff"}},
+        "checksums": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/checksum"}},
+        "coverage": {"$ref": "query-v1.schema.json#/$defs/coverage"},
+        "truncated": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "exportPayload": {
+      "oneOf": [
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "json"}, "data": {"type": "object", "required": ["events", "chunks", "artifacts"], "properties": {"events": {"type": "array", "items": {"$ref": "query-v1.schema.json#/$defs/queryEvent"}}, "chunks": {"type": "array", "items": {"$ref": "chunk-v1.schema.json"}}, "artifacts": {"type": "array", "items": {"$ref": "query-v1.schema.json#/$defs/queryArtifact"}}}, "additionalProperties": false}}, "additionalProperties": false},
+        {"type": "object", "required": ["type", "data"], "properties": {"type": {"const": "markdown"}, "data": {"type": "object", "required": ["document"], "properties": {"document": {"type": "string", "minLength": 1}}, "additionalProperties": false}}, "additionalProperties": false}
+      ]
+    },
+    "healthTimes": {
+      "type": "object",
+      "required": ["last_scheduled_attempt_at", "last_successful_capture_at", "last_successful_ocr_at", "last_journal_at", "last_projection_at", "last_chunk_at"],
+      "properties": {"last_scheduled_attempt_at": {"$ref": "#/$defs/nullableDateTime"}, "last_successful_capture_at": {"$ref": "#/$defs/nullableDateTime"}, "last_successful_ocr_at": {"$ref": "#/$defs/nullableDateTime"}, "last_journal_at": {"$ref": "#/$defs/nullableDateTime"}, "last_projection_at": {"$ref": "#/$defs/nullableDateTime"}, "last_chunk_at": {"$ref": "#/$defs/nullableDateTime"}},
+      "additionalProperties": false
+    },
+    "studyHealth": {
+      "type": "object",
+      "required": ["state", "start", "end", "expired_at"],
+      "properties": {"state": {"enum": ["personal", "scheduled", "active", "expired"]}, "start": {"$ref": "#/$defs/nullableDateTime"}, "end": {"$ref": "#/$defs/nullableDateTime"}, "expired_at": {"$ref": "#/$defs/nullableDateTime"}},
+      "additionalProperties": false
+    },
+    "health": {
+      "type": "object",
+      "required": ["schema_version", "observed_at", "store_generation", "projection", "acknowledgement", "latest", "aggregation_watermark", "aggregation_pending_buckets", "projection_lag_seconds", "projection_pending_records", "storage", "study", "screenshot_retention", "mcp", "issues"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/version"},
+        "observed_at": {"$ref": "#/$defs/dateTime"},
+        "store_generation": {"type": "integer", "minimum": 1},
+        "projection": {"enum": ["current", "lagging", "rebuilding", "blocked"]},
+        "acknowledgement": {"enum": ["durable", "journal-durable-projection-pending", "not-durable"]},
+        "latest": {"$ref": "#/$defs/healthTimes"},
+        "aggregation_watermark": {"$ref": "#/$defs/nullableDateTime"},
+        "aggregation_pending_buckets": {"type": "integer", "minimum": 0},
+        "projection_lag_seconds": {"type": "integer", "minimum": 0},
+        "projection_pending_records": {"type": "integer", "minimum": 0},
+        "storage": {"type": "object", "required": ["managed_bytes", "available_bytes"], "properties": {"managed_bytes": {"type": "integer", "minimum": 0}, "available_bytes": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+        "study": {"$ref": "#/$defs/studyHealth"},
+        "screenshot_retention": {"type": "object", "required": ["write_pending", "retained", "delete_pending", "expired", "user_deleted", "missing", "write_failed", "next_expiry_at"], "properties": {"write_pending": {"type": "integer", "minimum": 0}, "retained": {"type": "integer", "minimum": 0}, "delete_pending": {"type": "integer", "minimum": 0}, "expired": {"type": "integer", "minimum": 0}, "user_deleted": {"type": "integer", "minimum": 0}, "missing": {"type": "integer", "minimum": 0}, "write_failed": {"type": "integer", "minimum": 0}, "next_expiry_at": {"$ref": "#/$defs/nullableDateTime"}}, "additionalProperties": false},
+        "mcp": {"type": "object", "required": ["active_grants", "revoked_grants", "expired_grants", "exhausted_grants", "stale_generation_grants"], "properties": {"active_grants": {"type": "integer", "minimum": 0}, "revoked_grants": {"type": "integer", "minimum": 0}, "expired_grants": {"type": "integer", "minimum": 0}, "exhausted_grants": {"type": "integer", "minimum": 0}, "stale_generation_grants": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+        "issues": {"type": "array", "items": {"type": "object", "required": ["severity", "code"], "properties": {"severity": {"enum": ["info", "warning", "critical"]}, "code": {"enum": ["healthy", "projection-lag", "storage-unavailable", "corrupt-canonical-record", "permission-denied", "capture-unavailable", "study-expired"]}}, "additionalProperties": false}}
+      },
+      "additionalProperties": true
+    },
+    "mcpError": {
+      "type": "object",
+      "required": ["schema_version", "error"],
+      "properties": {"schema_version": {"$ref": "#/$defs/version"}, "error": {"type": "object", "required": ["code", "message"], "properties": {"code": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1}}, "additionalProperties": false}},
+      "additionalProperties": false
+    }
+  }
+}

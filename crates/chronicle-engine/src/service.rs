@@ -16,8 +16,8 @@ use chronicle_domain::{
 use chronicle_store::{
     ActivitySearch, ArtifactStore, FactualStatistics, FaultInjector, GrantQuerySession,
     GrantReceiptStore, LockManager, ManagedRoot, SqliteStore, StableExportBuilder,
-    StableSnapshotSelection, StoreError, StoreGeneration, StoreQueries, storage_available_bytes,
-    storage_health_summary, store_health_metrics,
+    StableSnapshotSelection, StoreError, StoreGeneration, StoreQueries, storage_health_summary,
+    store_health_metrics,
 };
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
@@ -699,9 +699,7 @@ impl SharedService {
                 let metrics =
                     store_health_metrics(&self.root, &self.sqlite, now).map_err(map_store)?;
                 Ok(ExecutedQuery::unpaged(QueryResult::Status(QueryStatus {
-                    recording_available: storage_available_bytes(&self.root).map_err(map_store)?
-                        > 0
-                        && metrics.latest.last_scheduled_attempt_at.is_some(),
+                    has_recorded_evidence: metrics.latest.last_scheduled_attempt_at.is_some(),
                     projection_current: metrics.projection_pending_records == 0,
                     latest_recorded_at: metrics.latest.last_projection_at,
                 })))

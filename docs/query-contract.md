@@ -20,11 +20,10 @@ or mutates canonical events or chunks.
 - Every agent query, including status and schema discovery, requires an active
   per-client grant.
 
-The U5 schema-discovery result enumerates every published JSON contract available
-at this layer: event v1, chunk v1, derived-artifact v1, and query v1. The outer
-shared-service/write/export envelope is already a typed and validated Rust contract,
-but U5b does not advertise a JSON schema that does not yet exist. U12 owns publishing
-that transport contract as an MCP schema resource alongside these four contracts.
+The U5 schema-discovery result enumerates its four domain contracts: event v1, chunk
+v1, derived-artifact v1, and query v1. U12 additionally publishes the typed outer
+shared-service/write/export transport as executable Draft 2020-12 JSON Schema through
+the MCP resource catalog, alongside those four domain schemas.
 
 The shared service implements status, schema discovery, chunk listing/detail, event detail,
 OCR search, moment inspection, statistics, period comparison, and supporting

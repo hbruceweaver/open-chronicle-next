@@ -324,7 +324,10 @@ impl QueryCoverage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryStatus {
-    pub recording_available: bool,
+    /// True when the canonical store contains evidence from at least one
+    /// completed recording attempt. This is historical availability, not a
+    /// claim that capture is currently active.
+    pub has_recorded_evidence: bool,
     pub projection_current: bool,
     pub latest_recorded_at: Option<DateTime<Utc>>,
 }
