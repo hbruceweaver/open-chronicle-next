@@ -8,8 +8,10 @@ use chronicle_domain::{
 
 use crate::checksum::canonical_json;
 use crate::{
-    CanonicalJournal, FaultInjector, FaultPoint, LockManager, ManagedRoot, Projector, Result,
-    StoreError, StoreGeneration,
+    CanonicalJournal, FaultInjector, FaultPoint, LockManager, ManagedRoot, Projector,
+    QuerySnapshotGuard, Result, ScreenshotGuard, ScreenshotStorageHealth, ScreenshotStorageLimits,
+    SharedStoreGuard, StorageAvailableBytesProbe, StoreError, StoreGeneration,
+    screenshot_storage_health_locked, storage_available_bytes,
 };
 
 const MAX_ARTIFACT_DIRECTORIES: usize = 10_000;
@@ -171,6 +173,8 @@ pub struct ScreenshotStore {
     pub(crate) projector: Projector,
     pub(crate) locks: LockManager,
     pub(crate) generation: StoreGeneration,
+    storage_limits: ScreenshotStorageLimits,
+    storage_available_bytes: StorageAvailableBytesProbe,
 }
 
 impl ScreenshotStore {
@@ -182,7 +186,30 @@ impl ScreenshotStore {
             journal,
             projector,
             generation,
+            storage_limits: ScreenshotStorageLimits::default(),
+            storage_available_bytes,
         })
+    }
+
+    pub fn with_storage_limits(mut self, limits: ScreenshotStorageLimits) -> Result<Self> {
+        self.storage_limits = limits.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_storage_available_bytes_probe(mut self, probe: StorageAvailableBytesProbe) -> Self {
+        self.storage_available_bytes = probe;
+        self
+    }
+
+    pub fn storage_health(&self) -> Result<ScreenshotStorageHealth> {
+        let shared = self.locks.shared_request()?;
+        self.generation.ensure_current(&self.root)?;
+        let _screenshots = shared.screenshots()?;
+        screenshot_storage_health_locked(
+            &self.root,
+            self.storage_limits,
+            self.storage_available_bytes,
+        )
     }
 
     pub fn retain(
@@ -192,10 +219,19 @@ impl ScreenshotStore {
         completion: &EventEnvelope,
         faults: FaultInjector,
     ) -> Result<()> {
+        self.prepare_retain(observation, encoded_image, completion)?
+            .commit(faults)
+    }
+
+    pub fn prepare_retain<'a>(
+        &'a self,
+        observation: &'a EventEnvelope,
+        encoded_image: &'a [u8],
+        completion: &'a EventEnvelope,
+    ) -> Result<PreparedScreenshotRetention<'a>> {
         let _shared = self.locks.shared_request()?;
         self.generation.ensure_current(&self.root)?;
         let _screenshots = _shared.screenshots()?;
-        let _snapshot = self.locks.query_snapshot()?;
         observation.validate().map_err(|reason| {
             StoreError::Contract(chronicle_domain::ContractError::Validation(reason))
         })?;
@@ -272,33 +308,93 @@ impl ScreenshotStore {
                 id: lifecycle.artifact_id.to_string(),
             });
         }
-        self.root.atomic_write(&provisional, encoded_image)?;
+        let candidate_bytes = u64::try_from(encoded_image.len()).map_err(|_| {
+            StoreError::InvalidPath("encoded screenshot length does not fit u64".to_owned())
+        })?;
+        screenshot_storage_health_locked(
+            &self.root,
+            self.storage_limits,
+            self.storage_available_bytes,
+        )?
+        .ensure_candidate_fits(candidate_bytes)?;
+        Ok(PreparedScreenshotRetention {
+            store: self,
+            observation,
+            encoded_image,
+            completion,
+            final_path,
+            provisional,
+            _shared,
+            _screenshots,
+        })
+    }
+
+    pub fn storage_limits(&self) -> ScreenshotStorageLimits {
+        self.storage_limits
+    }
+
+    pub fn set_storage_limits(&mut self, limits: ScreenshotStorageLimits) -> Result<()> {
+        self.storage_limits = limits.validate()?;
+        Ok(())
+    }
+
+    pub fn storage_available_bytes_probe(&self) -> StorageAvailableBytesProbe {
+        self.storage_available_bytes
+    }
+
+    pub fn set_storage_available_bytes_probe(&mut self, probe: StorageAvailableBytesProbe) {
+        self.storage_available_bytes = probe;
+    }
+}
+
+pub struct PreparedScreenshotRetention<'a> {
+    store: &'a ScreenshotStore,
+    observation: &'a EventEnvelope,
+    encoded_image: &'a [u8],
+    completion: &'a EventEnvelope,
+    final_path: String,
+    provisional: String,
+    _shared: SharedStoreGuard,
+    _screenshots: ScreenshotGuard,
+}
+
+impl PreparedScreenshotRetention<'_> {
+    pub fn commit(self, faults: FaultInjector) -> Result<()> {
+        let _snapshot: QuerySnapshotGuard = self.store.locks.query_snapshot()?;
+        self.store
+            .root
+            .atomic_write(&self.provisional, self.encoded_image)?;
         if let Err(error) = faults.check(FaultPoint::AfterProvisionalImageSync) {
-            self.root.unlink(&provisional)?;
+            self.store.root.unlink(&self.provisional)?;
             return Err(error);
         }
-        let observation_record = match self.journal.append_event(observation, faults) {
+        let observation_record = match self.store.journal.append_event(self.observation, faults) {
             Ok(record) => record,
             Err(error) => {
-                self.root.unlink(&provisional)?;
+                self.store.root.unlink(&self.provisional)?;
                 return Err(error);
             }
         };
         faults.check(FaultPoint::AfterObservationAppend)?;
-        self.root
-            .rename_with_boundary(&provisional, &final_path, || {
+        self.store
+            .root
+            .rename_with_boundary(&self.provisional, &self.final_path, || {
                 faults.check(FaultPoint::AfterImagePromotion)
             })?;
         faults.check(FaultPoint::AfterImagePromotionDirectorySync)?;
-        let lifecycle_record = self.journal.append_event(completion, faults)?;
+        let lifecycle_record = self.store.journal.append_event(self.completion, faults)?;
         faults.check(FaultPoint::AfterLifecycleCompletion)?;
-        self.projector
+        self.store
+            .projector
             .project_record(&observation_record, FaultInjector::none())?;
-        self.projector
+        self.store
+            .projector
             .project_record(&lifecycle_record, FaultInjector::none())?;
         Ok(())
     }
+}
 
+impl ScreenshotStore {
     pub fn delete(
         &self,
         request: &EventEnvelope,

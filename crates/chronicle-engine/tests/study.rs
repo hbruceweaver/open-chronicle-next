@@ -8,7 +8,10 @@ use chronicle_engine::{
     CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator, SharedService,
     StartupReconcileRequest, StudyBoundary,
 };
-use chronicle_store::{FaultInjector, FaultPoint, ManagedRoot, SqliteStore, StoreError};
+use chronicle_store::{
+    CanonicalJournal, FaultInjector, FaultPoint, JournalFamily, ManagedRoot,
+    ScreenshotStorageLimits, SqliteStore, StoreError,
+};
 use chrono::{DateTime, Utc};
 
 fn at(value: &str) -> DateTime<Utc> {
@@ -278,6 +281,113 @@ fn retained_image_acknowledgement_requires_lifecycle_completion()
         },
         at("2026-07-13T09:00:46Z"),
     )?;
+    Ok(())
+}
+
+#[test]
+fn storage_budget_rejection_does_not_consume_cadence_or_create_heartbeat_intent()
+-> Result<(), Box<dyn std::error::Error>> {
+    fn fixed_available(_: &ManagedRoot) -> chronicle_store::Result<u64> {
+        Ok(64 * 1024 * 1024)
+    }
+
+    let (temporary, mut coordinator) = coordinator()?;
+    coordinator.set_screenshot_storage_available_bytes_probe(fixed_available);
+    let blocked_limits = ScreenshotStorageLimits {
+        warning_free_bytes: 32 * 1024 * 1024,
+        minimum_free_bytes: 16 * 1024 * 1024,
+        managed_image_quota_bytes: 8,
+        journal_reserve_bytes: 4 * 1024 * 1024,
+    };
+    coordinator.set_screenshot_storage_limits(blocked_limits)?;
+    let events = common::fixture_events("events.jsonl")?;
+    let image = b"synthetic-image-bytes";
+    let root = ManagedRoot::initialize(temporary.path().join("store"))?;
+    let config_before = root.read("config.json")?;
+    assert!(matches!(
+        coordinator.retain_screenshot(
+            &events[0],
+            image,
+            &events[1],
+            stamp(1),
+            at("2026-07-13T09:00:17Z"),
+            FaultInjector::none(),
+        ),
+        Err(EngineError::Store(StoreError::ScreenshotImageQuota { .. }))
+    ));
+
+    assert_eq!(root.read("config.json")?, config_before);
+    let config: serde_json::Value = serde_json::from_slice(&root.read("config.json")?)?;
+    assert!(config.get("heartbeat_acknowledgement_intent").is_none());
+    assert!(
+        CanonicalJournal::new(root.clone())
+            .scan_all(JournalFamily::Events, false)?
+            .records
+            .is_empty()
+    );
+
+    coordinator.set_screenshot_storage_limits(ScreenshotStorageLimits {
+        managed_image_quota_bytes: 100,
+        ..blocked_limits
+    })?;
+    let acknowledgement = coordinator.retain_screenshot(
+        &events[0],
+        image,
+        &events[1],
+        stamp(1),
+        at("2026-07-13T09:00:17Z"),
+        FaultInjector::none(),
+    )?;
+    assert_eq!(
+        acknowledgement.acknowledgement,
+        DurableAcknowledgement::Durable
+    );
+    coordinator.set_screenshot_storage_limits(ScreenshotStorageLimits {
+        managed_image_quota_bytes: image.len() as u64,
+        ..blocked_limits
+    })?;
+    let admission = coordinator.capture_admission(at("2026-07-13T09:00:18Z"))?;
+    assert!(!admission.allowed);
+    assert_eq!(
+        admission.reason,
+        chronicle_engine::CaptureAdmissionReason::StorageImageQuota
+    );
+    assert_eq!(
+        CanonicalJournal::new(root)
+            .scan_all(JournalFamily::Events, false)?
+            .records
+            .len(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn capture_admission_warns_without_blocking_and_blocks_below_the_floor()
+-> Result<(), Box<dyn std::error::Error>> {
+    fn warning_space(_: &ManagedRoot) -> chronicle_store::Result<u64> {
+        Ok(3 * 1024 * 1024 * 1024)
+    }
+    fn blocked_space(_: &ManagedRoot) -> chronicle_store::Result<u64> {
+        Ok(2 * 1024 * 1024 * 1024 - 1)
+    }
+
+    let (_temporary, mut coordinator) = coordinator()?;
+    coordinator.set_screenshot_storage_available_bytes_probe(warning_space);
+    let warning = coordinator.capture_admission(at("2026-07-13T09:00:01Z"))?;
+    assert!(warning.allowed);
+    assert_eq!(
+        warning.reason,
+        chronicle_engine::CaptureAdmissionReason::Allowed
+    );
+
+    coordinator.set_screenshot_storage_available_bytes_probe(blocked_space);
+    let blocked = coordinator.capture_admission(at("2026-07-13T09:00:02Z"))?;
+    assert!(!blocked.allowed);
+    assert_eq!(
+        blocked.reason,
+        chronicle_engine::CaptureAdmissionReason::StorageFreeSpace
+    );
     Ok(())
 }
 

@@ -83,6 +83,14 @@ fn diagnostic_health_contract_has_no_user_content_fields() {
     ] {
         assert!(!json.contains(forbidden), "health leaked {forbidden}");
     }
+    let value = serde_json::to_value(&health).expect("serialize health value");
+    let storage = value["storage"]
+        .as_object()
+        .expect("shared storage health object");
+    assert_eq!(
+        storage.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["available_bytes", "managed_bytes"]
+    );
 }
 
 #[test]

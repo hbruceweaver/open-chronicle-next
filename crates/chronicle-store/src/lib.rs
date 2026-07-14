@@ -17,6 +17,7 @@ pub mod retention;
 pub mod search;
 pub mod sqlite;
 pub mod statistics;
+pub mod storage;
 
 use std::io;
 
@@ -41,6 +42,7 @@ pub use retention::*;
 pub use search::*;
 pub use sqlite::*;
 pub use statistics::*;
+pub use storage::*;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -68,6 +70,21 @@ pub enum StoreError {
     LockTimeout(String),
     #[error("another Open Chronicle application process owns capture")]
     CaptureOwnerActive,
+    #[error(
+        "screenshot transaction requires {required_bytes} available bytes but found {available_bytes}"
+    )]
+    ScreenshotFreeSpace {
+        available_bytes: u64,
+        required_bytes: u64,
+    },
+    #[error(
+        "screenshot transaction would add {candidate_bytes} bytes to {managed_image_bytes} managed image bytes above quota {quota_bytes}"
+    )]
+    ScreenshotImageQuota {
+        managed_image_bytes: u64,
+        candidate_bytes: u64,
+        quota_bytes: u64,
+    },
     #[error("stable ID {id} was replayed with different canonical bytes")]
     StableIdConflict { id: String },
     #[error("artifact expected prior revision conflict")]

@@ -97,6 +97,15 @@ impl FfiError {
         )
     }
 
+    fn retryable(status: ChronicleStatus, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
     fn response(&self) -> Value {
         json!({
             "schema_version": ABI_SCHEMA_VERSION,
@@ -118,6 +127,16 @@ impl From<StoreError> for FfiError {
                 ChronicleStatus::CaptureOwnerActive,
                 "capture-owner-active",
                 "another Open Chronicle application process owns capture",
+            ),
+            StoreError::ScreenshotFreeSpace { .. } => Self::retryable(
+                ChronicleStatus::Io,
+                "screenshot-free-space",
+                "available storage cannot preserve the screenshot transaction floor",
+            ),
+            StoreError::ScreenshotImageQuota { .. } => Self::retryable(
+                ChronicleStatus::Io,
+                "screenshot-image-quota",
+                "the managed screenshot quota would be exceeded",
             ),
             StoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Self::new(
                 ChronicleStatus::NotFound,
@@ -465,6 +484,7 @@ struct CallRequest {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum AppControl {
     RuntimeState,
+    StorageHealth,
     SetRecordingPreference {
         enabled: bool,
     },
@@ -627,6 +647,11 @@ impl CoreHandle {
             AppControl::RuntimeState => serialize_value(
                 self.coordinator
                     .runtime_state(now)
+                    .map_err(FfiError::from)?,
+            ),
+            AppControl::StorageHealth => serialize_value(
+                self.coordinator
+                    .screenshot_storage_health()
                     .map_err(FfiError::from)?,
             ),
             AppControl::SetRecordingPreference { enabled } => self
@@ -1398,7 +1423,54 @@ mod tests {
         assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
         assert_eq!(response["result"]["recording_preference"], false);
         assert_eq!(response["result"]["cadence"], "sixty-seconds");
+
+        let private_operation_as_shared = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:00:01Z",
+            "request": {
+                "schema_version": "1.0",
+                "request_id": "req-private-storage-control",
+                "store_generation": generation,
+                "operation": { "type": "storage-health" }
+            }
+        });
+        let (status, response) = call_raw(
+            handle,
+            &serde_json::to_vec(&private_operation_as_shared).expect("encode private operation"),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{response}");
+        assert!(response.get("result").is_none());
         let _ = close(handle);
+    }
+
+    #[test]
+    fn screenshot_storage_errors_are_typed_retryable_and_never_acknowledged() {
+        for (error, code) in [
+            (
+                StoreError::ScreenshotFreeSpace {
+                    available_bytes: 1,
+                    required_bytes: 2,
+                },
+                "screenshot-free-space",
+            ),
+            (
+                StoreError::ScreenshotImageQuota {
+                    managed_image_bytes: 20,
+                    candidate_bytes: 1,
+                    quota_bytes: 20,
+                },
+                "screenshot-image-quota",
+            ),
+        ] {
+            let error = FfiError::from(error);
+            assert_eq!(error.status, ChronicleStatus::Io);
+            let response = error.response();
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["error"]["code"], code);
+            assert_eq!(response["error"]["retryable"], true);
+            assert!(response.get("result").is_none());
+            assert!(response.get("acknowledgement").is_none());
+        }
     }
 
     #[test]
@@ -1464,6 +1536,26 @@ mod tests {
         assert_eq!(status, ChronicleStatus::Ok as u32, "{state}");
         assert_eq!(state["result"]["recording_preference"], true);
         assert_eq!(state["result"]["cadence"], "thirty-seconds");
+
+        let (status, storage) = control(
+            handle,
+            "2026-07-13T09:30:04Z",
+            json!({ "type": "storage-health" }),
+        );
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{storage}");
+        assert_eq!(storage["result"]["managed_image_bytes"], 0);
+        assert_eq!(
+            storage["result"]["warning_free_bytes"],
+            4 * 1024 * 1024 * 1024_u64
+        );
+        assert_eq!(
+            storage["result"]["minimum_free_bytes"],
+            2 * 1024 * 1024 * 1024_u64
+        );
+        assert_eq!(
+            storage["result"]["managed_image_quota_bytes"],
+            20 * 1024 * 1024 * 1024_u64
+        );
 
         let (status, response) = control(
             handle,

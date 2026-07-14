@@ -60,6 +60,8 @@ pub enum CaptureAdmissionReason {
     UserPaused,
     StudyNotStarted,
     StudyExpired,
+    StorageFreeSpace,
+    StorageImageQuota,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

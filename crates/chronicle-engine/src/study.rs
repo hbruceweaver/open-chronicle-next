@@ -352,10 +352,25 @@ impl RecordingCoordinator {
             });
         }
         match self.study.require_capture(now) {
-            Ok(()) => Ok(CaptureAdmission {
-                allowed: true,
-                reason: CaptureAdmissionReason::Allowed,
-            }),
+            Ok(()) => {
+                let storage = self.screenshots.storage_health()?;
+                let reason = match storage.state {
+                    chronicle_store::ScreenshotStorageState::BlockedFreeSpace => {
+                        CaptureAdmissionReason::StorageFreeSpace
+                    }
+                    chronicle_store::ScreenshotStorageState::BlockedImageQuota => {
+                        CaptureAdmissionReason::StorageImageQuota
+                    }
+                    chronicle_store::ScreenshotStorageState::Healthy
+                    | chronicle_store::ScreenshotStorageState::Warning => {
+                        CaptureAdmissionReason::Allowed
+                    }
+                };
+                Ok(CaptureAdmission {
+                    allowed: reason == CaptureAdmissionReason::Allowed,
+                    reason,
+                })
+            }
             Err(EngineError::StudyNotStarted) => Ok(CaptureAdmission {
                 allowed: false,
                 reason: CaptureAdmissionReason::StudyNotStarted,
@@ -550,6 +565,9 @@ impl RecordingCoordinator {
         .ok_or_else(|| {
             EngineError::Configuration("retained observation has no image intent".to_owned())
         })?;
+        let retention = self
+            .screenshots
+            .prepare_retain(observation, encoded_image, completion)?;
         let heartbeat_intent = self.runtime.prepare_heartbeat_intent(vec![
             HeartbeatAcknowledgementProof::new(
                 observation.event_id.clone(),
@@ -559,8 +577,7 @@ impl RecordingCoordinator {
         ])?;
         self.ingest
             .prepare_transactional_image(observation, &cadence)?;
-        self.screenshots
-            .retain(observation, encoded_image, completion, faults)?;
+        retention.commit(faults)?;
         self.runtime.resolve_heartbeat_intent(
             &heartbeat_intent,
             std::slice::from_ref(&completion.event_id),
@@ -588,15 +605,39 @@ impl RecordingCoordinator {
     ) -> Result<chronicle_store::RecoveryReport> {
         let report = self.ingest.recover_projection(now)?;
         let sqlite = SqliteStore::open(self.root.clone())?;
+        let storage_limits = self.screenshots.storage_limits();
+        let storage_available_bytes = self.screenshots.storage_available_bytes_probe();
         self.screenshots = ScreenshotStore::new(
             self.root.clone(),
             CanonicalJournal::new(self.root.clone()),
             Projector::new(sqlite),
-        )?;
+        )?
+        .with_storage_limits(storage_limits)?
+        .with_storage_available_bytes_probe(storage_available_bytes);
         let _ = self
             .ingest
             .reconcile_transactional_image(now, FaultInjector::none())?;
         Ok(report)
+    }
+
+    pub fn screenshot_storage_health(&self) -> Result<chronicle_store::ScreenshotStorageHealth> {
+        self.screenshots.storage_health().map_err(Into::into)
+    }
+
+    pub fn set_screenshot_storage_limits(
+        &mut self,
+        limits: chronicle_store::ScreenshotStorageLimits,
+    ) -> Result<()> {
+        self.screenshots
+            .set_storage_limits(limits)
+            .map_err(Into::into)
+    }
+
+    pub fn set_screenshot_storage_available_bytes_probe(
+        &mut self,
+        probe: chronicle_store::StorageAvailableBytesProbe,
+    ) {
+        self.screenshots.set_storage_available_bytes_probe(probe);
     }
 
     fn reconcile_heartbeat_intent(&mut self) -> Result<()> {
