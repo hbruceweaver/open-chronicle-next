@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use chronicle_domain::{ChunkRevision, DisclosureGrant, EventEnvelope};
+use chronicle_domain::{ChunkRevision, DisclosureGrant, EventEnvelope, GrantTimeScope, UtcRange};
 use chronicle_engine::SharedService;
 use chronicle_mcp::{ChronicleMcp, ServerConfig};
 use chronicle_store::{CanonicalJournal, FaultInjector, ManagedRoot, Projector, SqliteStore};
@@ -24,6 +24,26 @@ pub fn empty_server(client: &str, grant: &str) -> Result<TestServer, Box<dyn Err
 }
 
 pub fn fixture_server() -> Result<TestServer, Box<dyn Error>> {
+    let packet: serde_json::Value = serde_json::from_str(&fixture("queries.json")?)?;
+    let grant: DisclosureGrant = serde_json::from_value(packet["grant"].clone())?;
+    seeded_fixture_server(grant)
+}
+
+pub fn fixture_server_for_writes() -> Result<TestServer, Box<dyn Error>> {
+    let packet: serde_json::Value = serde_json::from_str(&fixture("queries.json")?)?;
+    let mut grant: DisclosureGrant = serde_json::from_value(packet["grant"].clone())?;
+    let now = chrono::Utc::now();
+    grant.time_scope = GrantTimeScope::Absolute {
+        range: UtcRange {
+            start: "2026-07-13T09:00:00Z".parse()?,
+            end: now + chrono::Duration::hours(1),
+        },
+    };
+    grant.expires_at = now + chrono::Duration::hours(1);
+    seeded_fixture_server(grant)
+}
+
+fn seeded_fixture_server(grant: DisclosureGrant) -> Result<TestServer, Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root_path = temporary.path().join("store");
     let root = ManagedRoot::initialize(&root_path)?;
@@ -46,8 +66,6 @@ pub fn fixture_server() -> Result<TestServer, Box<dyn Error>> {
         let record = journal.append_chunk(&chunk, FaultInjector::none())?;
         projector.project_record(&record, FaultInjector::none())?;
     }
-    let packet: serde_json::Value = serde_json::from_str(&fixture("queries.json")?)?;
-    let grant: DisclosureGrant = serde_json::from_value(packet["grant"].clone())?;
     SharedService::open(root, sqlite)?.install_grant(grant)?;
     let config = ServerConfig::new(root_path, "client-codex-synthetic", "grant-synthetic")?;
     Ok(TestServer {

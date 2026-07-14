@@ -31,6 +31,7 @@ fn initialization_and_tool_inventory_are_restrictive() -> Result<(), Box<dyn Err
         vec![
             "chronicle_compare_periods",
             "chronicle_context_packet",
+            "chronicle_create_artifact",
             "chronicle_get_artifact",
             "chronicle_get_chunk",
             "chronicle_get_current_context",
@@ -38,17 +39,25 @@ fn initialization_and_tool_inventory_are_restrictive() -> Result<(), Box<dyn Err
             "chronicle_inspect_moment",
             "chronicle_list_artifacts",
             "chronicle_list_chunks",
+            "chronicle_revise_artifact",
             "chronicle_search",
+            "chronicle_set_artifact_status",
             "chronicle_statistics",
             "chronicle_status",
             "chronicle_supporting_evidence",
         ]
     );
+    let retry_safe_writes = ["chronicle_create_artifact", "chronicle_revise_artifact"];
+    let status_write = "chronicle_set_artifact_status";
     for tool in &tools {
         let annotations = tool.annotations.as_ref().ok_or("missing annotations")?;
-        assert_eq!(annotations.read_only_hint, Some(true));
+        let write = retry_safe_writes.contains(&tool.name.as_ref()) || tool.name == status_write;
+        assert_eq!(annotations.read_only_hint, Some(!write));
         assert_eq!(annotations.destructive_hint, Some(false));
-        assert_eq!(annotations.idempotent_hint, Some(false));
+        assert_eq!(
+            annotations.idempotent_hint,
+            Some(retry_safe_writes.contains(&tool.name.as_ref()))
+        );
         assert_eq!(annotations.open_world_hint, Some(false));
     }
     let serialized = serde_json::to_string(&tools)?;

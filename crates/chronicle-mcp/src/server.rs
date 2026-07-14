@@ -2,8 +2,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use chronicle_domain::{
-    ClientId, GrantId, QueryOperation, QueryRequest, QueryResponse, RequestId,
-    SharedServiceOperation, SharedServiceRequest, SharedServiceResult,
+    ClientId, DerivedArtifactWriteRequest, DerivedArtifactWriteResponse, GrantId, QueryOperation,
+    QueryRequest, QueryResponse, QueryResult, RequestId, SharedServiceOperation,
+    SharedServiceRequest, SharedServiceResult,
 };
 use chronicle_engine::SharedService;
 use chrono::Utc;
@@ -16,6 +17,10 @@ use rmcp::model::{
 use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use uuid::Uuid;
 
+use crate::artifact_tools::{
+    CreateArtifactParams, PreparedArtifactWrite, PreparedStatusWrite, ReviseArtifactParams,
+    SetArtifactStatusParams,
+};
 use crate::logging::McpServerError;
 use crate::read_tools::{
     ArtifactParams, ChunkParams, CompareParams, ContextPacketParams, CurrentContextParams,
@@ -122,6 +127,16 @@ impl ChronicleMcp {
         let service =
             SharedService::open_path(&self.config.managed_root).map_err(McpServerError::Service)?;
         let generation = service.store_generation();
+        self.query_with_service(&service, generation, operation, Utc::now())
+    }
+
+    fn query_with_service(
+        &self,
+        service: &SharedService,
+        generation: u64,
+        operation: QueryOperation,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<QueryResponse, McpServerError> {
         let request_id = RequestId::new(format!("mcp-{}", Uuid::now_v7()))
             .map_err(|_| McpServerError::Worker)?;
         let request = SharedServiceRequest {
@@ -138,10 +153,109 @@ impl ChronicleMcp {
             })),
         };
         let response = service
-            .execute(request, Utc::now())
+            .execute(request, now)
             .map_err(McpServerError::Service)?;
         match response.result {
             SharedServiceResult::Query(response) => Ok(*response),
+            _ => Err(McpServerError::Worker),
+        }
+    }
+
+    async fn write_prepared(&self, prepared: PreparedArtifactWrite) -> CallToolResult {
+        let server = self.clone();
+        match tokio::task::spawn_blocking(move || server.write_prepared_blocking(prepared)).await {
+            Ok(Ok(response)) => match serde_json::to_value(response) {
+                Ok(value) => CallToolResult::structured(value),
+                Err(_) => McpServerError::Worker.tool_result(),
+            },
+            Ok(Err(error)) => error.tool_result(),
+            Err(_) => McpServerError::Worker.tool_result(),
+        }
+    }
+
+    fn write_prepared_blocking(
+        &self,
+        prepared: PreparedArtifactWrite,
+    ) -> Result<DerivedArtifactWriteResponse, McpServerError> {
+        let service =
+            SharedService::open_path(&self.config.managed_root).map_err(McpServerError::Service)?;
+        let generation = service.store_generation();
+        let now = Utc::now();
+        let request_id = prepared.request_id.clone();
+        self.write_revision(
+            &service,
+            generation,
+            request_id,
+            prepared.revision(generation, now),
+            now,
+        )
+    }
+
+    async fn write_status(&self, prepared: PreparedStatusWrite) -> CallToolResult {
+        let server = self.clone();
+        match tokio::task::spawn_blocking(move || server.write_status_blocking(prepared)).await {
+            Ok(Ok(response)) => match serde_json::to_value(response) {
+                Ok(value) => CallToolResult::structured(value),
+                Err(_) => McpServerError::Worker.tool_result(),
+            },
+            Ok(Err(error)) => error.tool_result(),
+            Err(_) => McpServerError::Worker.tool_result(),
+        }
+    }
+
+    fn write_status_blocking(
+        &self,
+        prepared: PreparedStatusWrite,
+    ) -> Result<DerivedArtifactWriteResponse, McpServerError> {
+        let service =
+            SharedService::open_path(&self.config.managed_root).map_err(McpServerError::Service)?;
+        let generation = service.store_generation();
+        let now = Utc::now();
+        let query = self.query_with_service(
+            &service,
+            generation,
+            QueryOperation::GetArtifact {
+                artifact_id: prepared.artifact_id.clone(),
+                revision_id: Some(prepared.expected_prior_revision_id.clone()),
+            },
+            now,
+        )?;
+        let QueryResult::Artifact { artifact } = query.result else {
+            return Err(McpServerError::Worker);
+        };
+        let request_id = prepared.request_id.clone();
+        let revision = prepared.revision(*artifact, generation, now)?;
+        self.write_revision(&service, generation, request_id, revision, now)
+    }
+
+    fn write_revision(
+        &self,
+        service: &SharedService,
+        generation: u64,
+        request_id: RequestId,
+        revision: chronicle_domain::DerivedArtifactRevision,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<DerivedArtifactWriteResponse, McpServerError> {
+        let request = SharedServiceRequest {
+            schema_version: "1.0".to_owned(),
+            request_id: request_id.clone(),
+            store_generation: generation,
+            operation: SharedServiceOperation::WriteDerived(Box::new(
+                DerivedArtifactWriteRequest {
+                    schema_version: "1.0".to_owned(),
+                    request_id,
+                    client_id: self.config.client_id.clone(),
+                    grant_id: self.config.grant_id.clone(),
+                    store_generation: generation,
+                    revision,
+                },
+            )),
+        };
+        let response = service
+            .execute(request, now)
+            .map_err(McpServerError::Service)?;
+        match response.result {
+            SharedServiceResult::DerivedWritten(response) => Ok(*response),
             _ => Err(McpServerError::Worker),
         }
     }
@@ -417,6 +531,69 @@ impl ChronicleMcp {
         Ok(self
             .query(params.operation().map_err(Self::invalid_input)?)
             .await)
+    }
+
+    #[tool(
+        name = "chronicle_create_artifact",
+        description = "Create a draft analysis artifact that remains separate from factual evidence and cites grant-visible evidence IDs.",
+        annotations(
+            title = "Create Chronicle analysis artifact",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn create_artifact(
+        &self,
+        Parameters(params): Parameters<CreateArtifactParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let prepared = params
+            .prepare(&self.config.client_id)
+            .map_err(Self::invalid_input)?;
+        Ok(self.write_prepared(prepared).await)
+    }
+
+    #[tool(
+        name = "chronicle_revise_artifact",
+        description = "Append an immutable analysis revision using an exact expected prior revision and grant-visible evidence IDs.",
+        annotations(
+            title = "Revise Chronicle analysis artifact",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn revise_artifact(
+        &self,
+        Parameters(params): Parameters<ReviseArtifactParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let prepared = params
+            .prepare(&self.config.client_id)
+            .map_err(Self::invalid_input)?;
+        Ok(self.write_prepared(prepared).await)
+    }
+
+    #[tool(
+        name = "chronicle_set_artifact_status",
+        description = "Append a status-only artifact revision while preserving the cited payload and evidence from an exact prior revision.",
+        annotations(
+            title = "Set Chronicle analysis status",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn set_artifact_status(
+        &self,
+        Parameters(params): Parameters<SetArtifactStatusParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let prepared = params
+            .prepare(&self.config.client_id)
+            .map_err(Self::invalid_input)?;
+        Ok(self.write_status(prepared).await)
     }
 }
 
