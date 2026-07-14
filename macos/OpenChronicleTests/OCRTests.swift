@@ -86,7 +86,7 @@ final class OCRTests: XCTestCase {
         let service = VisionOCRService(performer: StubVisionPerformer(
             result: VisionOCRRawResult(
                 requestRevision: 3,
-                observations: [observation(text, x: 0, y: 1)],
+                observations: [observation(text, x: 0, y: 1)]
             )
         ))
 
