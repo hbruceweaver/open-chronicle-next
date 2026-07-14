@@ -70,8 +70,6 @@ jobs:
       MACOS_DEVELOPER_ID_APPLICATION: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION }}
       MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
       MACOS_NOTARY_KEYCHAIN_PROFILE: open-chronicle-release
-      MACOS_SIGNING_KEYCHAIN: ${{ runner.temp }}/open-chronicle-signing.keychain-db
-      MACOS_NOTARY_KEYCHAIN: ${{ runner.temp }}/open-chronicle-notary.keychain-db
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -125,7 +123,7 @@ jobs:
         run: |
           test -n "$KEYCHAIN_PASSWORD"
           certificate="$RUNNER_TEMP/open-chronicle-release.p12"
-          keychain="$MACOS_SIGNING_KEYCHAIN"
+          keychain="$RUNNER_TEMP/open-chronicle-signing.keychain-db"
           destroy_signer() {
             primary_status=$?
             trap - EXIT
@@ -149,6 +147,7 @@ jobs:
           rm -f "$certificate"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
           security list-keychains -d user -s "$keychain"
+          export MACOS_SIGNING_KEYCHAIN="$keychain"
           ./scripts/sign-app.sh
           ./scripts/package-dmg.sh --sign-only
       - name: Materialize notary credential, submit, then destroy credential
@@ -159,7 +158,7 @@ jobs:
           KEYCHAIN_PASSWORD: ${{ secrets.MACOS_BUILD_KEYCHAIN_PASSWORD }}
         run: |
           api_key="$RUNNER_TEMP/open-chronicle-notary-key.p8"
-          keychain="$MACOS_NOTARY_KEYCHAIN"
+          keychain="$RUNNER_TEMP/open-chronicle-notary.keychain-db"
           destroy_notary() {
             cleanup_status=0
             rm -f "$api_key"
@@ -207,7 +206,9 @@ jobs:
           cleanup_failed=0
           certificate="$RUNNER_TEMP/open-chronicle-release.p12"
           api_key="$RUNNER_TEMP/open-chronicle-notary-key.p8"
-          for keychain in "$MACOS_SIGNING_KEYCHAIN" "$MACOS_NOTARY_KEYCHAIN"; do
+          signing_keychain="$RUNNER_TEMP/open-chronicle-signing.keychain-db"
+          notary_keychain="$RUNNER_TEMP/open-chronicle-notary.keychain-db"
+          for keychain in "$signing_keychain" "$notary_keychain"; do
             if [ -e "$keychain" ]; then
               security lock-keychain "$keychain" || cleanup_failed=1
               security delete-keychain "$keychain" || cleanup_failed=1
@@ -216,8 +217,8 @@ jobs:
           rm -f "$certificate" "$api_key"
           test ! -e "$certificate" || cleanup_failed=1
           test ! -e "$api_key" || cleanup_failed=1
-          test ! -e "$MACOS_SIGNING_KEYCHAIN" || cleanup_failed=1
-          test ! -e "$MACOS_NOTARY_KEYCHAIN" || cleanup_failed=1
+          test ! -e "$signing_keychain" || cleanup_failed=1
+          test ! -e "$notary_keychain" || cleanup_failed=1
           exit "$cleanup_failed"
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
