@@ -20,8 +20,19 @@ final class HealthTests: XCTestCase {
         XCTAssertEqual(snapshot.acknowledgement, .durable)
         XCTAssertEqual(snapshot.study.state, .personal)
         XCTAssertGreaterThan(snapshot.storage.availableBytes, 0)
-        XCTAssertEqual(snapshot.screenshotStorage?.state, .healthy)
-        XCTAssertEqual(snapshot.screenshotStorage?.managedImageBytes, 0)
+        let screenshotStorage = try XCTUnwrap(snapshot.screenshotStorage)
+        let expectedScreenshotState: DiagnosticScreenshotStorageState =
+            if screenshotStorage.managedImageBytes >= screenshotStorage.managedImageQuotaBytes {
+                .blockedImageQuota
+            } else if screenshotStorage.availableBytes < screenshotStorage.minimumFreeBytes {
+                .blockedFreeSpace
+            } else if screenshotStorage.availableBytes < screenshotStorage.warningFreeBytes {
+                .warning
+            } else {
+                .healthy
+            }
+        XCTAssertEqual(screenshotStorage.state, expectedScreenshotState)
+        XCTAssertEqual(screenshotStorage.managedImageBytes, 0)
         let encoded = String(decoding: try JSONEncoder().encode(snapshot), as: UTF8.self)
         for forbidden in ["ocr_text", "window_title", "application_name", "screenshot_path"] {
             XCTAssertFalse(encoded.contains(forbidden), "health leaked \(forbidden)")
