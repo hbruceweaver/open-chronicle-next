@@ -5,6 +5,7 @@
   "event_records": 14,
   "chunk_revisions": 2,
   "query_exchanges": 3,
+  "language_neutral_query_results": 2,
   "ae4_interval_centered_attempts": 10,
   "ae13_unchanged_attempts": 10,
   "ae13_seed_records": 2,
@@ -26,6 +27,8 @@
     "ten-unchanged-one-artifact",
     "unchanged-seed-retained-lifecycle",
     "opaque-query-image-reference",
-    "derived-analysis-separation"
+    "derived-analysis-separation",
+    "list-chunks-query-result",
+    "factual-statistics-query-result"
   ]
 }

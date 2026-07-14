@@ -1,0 +1,54 @@
+{
+  "list_chunks": {
+    "type": "chunk-list",
+    "data": {
+      "chunks": [
+        {
+          "chunk_id": "chunk-20260713T0900Z",
+          "revision_id": "chunk-rev-002",
+          "start": "2026-07-13T09:00:00Z",
+          "end": "2026-07-13T09:05:00Z",
+          "evidence_seconds": {
+            "captured": 150,
+            "protected": 30,
+            "paused": 0,
+            "unavailable": 30,
+            "error": 0,
+            "gap": 90
+          },
+          "presence_seconds": {
+            "active": 90,
+            "idle": 30,
+            "unknown": 30
+          },
+          "late_input": true
+        }
+      ]
+    }
+  },
+  "statistics": {
+    "type": "statistics",
+    "data": {
+      "factual_totals": [
+        {
+          "dimension": "application",
+          "key": "com.example.chat",
+          "estimated_seconds": 30,
+          "supporting_chunk_ids": ["chunk-20260713T0900Z"]
+        },
+        {
+          "dimension": "application",
+          "key": "com.example.mail",
+          "estimated_seconds": 30,
+          "supporting_chunk_ids": ["chunk-20260713T0900Z"]
+        },
+        {
+          "dimension": "application",
+          "key": "com.example.writer",
+          "estimated_seconds": 60,
+          "supporting_chunk_ids": ["chunk-20260713T0900Z"]
+        }
+      ]
+    }
+  }
+}
