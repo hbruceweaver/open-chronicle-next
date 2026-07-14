@@ -75,6 +75,32 @@ final class AgentDetectionTests: XCTestCase {
         XCTAssertEqual(installations.first { $0.kind == .claudeCode }?.support, .unsupported)
     }
 
+    func testOnboardingSetupModelScansOnceAndPublishesConnectionOutcome() async throws {
+        let installation = AgentInstallation(
+            kind: .codex,
+            executableURL: URL(fileURLWithPath: "/usr/local/bin/codex"),
+            applicationURL: nil,
+            version: "codex-cli fixture",
+            support: .supported,
+            alternateExecutableURLs: []
+        )
+        let detector = StubAgentDetector(installations: [installation])
+        let model = AgentSetupModel(detector: detector) { selected in
+            XCTAssertEqual(selected, installation)
+            return .guidedDesktop
+        }
+
+        await model.scanIfNeeded()
+        await model.scanIfNeeded()
+        await model.connect(installation)
+
+        XCTAssertEqual(model.installations, [installation])
+        XCTAssertEqual(model.outcomes[.codex], .guidedDesktop)
+        XCTAssertEqual(detector.calls, 1)
+        XCTAssertTrue(model.hasScanned)
+        XCTAssertFalse(model.isScanning)
+    }
+
     private func makeExecutable(_ url: URL) throws {
         try Data("fixture".utf8).write(to: url)
         try FileManager.default.setAttributes(
@@ -818,6 +844,21 @@ private final class StubAgentApplicationLocator: AgentApplicationLocating {
 
     func applicationURL(bundleIdentifier: String) -> URL? {
         applications[bundleIdentifier]
+    }
+}
+
+@MainActor
+private final class StubAgentDetector: AgentDetecting {
+    let installations: [AgentInstallation]
+    private(set) var calls = 0
+
+    init(installations: [AgentInstallation]) {
+        self.installations = installations
+    }
+
+    func detect() -> [AgentInstallation] {
+        calls += 1
+        return installations
     }
 }
 

@@ -190,27 +190,6 @@ private struct LoginStep: View {
     }
 }
 
-private struct AgentStep: View {
-    @ObservedObject var model: OnboardingModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("AI access is optional")
-                .font(.largeTitle.weight(.semibold))
-            Text(
-                "Recording and reports work without Claude or Codex. When you connect an AI client, "
-                    + "Open Chronicle will require a time-limited disclosure grant before returning OCR or event details."
-            )
-            .foregroundStyle(.secondary)
-            Toggle("Finish recording setup now; connect an AI client later", isOn: $model.draft.deferAgentSetup)
-                .toggleStyle(.checkbox)
-            Text("No global agent configuration is edited during this step.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
 private struct CompletionStep: View {
     @ObservedObject var model: OnboardingModel
 

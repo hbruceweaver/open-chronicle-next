@@ -253,6 +253,7 @@ final class OnboardingModel: ObservableObject {
     @Published private(set) var finishError: String?
     @Published private(set) var nonBlockingWarning: String?
     @Published private(set) var restoreIssue: String?
+    let agentSetup: AgentSetupModel
 
     private let store: any OnboardingStateStoring
     private let permission: any ScreenRecordingPermissionServicing
@@ -266,6 +267,7 @@ final class OnboardingModel: ObservableObject {
         store: (any OnboardingStateStoring)? = nil,
         permission: (any ScreenRecordingPermissionServicing)? = nil,
         proofRunner: (any OnboardingCaptureProofRunning)? = nil,
+        agentSetup: AgentSetupModel? = nil,
         now: @escaping () -> Date = Date.init,
         finishHandler: @escaping FinishHandler = { _ in
             throw OnboardingModelError.completionUnavailable
@@ -294,6 +296,7 @@ final class OnboardingModel: ObservableObject {
         self.store = resolvedStore
         self.permission = resolvedPermission
         self.proofRunner = resolvedProofRunner
+        self.agentSetup = agentSetup ?? AgentSetupModel()
         self.now = now
         self.finishHandler = finishHandler
         self.launchPreferenceHandler = launchPreferenceHandler

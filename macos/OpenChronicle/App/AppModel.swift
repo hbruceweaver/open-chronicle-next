@@ -74,6 +74,27 @@ final class AppModel: ObservableObject {
         await runtime?.retryStorageRecovery()
     }
 
+    func connectAgent(_ installation: AgentInstallation) async -> AgentRegistrationOutcome {
+        guard !isShuttingDown, let core else {
+            return .failed(.clientUnavailable)
+        }
+        do {
+            let managedRoot = try Self.applicationSupportURL()
+            let helper = Bundle.main.bundleURL
+                .appendingPathComponent("Contents/Helpers/chronicle-mcp", isDirectory: false)
+            let connection = AgentConnectionService(
+                grants: CoreDisclosureGrantService(core: core),
+                registration: AgentRegistrationService(),
+                applicationBundleURL: Bundle.main.bundleURL,
+                helperURL: helper,
+                managedRootURL: managedRoot
+            )
+            return await connection.connect(installation)
+        } catch {
+            return .failed(.clientUnavailable)
+        }
+    }
+
     func completeOnboarding(_ configuration: OnboardingRuntimeConfiguration) async throws {
         if let completedOnboardingConfiguration {
             guard completedOnboardingConfiguration == configuration else {

@@ -242,7 +242,12 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     })
     lazy var navigation = NavigationModel()
     private lazy var launchAtLoginService = LaunchAtLoginService()
+    private lazy var agentSetupModel = AgentSetupModel { [weak self] installation in
+        guard let self else { return .failed(.clientUnavailable) }
+        return await self.appModel.connectAgent(installation)
+    }
     lazy var onboardingModel = OnboardingModel(
+        agentSetup: agentSetupModel,
         finishHandler: { [weak self] configuration in
             guard let self else { throw AppModelOnboardingError.coreUnavailable }
             try await self.appModel.completeOnboarding(configuration)
