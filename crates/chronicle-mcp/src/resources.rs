@@ -18,23 +18,23 @@ pub fn list() -> Vec<Resource> {
         schema_resource(
             EVENT_SCHEMA_URI,
             "event-v1",
-            "Factual evidence event contract",
+            "Public factual evidence event contract",
         ),
         schema_resource(
             CHUNK_SCHEMA_URI,
             "chunk-v1",
-            "Five-minute factual chunk contract",
+            "Public five-minute factual chunk contract",
         ),
         schema_resource(
             ARTIFACT_SCHEMA_URI,
             "derived-artifact-v1",
-            "Separate derived analysis contract",
+            "Public separate derived analysis contract",
         ),
-        schema_resource(QUERY_SCHEMA_URI, "query-v1", "Grant-bounded query contract"),
+        schema_resource(QUERY_SCHEMA_URI, "query-v1", "Public grant-bounded query contract"),
         schema_resource(
             SHARED_SERVICE_SCHEMA_URI,
             "shared-service-v1",
-            "Shared health/query/write/export transport and safe MCP error contract",
+            "Public shared health/query/write/export transport and safe MCP error contract",
         ),
     ]
 }

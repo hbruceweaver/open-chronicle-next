@@ -639,9 +639,6 @@ impl ServerHandler for ChronicleMcp {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         if let Some((text, mime_type)) = resources::static_text(&request.uri) {
-            self.query_response(QueryOperation::Schemas)
-                .await
-                .map_err(Self::resource_error)?;
             return Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(text, request.uri).with_mime_type(mime_type),
             ]));
@@ -651,7 +648,12 @@ impl ServerHandler for ChronicleMcp {
                 .query_response(QueryOperation::Status)
                 .await
                 .map_err(Self::resource_error)?;
-            let value = serde_json::to_value(result)
+            // Only the factual status payload is adapted into an MCP resource.
+            // The engine charges the larger complete QueryResponse, so the
+            // protocol wrapper cannot exceed the disclosure charge. The full
+            // grant/provenance envelope remains available through the status
+            // tool without duplicating JSON into text content.
+            let value = serde_json::to_value(result.result)
                 .map_err(|_| ErrorData::internal_error("status resource unavailable", None))?;
             return Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(value.to_string(), request.uri)

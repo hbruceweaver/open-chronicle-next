@@ -53,11 +53,17 @@ network calls, model calls, screenshot bytes, and filesystem paths.
 | `chronicle://schemas/query/v1` | `application/schema+json` | Query envelope and result contract |
 | `chronicle://schemas/shared-service/v1` | `application/schema+json` | Shared health/query/write/export transport and safe MCP error contract |
 
-Reading any resource requires the registered active grant. Schema reads perform a
-metadata-granted schema query first and return executable Draft 2020-12 JSON Schema;
+The five bundled contract schemas are public, static application metadata. Reading
+them is deliberately unmetered and does not require or consume a disclosure grant;
+they contain no user evidence. They are executable Draft 2020-12 JSON Schema, and
 the shared-service schema resolves its sibling references against the other schema
-resources. Status returns the same inner `QueryResponse` shape as
-`chronicle_status`.
+resources.
+
+The status resource is evidence-bearing and therefore requires the registered
+active grant. It returns only the factual `QueryResult::Status` payload. The engine
+authorizes and charges the larger complete `QueryResponse`, ensuring the serialized
+MCP resource stays within both the per-response and cumulative disclosure bounds.
+Use `chronicle_status` when the full grant, provenance, and scope envelope is needed.
 
 ## Factual read tools
 
@@ -123,8 +129,10 @@ pagination/truncation, and provenance.
 
 Successful and failed tool calls use `structuredContent` only; the text `content`
 array is empty. This prevents JSON from being duplicated below the engine's charged
-response boundary. The real-stdio suite asserts that the complete serialized MCP
-result remains within the disclosure bytes charged by the engine.
+response boundary. The real-stdio suite asserts that complete serialized MCP tool
+and status-resource results remain within the disclosure bytes charged by the
+engine. It separately proves that public static schema reads do not change
+disclosure accounting.
 
 Tool failures use a structured, content-free body:
 

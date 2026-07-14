@@ -6,7 +6,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use chronicle_domain::{EventEnvelope, EventId, UtcRange};
+use chronicle_domain::{EventEnvelope, EventId, GrantId, UtcRange};
+use chronicle_engine::SharedService;
 use chronicle_store::{
     ArtifactStore, CanonicalJournal, FaultInjector, JournalFamily, ManagedRoot, Projector,
     SqliteStore, StoreGeneration, StoreQueries,
@@ -46,7 +47,7 @@ async fn bundled_binary_initializes_lists_and_serves_over_real_stdio() -> Result
         tokio::process::Command::new(env!("CARGO_BIN_EXE_chronicle-mcp")).configure(|command| {
             command
                 .arg("--managed-root")
-                .arg(root)
+                .arg(&root)
                 .arg("--client-id")
                 .arg("client-codex-synthetic")
                 .arg("--grant-id")
@@ -80,6 +81,9 @@ async fn bundled_binary_initializes_lists_and_serves_over_real_stdio() -> Result
             .iter()
             .any(|resource| resource.uri == "chronicle://status/v1")
     );
+    let grant_id = GrantId::new("grant-synthetic")?;
+    let service = SharedService::open_path(&root)?;
+    let bytes_before_schema = service.grant(&grant_id)?.disclosed_bytes;
     let schema = tokio::time::timeout(
         Duration::from_secs(10),
         client.read_resource(ReadResourceRequestParams::new(
@@ -96,6 +100,31 @@ async fn bundled_binary_initializes_lists_and_serves_over_real_stdio() -> Result
     )
     .await??;
     assert_eq!(shared_schema.contents.len(), 1);
+    assert_eq!(
+        SharedService::open_path(&root)?
+            .grant(&grant_id)?
+            .disclosed_bytes,
+        bytes_before_schema,
+        "bundled public contract schemas must be explicitly unmetered"
+    );
+
+    let bytes_before_status_resource = SharedService::open_path(&root)?
+        .grant(&grant_id)?
+        .disclosed_bytes;
+    let status_resource = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.read_resource(ReadResourceRequestParams::new("chronicle://status/v1")),
+    )
+    .await??;
+    let bytes_after_status_resource = SharedService::open_path(&root)?
+        .grant(&grant_id)?
+        .disclosed_bytes;
+    let status_resource_bytes = serde_json::to_vec(&status_resource)?.len() as u64;
+    assert!(
+        status_resource_bytes <= bytes_after_status_resource - bytes_before_status_resource,
+        "serialized status resource ({status_resource_bytes}) exceeded its disclosure charge ({})",
+        bytes_after_status_resource - bytes_before_status_resource
+    );
 
     let status = tokio::time::timeout(
         Duration::from_secs(10),
