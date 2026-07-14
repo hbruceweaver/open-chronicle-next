@@ -90,13 +90,22 @@
     },
     "ocr": {
       "type": "object",
-      "required": ["text", "change", "confidence", "untrusted_evidence"],
+      "required": ["text", "change", "confidence", "engine", "automatic_language_detection", "recognition_languages", "untrusted_evidence"],
       "properties": {
         "text": {"type": "string"},
         "change": {"enum": ["new", "changed", "unchanged"]},
         "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "engine": {"$ref": "#/$defs/evidenceSource"},
+        "automatic_language_detection": {"type": "boolean"},
+        "recognition_languages": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
         "untrusted_evidence": {"const": true}
       },
+      "additionalProperties": false
+    },
+    "evidenceSource": {
+      "type": "object",
+      "required": ["adapter", "version"],
+      "properties": {"adapter": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1}},
       "additionalProperties": false
     },
     "image": {

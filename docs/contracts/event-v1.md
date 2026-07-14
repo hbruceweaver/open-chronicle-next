@@ -39,7 +39,13 @@ can hold an application identity, title, OCR, image, or freeform detail. Their J
 objects reject unknown fields.
 
 Captured OCR always contains `"untrusted_evidence": true`; false is not
-deserializable. A canonical local image reference contains an opaque artifact ID and
+deserializable. It also records the OCR engine adapter/version, whether automatic
+language detection was requested, and the configured/requested recognition-language
+list. That list is request provenance and never claims Vision detected a language.
+The v1 `failed` OCR state has no OCR payload, so it intentionally preserves only the
+coarse failure outcome; engine/language provenance exists for complete, empty, and
+partial OCR payloads.
+A canonical local image reference contains an opaque artifact ID and
 a validated relative managed location for recovery. Absolute/traversing paths are
 invalid. The observation records only a `pending` image intent; retained state exists
 only after the additive write-completed lifecycle record. Image dimensions are

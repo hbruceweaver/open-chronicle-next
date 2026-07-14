@@ -70,6 +70,10 @@ jobs:
           key: macos-universal-ffi
       - name: Build universal Rust core
         run: ./scripts/build-rust-universal.sh
+      - name: Reject broad or legacy screenshot APIs
+        run: |
+          ./scripts/check-capture-apis.sh --self-test
+          ./scripts/check-capture-apis.sh
       - name: Verify universal architectures
         run: |
           archs=$(lipo -archs build/universal/libchronicle_ffi.a)

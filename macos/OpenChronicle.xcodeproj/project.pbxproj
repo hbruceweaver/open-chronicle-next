@@ -16,6 +16,21 @@
 		A10000000000000000000008 /* BridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* BridgeTests.swift */; };
 		A10000000000000000000009 /* FixtureParityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* FixtureParityTests.swift */; };
 		A1000000000000000000000A /* shared-response-v1.json in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* shared-response-v1.json */; };
+		A1000000000000000000000B /* PrivacyPreflightTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* PrivacyPreflightTests.swift */; };
+		A1000000000000000000000C /* ActiveWindowProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* ActiveWindowProvider.swift */; };
+		A1000000000000000000000D /* PrivacyPreflight.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* PrivacyPreflight.swift */; };
+		A1000000000000000000000E /* ScreenCaptureService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* ScreenCaptureService.swift */; };
+		A1000000000000000000000F /* VisionOCRService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* VisionOCRService.swift */; };
+		A10000000000000000000010 /* ContentDeduplicator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* ContentDeduplicator.swift */; };
+		A10000000000000000000011 /* IdleStateSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* IdleStateSource.swift */; };
+		A10000000000000000000012 /* CoreCaptureIngestor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* CoreCaptureIngestor.swift */; };
+		A10000000000000000000013 /* CaptureTestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* CaptureTestSupport.swift */; };
+		A10000000000000000000014 /* ActiveWindowProviderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000019 /* ActiveWindowProviderTests.swift */; };
+		A10000000000000000000015 /* CaptureRaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001A /* CaptureRaceTests.swift */; };
+		A10000000000000000000016 /* DedupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001B /* DedupTests.swift */; };
+		A10000000000000000000017 /* OCRTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001C /* OCRTests.swift */; };
+		A10000000000000000000018 /* IdleStateSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001D /* IdleStateSourceTests.swift */; };
+		A10000000000000000000019 /* CaptureIngestorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001E /* CaptureIngestorTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +59,21 @@
 		A2000000000000000000000D /* shared-response-v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "shared-response-v1.json"; sourceTree = "<group>"; };
 		A2000000000000000000000E /* Open Chronicle.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Open Chronicle.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000000000000000000000F /* OpenChronicleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenChronicleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000000000000000000010 /* PrivacyPreflightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyPreflightTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000011 /* ActiveWindowProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActiveWindowProvider.swift; sourceTree = "<group>"; };
+		A20000000000000000000012 /* PrivacyPreflight.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyPreflight.swift; sourceTree = "<group>"; };
+		A20000000000000000000013 /* ScreenCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureService.swift; sourceTree = "<group>"; };
+		A20000000000000000000014 /* VisionOCRService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisionOCRService.swift; sourceTree = "<group>"; };
+		A20000000000000000000015 /* ContentDeduplicator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentDeduplicator.swift; sourceTree = "<group>"; };
+		A20000000000000000000016 /* IdleStateSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IdleStateSource.swift; sourceTree = "<group>"; };
+		A20000000000000000000017 /* CoreCaptureIngestor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreCaptureIngestor.swift; sourceTree = "<group>"; };
+		A20000000000000000000018 /* CaptureTestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureTestSupport.swift; sourceTree = "<group>"; };
+		A20000000000000000000019 /* ActiveWindowProviderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActiveWindowProviderTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000001A /* CaptureRaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureRaceTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000001B /* DedupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DedupTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000001C /* OCRTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OCRTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000001D /* IdleStateSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IdleStateSourceTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000001E /* CaptureIngestorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureIngestorTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -66,6 +96,7 @@
 			children = (
 				A50000000000000000000003 /* App */,
 				A50000000000000000000004 /* Engine */,
+				A50000000000000000000009 /* Capture */,
 				A50000000000000000000005 /* Resources */,
 				A2000000000000000000000A /* OpenChronicle-Bridging-Header.h */,
 			);
@@ -74,12 +105,21 @@
 		};
 		A50000000000000000000003 /* App */ = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003); path = App; sourceTree = "<group>"; };
 		A50000000000000000000004 /* Engine */ = {isa = PBXGroup; children = (A20000000000000000000004, A20000000000000000000005, A20000000000000000000006); path = Engine; sourceTree = "<group>"; };
+		A50000000000000000000009 /* Capture */ = {isa = PBXGroup; children = (A20000000000000000000011, A20000000000000000000012, A20000000000000000000013, A20000000000000000000014, A20000000000000000000015, A20000000000000000000016, A20000000000000000000017); path = Capture; sourceTree = "<group>"; };
 		A50000000000000000000005 /* Resources */ = {isa = PBXGroup; children = (A20000000000000000000007, A20000000000000000000008, A20000000000000000000009); path = Resources; sourceTree = "<group>"; };
 		A50000000000000000000006 /* OpenChronicleTests */ = {
 			isa = PBXGroup;
 			children = (
 				A2000000000000000000000B /* BridgeTests.swift */,
 				A2000000000000000000000C /* FixtureParityTests.swift */,
+				A20000000000000000000010 /* PrivacyPreflightTests.swift */,
+				A20000000000000000000018 /* CaptureTestSupport.swift */,
+				A20000000000000000000019 /* ActiveWindowProviderTests.swift */,
+				A2000000000000000000001A /* CaptureRaceTests.swift */,
+				A2000000000000000000001B /* DedupTests.swift */,
+				A2000000000000000000001C /* OCRTests.swift */,
+				A2000000000000000000001D /* IdleStateSourceTests.swift */,
+				A2000000000000000000001E /* CaptureIngestorTests.swift */,
 				A50000000000000000000007 /* Fixtures */,
 			);
 			path = OpenChronicleTests;
@@ -167,8 +207,8 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A40000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006); runOnlyForDeploymentPostprocessing = 0; };
-		A40000000000000000000005 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008, A10000000000000000000009); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A1000000000000000000000C, A1000000000000000000000D, A1000000000000000000000E, A1000000000000000000000F, A10000000000000000000010, A10000000000000000000011, A10000000000000000000012); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000005 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008, A10000000000000000000009, A1000000000000000000000B, A10000000000000000000013, A10000000000000000000014, A10000000000000000000015, A10000000000000000000016, A10000000000000000000017, A10000000000000000000018, A10000000000000000000019); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */

@@ -46,6 +46,7 @@ for relative_path in crates macos app Sources spikes scripts; do
             --glob '*.rs' --glob '*.swift' --glob '*.sh' --glob '*.toml' \
             --glob '*.json' --glob '*.plist' --glob '*.yml' --glob '*.yaml' \
             --glob '!check-forbidden-runtime.sh' \
+            --glob '!check-capture-apis.sh' \
             "$runtime_pattern" "$candidate" || true)
     else
         matches=$(find "$candidate" -type f \
@@ -54,6 +55,7 @@ for relative_path in crates macos app Sources spikes scripts; do
             -o -name '*.toml' -o -name '*.json' -o -name '*.plist' \
             -o -name '*.yml' -o -name '*.yaml' \) \
             ! -name 'check-forbidden-runtime.sh' \
+            ! -name 'check-capture-apis.sh' \
             -exec grep -nEH "$runtime_pattern" {} + 2>/dev/null || true)
     fi
 

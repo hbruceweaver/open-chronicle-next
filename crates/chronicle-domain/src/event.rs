@@ -85,14 +85,19 @@ pub enum OcrChange {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcrEvidence {
     pub text: String,
     pub change: OcrChange,
     pub confidence: Option<f32>,
+    pub engine: EvidenceSource,
+    pub automatic_language_detection: bool,
+    pub recognition_languages: Vec<String>,
     pub untrusted_evidence: UntrustedEvidenceMarker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceSource {
     pub adapter: String,
     pub version: String,
@@ -318,6 +323,22 @@ impl ObservationAttempt {
                     return Err("ocr_state and OCR payload disagree".to_owned());
                 }
                 if let Some(ocr) = &content.ocr {
+                    if ocr.engine.adapter.is_empty() || ocr.engine.version.is_empty() {
+                        return Err("OCR engine provenance fields must be non-empty".to_owned());
+                    }
+                    if ocr.recognition_languages.iter().any(String::is_empty)
+                        || ocr
+                            .recognition_languages
+                            .iter()
+                            .enumerate()
+                            .any(|(index, language)| {
+                                ocr.recognition_languages[..index].contains(language)
+                            })
+                    {
+                        return Err(
+                            "OCR recognition languages must be non-empty and unique".to_owned()
+                        );
+                    }
                     if ocr
                         .confidence
                         .is_some_and(|confidence| !(0.0..=1.0).contains(&confidence))

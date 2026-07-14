@@ -108,6 +108,54 @@ fn ocr_marker_cannot_be_false_and_ocr_axes_match_text() -> Result<(), Box<dyn Er
         .ok_or("empty OCR fixture missing")?;
     empty_with_text["payload"]["data"]["content"]["data"]["ocr"]["text"] = json!("not empty");
     assert!(EventEnvelope::parse(&serde_json::to_string(&empty_with_text)?).is_err());
+
+    let captured = event_values()?
+        .into_iter()
+        .next()
+        .ok_or("event fixture empty")?;
+    for required in [
+        "engine",
+        "automatic_language_detection",
+        "recognition_languages",
+    ] {
+        let mut missing = captured.clone();
+        missing["payload"]["data"]["content"]["data"]["ocr"]
+            .as_object_mut()
+            .ok_or("OCR fixture is not an object")?
+            .remove(required);
+        assert!(
+            EventEnvelope::parse(&serde_json::to_string(&missing)?).is_err(),
+            "accepted OCR without required provenance field {required}"
+        );
+    }
+
+    let mut empty_engine = captured.clone();
+    empty_engine["payload"]["data"]["content"]["data"]["ocr"]["engine"]["adapter"] = json!("");
+    assert!(EventEnvelope::parse(&serde_json::to_string(&empty_engine)?).is_err());
+
+    let mut empty_language = captured;
+    empty_language["payload"]["data"]["content"]["data"]["ocr"]["recognition_languages"] =
+        json!([""]);
+    assert!(EventEnvelope::parse(&serde_json::to_string(&empty_language)?).is_err());
+
+    let captured = event_values()?
+        .into_iter()
+        .next()
+        .ok_or("event fixture empty")?;
+    let mut unknown_ocr = captured.clone();
+    unknown_ocr["payload"]["data"]["content"]["data"]["ocr"]["detected_language"] = json!("en-US");
+    assert!(
+        EventEnvelope::parse(&serde_json::to_string(&unknown_ocr)?).is_err(),
+        "accepted unknown OCR field despite closed schema"
+    );
+
+    let mut unknown_engine = captured;
+    unknown_engine["payload"]["data"]["content"]["data"]["ocr"]["engine"]["model_name"] =
+        json!("private-model");
+    assert!(
+        EventEnvelope::parse(&serde_json::to_string(&unknown_engine)?).is_err(),
+        "accepted unknown OCR engine field despite closed schema"
+    );
     Ok(())
 }
 

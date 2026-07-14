@@ -42,7 +42,9 @@ inside the effective disclosure ranges. Returned content classes must be declare
 the scope, and paged `returned_items` must equal the actual top-level list length
 while remaining within both the request and grant limits.
 
-OCR retains the untrusted marker and cannot appear outside an OCR-enabled scope.
+OCR retains the untrusted marker and factual engine/request-language provenance and
+cannot appear outside an OCR-enabled scope. Recognition languages are the configured
+or requested values, not a claim that Vision detected those languages.
 Image metadata contains only opaque artifact ID, lifecycle state, and expiry. Query
 parsing recursively rejects managed/file path and image-byte keys, including inside
 derived payloads. The query schema closes every result DTO against those extensions.
