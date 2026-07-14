@@ -314,15 +314,66 @@ struct CaptureIngestAcknowledgement: Equatable, Sendable {
 protocol CaptureIngesting: Sendable {
     func ingest(
         record: CaptureIngestRecord,
-        image: Data?
+        image: Data?,
+        context: CaptureAttemptContext,
+        observedAt: Date,
+        permit: CapturePersistencePermit
     ) async throws -> CaptureIngestAcknowledgement
+}
+
+enum CaptureInvalidation: String, Equatable, Sendable {
+    case sleep
+    case clockChanged = "clock-changed"
+    case studyExpired = "study-expired"
+    case userPaused = "user-paused"
+    case stopping
+    case superseded
+}
+
+enum CapturePersistenceFailureCategory: Equatable, Sendable {
+    case retryableStorage
+    case studyBoundary
+    case staleGeneration
+    case contractRepair
+    case unknownFatal
+}
+
+struct CapturePersistenceFailure: Equatable, Sendable {
+    let category: CapturePersistenceFailureCategory
+    let code: String?
+    let retryable: Bool
+
+    static let unknown = CapturePersistenceFailure(
+        category: .unknownFatal,
+        code: nil,
+        retryable: false
+    )
+}
+
+enum CaptureAttemptDirective: Equatable, Sendable {
+    case normal
+    case forceDenial(CaptureDenial)
+}
+
+struct CapturePersistencePermit: Equatable, Sendable {
+    let id: UUID
+    let executionGeneration: UInt64
+}
+
+protocol CaptureAttemptValidityChecking: Sendable {
+    func invalidation(for executionGeneration: UInt64) async -> CaptureInvalidation?
+    func claimPersistence(
+        for executionGeneration: UInt64
+    ) async -> CapturePersistencePermit?
+    func releasePersistence(_ permit: CapturePersistencePermit) async
 }
 
 enum CaptureAttemptResult: Equatable, Sendable {
     case stored(CaptureIngestAcknowledgement)
     case proofSucceeded
     case denied(CaptureDenial)
-    case notDurable
+    case invalidated(CaptureInvalidation)
+    case persistenceFailed(CapturePersistenceFailure)
 }
 
 actor CaptureAttemptPipeline {
@@ -339,6 +390,8 @@ actor CaptureAttemptPipeline {
     private let idleThresholdSeconds: UInt32
     private let proofTokens: CaptureProofTokenStore
     private let ingestor: any CaptureIngesting
+    private let observationTime: any CaptureRecordingTimeProviding
+    private let validity: any CaptureAttemptValidityChecking
 
     init(
         windowProvider: any ActiveWindowProviding,
@@ -353,7 +406,9 @@ actor CaptureAttemptPipeline {
         idleState: IdleStateSource = IdleStateSource(),
         idleThresholdSeconds: UInt32 = 300,
         proofTokens: CaptureProofTokenStore,
-        ingestor: any CaptureIngesting
+        ingestor: any CaptureIngesting,
+        observationTime: any CaptureRecordingTimeProviding = SystemCaptureRecordingTimeSource(),
+        validity: any CaptureAttemptValidityChecking
     ) {
         self.windowProvider = windowProvider
         self.environment = environment
@@ -368,13 +423,35 @@ actor CaptureAttemptPipeline {
         self.idleThresholdSeconds = idleThresholdSeconds
         self.proofTokens = proofTokens
         self.ingestor = ingestor
+        self.observationTime = observationTime
+        self.validity = validity
     }
 
-    func attempt(proofToken: CaptureProofToken? = nil) async -> CaptureAttemptResult {
+    func attempt(
+        context: CaptureAttemptContext,
+        directive: CaptureAttemptDirective = .normal,
+        proofToken: CaptureProofToken? = nil
+    ) async -> CaptureAttemptResult {
+        if let invalidation = await validity.invalidation(
+            for: context.executionGeneration
+        ) {
+            return .invalidated(invalidation)
+        }
+        if case let .forceDenial(reason) = directive {
+            return await persistDenial(
+                .deny(reason),
+                context: context,
+                observedAt: await observationTime.now()
+            )
+        }
         let initialEnvironment = await environment.currentEnvironment()
         if let denial = Self.environmentDenial(initialEnvironment) {
             _ = await proofTokens.beginAttempt(token: proofToken, windowID: nil)
-            return await persistDenial(.deny(denial))
+            return await persistDenial(
+                .deny(denial),
+                context: context,
+                observedAt: await observationTime.now()
+            )
         }
         let preLookup = await lookupWindow(ifPermitted: initialEnvironment)
         let preWindowID = preLookup.exactWindow?.identity.windowID
@@ -392,58 +469,80 @@ actor CaptureAttemptPipeline {
         guard case let .allow(preIdentity) = preDecision,
               let resolved = preLookup.exactWindow
         else {
-            return await persistDenial(preDecision)
+            return await persistDenial(
+                preDecision,
+                context: context,
+                observedAt: await observationTime.now()
+            )
         }
         if proofToken != nil,
            (proof == nil || preIdentity.bundleIdentifier != policy.chronicleBundleIdentifier) {
             // An explicit proof request is a separate, pixel-free path. A wrong,
             // reused, or non-Chronicle-scoped token must never become normal capture.
-            return await persistDenial(.deny(.chronicleSelf))
+            return await persistDenial(
+                .deny(.chronicleSelf),
+                context: context,
+                observedAt: await observationTime.now()
+            )
         }
 
         let prepared = await captureAndPrepare(
             resolved: resolved,
             expectedIdentity: preIdentity,
-            proof: proof
+            proof: proof,
+            context: context
         )
         let normalized: NormalizedImage
         let scaleMilli: UInt32
         let postIdentity: ActiveWindowIdentity
+        let observedAt: Date
         switch prepared {
-        case let .ready(value, scale, identity):
+        case let .ready(value, scale, identity, observationTime):
             normalized = value
             scaleMilli = scale
             postIdentity = identity
+            observedAt = observationTime
         case .proofSucceeded:
             return .proofSucceeded
         case let .denied(reason):
             // The helper has already ended the CGImage lifetime before persistence.
-            return await persistDenial(.deny(reason))
+            return await persistDenial(
+                .deny(reason),
+                context: context,
+                observedAt: await observationTime.now()
+            )
+        case let .invalidated(reason):
+            return .invalidated(reason)
         case .captureFailed:
-            return await persistCaptureFailure()
+            return await persistCaptureFailure(
+                context: context,
+                observedAt: await observationTime.now()
+            )
         }
-        let context = ApprovedWindowContext(
+        let windowContext = ApprovedWindowContext(
             applicationBundleID: postIdentity.bundleIdentifier,
             processName: postIdentity.processName,
             windowTitle: postIdentity.windowTitle
         )
         let key = DeduplicationKey(
             contentHash: normalized.contentHash,
-            bundleIdentifier: context.applicationBundleID,
-            processName: context.processName,
-            windowTitle: context.windowTitle
+            bundleIdentifier: windowContext.applicationBundleID,
+            processName: windowContext.processName,
+            windowTitle: windowContext.windowTitle
         )
         let presence = idleState.sample(thresholdSeconds: idleThresholdSeconds)
 
         if let previous = await deduplicator.match(for: key) {
             let result = await persist(
                 .unchanged(
-                    context: context,
+                    context: windowContext,
                     contentHash: normalized.contentHash,
                     previous: previous,
                     presence: presence
                 ),
-                image: nil
+                image: nil,
+                context: context,
+                observedAt: observedAt
             )
             if case let .stored(acknowledgement) = result,
                acknowledgement.durability.isCanonicalDurable,
@@ -475,14 +574,16 @@ actor CaptureAttemptPipeline {
         }
         let result = await persist(
             .changed(
-                context: context,
+                context: windowContext,
                 contentHash: normalized.contentHash,
                 ocrChange: ocrChange,
                 ocr: ocr,
                 dimensions: dimensions,
                 presence: presence
             ),
-            image: encodedImage?.data
+            image: encodedImage?.data,
+            context: context,
+            observedAt: observedAt
         )
         if case let .stored(acknowledgement) = result,
            acknowledgement.durability.isCanonicalDurable,
@@ -509,9 +610,10 @@ actor CaptureAttemptPipeline {
     }
 
     private enum PreparedCapture {
-        case ready(NormalizedImage, UInt32, ActiveWindowIdentity)
+        case ready(NormalizedImage, UInt32, ActiveWindowIdentity, Date)
         case proofSucceeded
         case denied(CaptureDenial)
+        case invalidated(CaptureInvalidation)
         case captureFailed
     }
 
@@ -520,8 +622,14 @@ actor CaptureAttemptPipeline {
     private func captureAndPrepare(
         resolved: ResolvedActiveWindow,
         expectedIdentity: ActiveWindowIdentity,
-        proof: CaptureProofAuthorization?
+        proof: CaptureProofAuthorization?,
+        context: CaptureAttemptContext
     ) async -> PreparedCapture {
+        if let invalidation = await validity.invalidation(
+            for: context.executionGeneration
+        ) {
+            return .invalidated(invalidation)
+        }
         let captured: CapturedWindowImage
         do {
             captured = try await capturer.capture(resolved)
@@ -531,6 +639,12 @@ actor CaptureAttemptPipeline {
                 return .denied(denial)
             }
             return .captureFailed
+        }
+
+        if let invalidation = await validity.invalidation(
+            for: context.executionGeneration
+        ) {
+            return .invalidated(invalidation)
         }
 
         let preLookupEnvironment = await environment.currentEnvironment()
@@ -550,6 +664,15 @@ actor CaptureAttemptPipeline {
             guard case let .deny(reason) = decision else { return .captureFailed }
             return .denied(reason)
         }
+        if let invalidation = await validity.invalidation(
+            for: context.executionGeneration
+        ) {
+            return .invalidated(invalidation)
+        }
+        let observedAt = await observationTime.now()
+        guard observedAt >= context.scheduledAt else {
+            return .invalidated(.clockChanged)
+        }
         guard let normalized = try? normalizer.normalize(captured.image) else {
             return .captureFailed
         }
@@ -565,7 +688,7 @@ actor CaptureAttemptPipeline {
             }
             return .proofSucceeded
         }
-        return .ready(normalized, captured.scaleMilli, postIdentity)
+        return .ready(normalized, captured.scaleMilli, postIdentity, observedAt)
     }
 
     private static func environmentDenial(
@@ -596,43 +719,108 @@ actor CaptureAttemptPipeline {
         )
     }
 
-    private func persistDenial(_ decision: PrivacyDecision) async -> CaptureAttemptResult {
-        guard case let .deny(reason) = decision else { return .notDurable }
+    private func persistDenial(
+        _ decision: PrivacyDecision,
+        context: CaptureAttemptContext,
+        observedAt: Date
+    ) async -> CaptureAttemptResult {
+        guard case let .deny(reason) = decision else {
+            return .persistenceFailed(.unknown)
+        }
         let result = await persist(
             .denied(
                 reason: reason,
                 presence: idleState.sample(thresholdSeconds: idleThresholdSeconds)
             ),
-            image: nil
+            image: nil,
+            context: context,
+            observedAt: observedAt
         )
         if case .stored = result { return .denied(reason) }
         return result
     }
 
-    private func persistCaptureFailure() async -> CaptureAttemptResult {
+    private func persistCaptureFailure(
+        context: CaptureAttemptContext,
+        observedAt: Date
+    ) async -> CaptureAttemptResult {
         await persist(
             .captureFailed(
                 presence: idleState.sample(thresholdSeconds: idleThresholdSeconds)
             ),
-            image: nil
+            image: nil,
+            context: context,
+            observedAt: observedAt
         )
     }
 
     private func persist(
         _ record: CaptureIngestRecord,
-        image: Data?
+        image: Data?,
+        context: CaptureAttemptContext,
+        observedAt: Date
     ) async -> CaptureAttemptResult {
+        guard observedAt >= context.scheduledAt else {
+            return .invalidated(.clockChanged)
+        }
+        guard let permit = await validity.claimPersistence(
+            for: context.executionGeneration
+        ) else {
+            return .invalidated(
+                await validity.invalidation(for: context.executionGeneration)
+                    ?? .superseded
+            )
+        }
+        let result: CaptureAttemptResult
         do {
             let acknowledgement = try await ingestor.ingest(
                 record: record,
-                image: image.map { Data($0) }
+                image: image.map { Data($0) },
+                context: context,
+                observedAt: observedAt,
+                permit: permit
             )
-            return acknowledgement.durability.isCanonicalDurable
+            result = acknowledgement.durability.isCanonicalDurable
                 ? .stored(acknowledgement)
-                : .notDurable
+                : .persistenceFailed(.unknown)
         } catch {
-            return .notDurable
+            if case CoreCaptureIngestorError.clockDiscontinuity = error {
+                result = .invalidated(.clockChanged)
+            } else {
+                result = .persistenceFailed(Self.persistenceFailure(from: error))
+            }
         }
+        await validity.releasePersistence(permit)
+        return result
+    }
+
+    private static func persistenceFailure(from error: Error) -> CapturePersistenceFailure {
+        let payload: ChronicleErrorPayload?
+        switch error {
+        case let CoreCaptureIngestorError.coreRejected(value): payload = value
+        case let ChronicleBridgeError.bridgeStatus(_, value): payload = value
+        default: payload = nil
+        }
+        guard let payload else { return .unknown }
+        let category: CapturePersistenceFailureCategory
+        switch payload.code {
+        case "screenshot-free-space", "screenshot-image-quota", "io-error":
+            category = .retryableStorage
+        case "study-expired", "study-not-started":
+            category = .studyBoundary
+        case "stale-generation", "invalid-handle", "closed":
+            category = .staleGeneration
+        case "contract-error", "ingest-contract-error", "event-contract-error", "schema-mismatch",
+             "invalid-call-envelope", "malformed-response":
+            category = .contractRepair
+        default:
+            category = payload.retryable ? .retryableStorage : .unknownFatal
+        }
+        return CapturePersistenceFailure(
+            category: category,
+            code: payload.code,
+            retryable: category == .retryableStorage
+        )
     }
 }
 

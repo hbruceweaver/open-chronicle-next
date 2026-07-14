@@ -17,8 +17,9 @@ use chronicle_domain::{
     ScreenshotProjectedState, SharedServiceRequest, parse_versioned, validate_schema_version,
 };
 use chronicle_engine::{
-    CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator, SharedService,
-    SharedServiceError, StartupReconcileRequest, StudyBoundary,
+    CadenceStamp, ChunkerConfig, EngineError, IngestRequest, RecordingCoordinator,
+    RuntimeGapReason, RuntimeGapReconcileRequest, SharedService, SharedServiceError,
+    StartupReconcileRequest, StudyBoundary,
 };
 use chronicle_store::{
     CaptureOwnerGuard, FaultInjector, LockManager, ManagedRoot, SqliteStore, StoreError,
@@ -501,6 +502,11 @@ enum AppControl {
     },
     CaptureAdmission,
     ReconcilePendingImages,
+    ReconcileRuntimeGap {
+        reason: RuntimeGapReason,
+        device_id: DeviceId,
+        display_timezone: String,
+    },
     PrepareTermination {
         session_id: String,
     },
@@ -524,10 +530,16 @@ struct IngestEnvelope {
 struct FfiCadenceStamp {
     boot_sequence: String,
     monotonic_tick: u64,
+    #[serde(default)]
+    execution_generation: Option<u64>,
 }
 
 impl From<FfiCadenceStamp> for CadenceStamp {
     fn from(value: FfiCadenceStamp) -> Self {
+        // Recognize the app-private linearization generation at the ABI boundary.
+        // Cadence replay remains keyed by boot sequence and monotonic tick, while
+        // older non-app fixtures remain forward-compatible without this field.
+        let _execution_generation = value.execution_generation;
         Self {
             boot_sequence: value.boot_sequence,
             monotonic_tick: value.monotonic_tick,
@@ -687,6 +699,20 @@ impl CoreHandle {
             AppControl::ReconcilePendingImages => self
                 .coordinator
                 .reconcile_pending_images(now)
+                .map_err(FfiError::from)
+                .and_then(serialize_value),
+            AppControl::ReconcileRuntimeGap {
+                reason,
+                device_id,
+                display_timezone,
+            } => self
+                .coordinator
+                .reconcile_runtime_gap(RuntimeGapReconcileRequest {
+                    reason,
+                    device_id,
+                    display_timezone,
+                    now,
+                })
                 .map_err(FfiError::from)
                 .and_then(serialize_value),
             AppControl::PrepareTermination { session_id } => self
@@ -1567,6 +1593,67 @@ mod tests {
         );
         assert_eq!(status, ChronicleStatus::Ok as u32, "{response}");
         assert_eq!(response["result"]["prepared"], true);
+        let _ = close(handle);
+    }
+
+    #[test]
+    fn runtime_gap_control_is_app_private_typed_and_idempotent() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (handle, opened) = open(&temporary);
+        let generation = opened["result"]["store_generation"]
+            .as_u64()
+            .expect("generation");
+        start_recording(handle, "ffi-runtime-gap");
+
+        let request = json!({
+            "type": "reconcile-runtime-gap",
+            "reason": "sleep",
+            "device_id": "dev-ffi-ingest",
+            "display_timezone": "Europe/Zurich"
+        });
+        let (status, first) = control(handle, "2026-07-13T09:05:00Z", request.clone());
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{first}");
+        let (status, repeated) = control(handle, "2026-07-13T09:05:00Z", request);
+        assert_eq!(status, ChronicleStatus::Ok as u32, "{repeated}");
+        assert_eq!(first["result"], repeated["result"]);
+        assert_eq!(
+            first["result"]["gap_event_ids"]
+                .as_array()
+                .expect("gap event IDs")
+                .len(),
+            1
+        );
+
+        let invalid = json!({
+            "type": "reconcile-runtime-gap",
+            "reason": "quit",
+            "device_id": "dev-ffi-ingest",
+            "display_timezone": "Europe/Zurich"
+        });
+        let (status, response) = control(handle, "2026-07-13T09:06:00Z", invalid);
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{response}");
+        assert_eq!(response["error"]["code"], "contract-error");
+
+        let private_operation_as_shared = json!({
+            "schema_version": "1.0",
+            "now": "2026-07-13T09:06:00Z",
+            "request": {
+                "schema_version": "1.0",
+                "request_id": "req-private-runtime-gap",
+                "store_generation": generation,
+                "operation": {
+                    "type": "reconcile-runtime-gap",
+                    "reason": "sleep"
+                }
+            }
+        });
+        let (status, response) = call_raw(
+            handle,
+            &serde_json::to_vec(&private_operation_as_shared)
+                .expect("encode private shared operation"),
+        );
+        assert_eq!(status, ChronicleStatus::Contract as u32, "{response}");
+        assert!(response.get("result").is_none());
         let _ = close(handle);
     }
 

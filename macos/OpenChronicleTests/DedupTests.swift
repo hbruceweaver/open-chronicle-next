@@ -29,8 +29,8 @@ final class DedupTests: XCTestCase {
             ingestor: ingestor
         )
 
-        _ = await pipeline.attempt()
-        _ = await pipeline.attempt()
+        _ = await pipeline.attempt(context: testAttemptContext(token: "dedup-1"))
+        _ = await pipeline.attempt(context: testAttemptContext(token: "dedup-2"))
 
         let ocrCalls = await ocr.calls
         XCTAssertEqual(ocrCalls, 1)
@@ -71,9 +71,9 @@ final class DedupTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let first = await pipeline.attempt()
-        XCTAssertEqual(first, .notDurable)
-        _ = await pipeline.attempt()
+        let first = await pipeline.attempt(context: testAttemptContext(token: "retry-1"))
+        XCTAssertEqual(first, .persistenceFailed(.unknown))
+        _ = await pipeline.attempt(context: testAttemptContext(token: "retry-2"))
 
         let ocrCalls = await ocr.calls
         XCTAssertEqual(ocrCalls, 2)
@@ -111,8 +111,8 @@ final class DedupTests: XCTestCase {
             ingestor: ingestor
         )
 
-        _ = await pipeline.attempt()
-        _ = await pipeline.attempt()
+        _ = await pipeline.attempt(context: testAttemptContext(token: "change-1"))
+        _ = await pipeline.attempt(context: testAttemptContext(token: "change-2"))
 
         let ocrCalls = await ocr.calls
         XCTAssertEqual(ocrCalls, 1)

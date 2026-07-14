@@ -83,6 +83,37 @@ pub struct StartupReconcileResult {
     pub gap_event_ids: Vec<EventId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeGapReason {
+    Sleep,
+    StorageOutage,
+    ClockCorrection,
+}
+
+impl From<RuntimeGapReason> for GapReason {
+    fn from(value: RuntimeGapReason) -> Self {
+        match value {
+            RuntimeGapReason::Sleep => Self::Sleep,
+            RuntimeGapReason::StorageOutage => Self::StorageOutage,
+            RuntimeGapReason::ClockCorrection => Self::ClockCorrection,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct RuntimeGapReconcileRequest {
+    pub reason: RuntimeGapReason,
+    pub device_id: DeviceId,
+    pub display_timezone: String,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuntimeGapReconcileResult {
+    pub gap_event_ids: Vec<EventId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct RuntimeSession {
     session_id: String,
@@ -122,6 +153,30 @@ struct LastStartupReconciliation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PendingRuntimeGapReconciliation {
+    pub session_id: String,
+    pub reason: RuntimeGapReason,
+    pub device_id: DeviceId,
+    pub display_timezone: String,
+    pub reconciled_at: DateTime<Utc>,
+    pub gap_event: EventEnvelope,
+    #[serde(flatten)]
+    extensions: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LastRuntimeGapReconciliation {
+    session_id: String,
+    reason: RuntimeGapReason,
+    device_id: DeviceId,
+    display_timezone: String,
+    reconciled_at: DateTime<Utc>,
+    gap_event_ids: Vec<EventId>,
+    #[serde(flatten)]
+    extensions: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct HeartbeatAcknowledgementProof {
     pub event_id: EventId,
     pub heartbeat_at: DateTime<Utc>,
@@ -150,6 +205,13 @@ pub(crate) struct HeartbeatAcknowledgementIntent {
 pub(crate) struct PreparedStartupReconciliation {
     pub gap_events: Vec<EventEnvelope>,
     pub gap_event_ids: Vec<EventId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedRuntimeGapReconciliation {
+    pub gap_events: Vec<EventEnvelope>,
+    pub gap_event_ids: Vec<EventId>,
+    pub pending: Option<PendingRuntimeGapReconciliation>,
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +362,165 @@ impl RuntimeController {
                 }
             }
             document.remove("heartbeat_acknowledgement_intent");
+            Ok(())
+        })
+    }
+
+    pub(crate) fn pending_runtime_gap(&self) -> Result<Option<PendingRuntimeGapReconciliation>> {
+        let pending = get(&self.read_document()?, "pending_runtime_gap_reconciliation")?;
+        if let Some(pending) = &pending {
+            validate_pending_runtime_gap(pending)?;
+        }
+        Ok(pending)
+    }
+
+    pub(crate) fn prepare_runtime_gap(
+        &self,
+        request: &RuntimeGapReconcileRequest,
+    ) -> Result<PreparedRuntimeGapReconciliation> {
+        validate_runtime_gap_request(request)?;
+        self.update_document_with_result(|document| {
+            if let Some(pending) = get::<PendingRuntimeGapReconciliation>(
+                document,
+                "pending_runtime_gap_reconciliation",
+            )? {
+                validate_pending_runtime_gap(&pending)?;
+                if !runtime_gap_request_matches_pending(request, &pending) {
+                    return Err(EngineError::Configuration(
+                        "a different runtime gap reconciliation is unresolved".to_owned(),
+                    ));
+                }
+                return Ok(PreparedRuntimeGapReconciliation {
+                    gap_events: vec![pending.gap_event.clone()],
+                    gap_event_ids: vec![pending.gap_event.event_id.clone()],
+                    pending: Some(pending),
+                });
+            }
+
+            let session = current_session(document)?.ok_or_else(|| {
+                EngineError::Configuration(
+                    "runtime gap reconciliation requires an active session".to_owned(),
+                )
+            })?;
+            if session.closed_at.is_some() {
+                return Err(EngineError::Configuration(
+                    "runtime gap reconciliation requires an active session".to_owned(),
+                ));
+            }
+            if let Some(last) =
+                get::<LastRuntimeGapReconciliation>(document, "last_runtime_gap_reconciliation")?
+                && runtime_gap_request_matches_last(request, &session.session_id, &last)
+            {
+                return Ok(PreparedRuntimeGapReconciliation {
+                    gap_events: Vec::new(),
+                    gap_event_ids: last.gap_event_ids,
+                    pending: None,
+                });
+            }
+
+            if request.now == session.last_heartbeat_at {
+                return Ok(PreparedRuntimeGapReconciliation {
+                    gap_events: Vec::new(),
+                    gap_event_ids: Vec::new(),
+                    pending: None,
+                });
+            }
+            if request.now < session.last_heartbeat_at
+                && request.reason != RuntimeGapReason::ClockCorrection
+            {
+                return Err(EngineError::Configuration(
+                    "backward runtime gaps require clock-correction reason".to_owned(),
+                ));
+            }
+
+            let (start, end) = if request.now < session.last_heartbeat_at {
+                (request.now, session.last_heartbeat_at)
+            } else {
+                (session.last_heartbeat_at, request.now)
+            };
+            let gap_event = runtime_gap_event(start, end, request, &session.session_id)?;
+            let pending = PendingRuntimeGapReconciliation {
+                session_id: session.session_id,
+                reason: request.reason,
+                device_id: request.device_id.clone(),
+                display_timezone: request.display_timezone.clone(),
+                reconciled_at: request.now,
+                gap_event: gap_event.clone(),
+                extensions: Map::new(),
+            };
+            put(document, "pending_runtime_gap_reconciliation", &pending)?;
+            Ok(PreparedRuntimeGapReconciliation {
+                gap_event_ids: vec![gap_event.event_id.clone()],
+                gap_events: vec![gap_event],
+                pending: Some(pending),
+            })
+        })
+    }
+
+    pub(crate) fn commit_runtime_gap(
+        &self,
+        expected: &PendingRuntimeGapReconciliation,
+        gap_event_ids: &[EventId],
+        faults: RuntimeFaultInjector,
+    ) -> Result<()> {
+        validate_pending_runtime_gap(expected)?;
+        self.update_document(|document| {
+            let pending = get::<PendingRuntimeGapReconciliation>(
+                document,
+                "pending_runtime_gap_reconciliation",
+            )?
+            .ok_or_else(|| {
+                EngineError::Configuration(
+                    "runtime gap completed without a pending intent".to_owned(),
+                )
+            })?;
+            validate_pending_runtime_gap(&pending)?;
+            if !runtime_gap_pending_matches(&pending, expected)
+                || gap_event_ids != [pending.gap_event.event_id.clone()]
+            {
+                return Err(EngineError::Configuration(
+                    "runtime gap completion does not match its durable intent".to_owned(),
+                ));
+            }
+
+            let mut session = current_session(document)?.ok_or_else(|| {
+                EngineError::Configuration(
+                    "runtime gap completion has no active session".to_owned(),
+                )
+            })?;
+            if session.session_id != pending.session_id || session.closed_at.is_some() {
+                return Err(EngineError::Configuration(
+                    "runtime gap completion session changed".to_owned(),
+                ));
+            }
+            faults.check_checkpoint_write()?;
+            session.last_heartbeat_at = pending.reconciled_at;
+            if pending.reason == RuntimeGapReason::ClockCorrection
+                && pending.reconciled_at < session.started_at
+            {
+                session.started_at = pending.reconciled_at;
+            }
+            put(document, "lifecycle_checkpoint", &session)?;
+
+            let mut extensions =
+                get::<LastRuntimeGapReconciliation>(document, "last_runtime_gap_reconciliation")?
+                    .map(|last| last.extensions)
+                    .unwrap_or_default();
+            extensions.extend(pending.extensions.clone());
+            put(
+                document,
+                "last_runtime_gap_reconciliation",
+                &LastRuntimeGapReconciliation {
+                    session_id: pending.session_id.clone(),
+                    reason: pending.reason,
+                    device_id: pending.device_id.clone(),
+                    display_timezone: pending.display_timezone.clone(),
+                    reconciled_at: pending.reconciled_at,
+                    gap_event_ids: gap_event_ids.to_vec(),
+                    extensions,
+                },
+            )?;
+            document.remove("pending_runtime_gap_reconciliation");
             Ok(())
         })
     }
@@ -619,10 +840,130 @@ fn validate_startup_request(request: &StartupReconcileRequest) -> Result<()> {
     Ok(())
 }
 
+fn validate_runtime_gap_request(request: &RuntimeGapReconcileRequest) -> Result<()> {
+    if request.display_timezone.is_empty() || request.display_timezone.len() > 128 {
+        return Err(EngineError::Configuration(
+            "runtime gap display timezone must be non-empty and bounded".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pending_runtime_gap(pending: &PendingRuntimeGapReconciliation) -> Result<()> {
+    validate_session_id(&pending.session_id)?;
+    if pending.display_timezone.is_empty() || pending.display_timezone.len() > 128 {
+        return Err(EngineError::Configuration(
+            "pending runtime gap display timezone must be non-empty and bounded".to_owned(),
+        ));
+    }
+    pending
+        .gap_event
+        .validate()
+        .map_err(EngineError::Aggregation)?;
+    let EventPayload::RecordingGap(gap) = &pending.gap_event.payload else {
+        return Err(EngineError::Configuration(
+            "pending runtime gap contains a non-gap event".to_owned(),
+        ));
+    };
+    if gap.reason != GapReason::from(pending.reason)
+        || pending.gap_event.device_id != pending.device_id
+        || pending.gap_event.display_timezone != pending.display_timezone
+    {
+        return Err(EngineError::Configuration(
+            "pending runtime gap metadata is inconsistent".to_owned(),
+        ));
+    }
+    let reconciled_at_matches =
+        if pending.reason == RuntimeGapReason::ClockCorrection && pending.reconciled_at < gap.end {
+            gap.start == pending.reconciled_at
+        } else {
+            gap.end == pending.reconciled_at
+        };
+    if !reconciled_at_matches {
+        return Err(EngineError::Configuration(
+            "pending runtime gap boundary is inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_gap_request_matches_pending(
+    request: &RuntimeGapReconcileRequest,
+    pending: &PendingRuntimeGapReconciliation,
+) -> bool {
+    request.reason == pending.reason
+        && request.device_id == pending.device_id
+        && request.display_timezone == pending.display_timezone
+        && request.now == pending.reconciled_at
+}
+
+fn runtime_gap_request_matches_last(
+    request: &RuntimeGapReconcileRequest,
+    session_id: &str,
+    last: &LastRuntimeGapReconciliation,
+) -> bool {
+    session_id == last.session_id
+        && request.reason == last.reason
+        && request.device_id == last.device_id
+        && request.display_timezone == last.display_timezone
+        && request.now == last.reconciled_at
+}
+
+fn runtime_gap_pending_matches(
+    left: &PendingRuntimeGapReconciliation,
+    right: &PendingRuntimeGapReconciliation,
+) -> bool {
+    left.session_id == right.session_id
+        && left.reason == right.reason
+        && left.device_id == right.device_id
+        && left.display_timezone == right.display_timezone
+        && left.reconciled_at == right.reconciled_at
+        && left.gap_event == right.gap_event
+}
+
 fn validate_session_id(session_id: &str) -> Result<()> {
     EventId::new(session_id.to_owned())
         .map(|_| ())
         .map_err(EngineError::Identifier)
+}
+
+fn runtime_gap_event(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    request: &RuntimeGapReconcileRequest,
+    session_id: &str,
+) -> Result<EventEnvelope> {
+    let reason = GapReason::from(request.reason);
+    let stable_identity = serde_json::to_vec(&(
+        session_id,
+        start,
+        end,
+        reason,
+        request.device_id.as_str(),
+        &request.display_timezone,
+    ))
+    .map_err(|error| EngineError::Configuration(error.to_string()))?;
+    let digest = chronicle_store::checksum::checksum_bytes(&stable_identity);
+    let event = EventEnvelope {
+        schema_version: chronicle_domain::CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new(format!("runtime-gap-{digest}"))?,
+        device_id: request.device_id.clone(),
+        scheduled_at: None,
+        // The payload interval may point across a backward wall-clock correction,
+        // but the envelope timestamps describe when that correction was observed
+        // and durably authored on the corrected clock.
+        observed_at: request.now,
+        recorded_at: request.now,
+        display_timezone: request.display_timezone.clone(),
+        source: EvidenceSource {
+            adapter: "app-lifecycle".to_owned(),
+            version: "1.0".to_owned(),
+        },
+        kind: EventKind::RecordingGap,
+        payload: EventPayload::RecordingGap(RecordingGap { start, end, reason }),
+    };
+    event.validate().map_err(EngineError::Aggregation)?;
+    Ok(event)
 }
 
 fn gap_end(event: &EventEnvelope) -> Option<DateTime<Utc>> {

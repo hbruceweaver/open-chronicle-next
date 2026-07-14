@@ -2,6 +2,125 @@ import XCTest
 @testable import OpenChronicle
 
 final class CaptureRaceTests: XCTestCase {
+    func testSleepInvalidationDuringCaptureDropsPixelsBeforeNormalization() async {
+        let identity = testIdentity()
+        let epoch = CaptureExecutionEpoch()
+        let generation = await epoch.beginGeneration()
+        let capturer = BlockingCapturer()
+        let normalizer = TestNormalizer()
+        let ocr = TestOCR()
+        let encoder = TestEncoder()
+        let ingestor = TestIngestor()
+        let pipeline = testPipeline(
+            provider: TestWindowProvider([
+                .exact(.testFixture(identity: identity)),
+                .exact(.testFixture(identity: identity)),
+            ]),
+            environment: TestEnvironment([allowedEnvironment]),
+            capturer: capturer,
+            normalizer: normalizer,
+            ocr: ocr,
+            encoder: encoder,
+            ingestor: ingestor,
+            validity: epoch
+        )
+        let context = testAttemptContext(
+            token: "sleep-invalidation",
+            executionGeneration: generation
+        )
+
+        let attempt = Task { await pipeline.attempt(context: context) }
+        await capturer.waitUntilStarted()
+        await epoch.invalidate(generation: generation, reason: .sleep)
+        await capturer.release()
+        let result = await attempt.value
+        let ocrCalls = await ocr.calls
+        let entries = await ingestor.entries
+
+        XCTAssertEqual(result, .invalidated(.sleep))
+        XCTAssertEqual(normalizer.calls, 0)
+        XCTAssertEqual(ocrCalls, 0)
+        XCTAssertEqual(encoder.calls, 0)
+        XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testPersistencePermitLinearizesBeforeLifecycleInvalidation() async {
+        let identity = testIdentity()
+        let epoch = CaptureExecutionEpoch()
+        let generation = await epoch.beginGeneration()
+        let ingestor = BlockingCaptureIngestor()
+        let pipeline = testPipeline(
+            provider: TestWindowProvider([
+                .exact(.testFixture(identity: identity)),
+                .exact(.testFixture(identity: identity)),
+            ]),
+            environment: TestEnvironment([allowedEnvironment]),
+            capturer: TestCapturer(),
+            ingestor: ingestor,
+            validity: epoch
+        )
+        let context = testAttemptContext(
+            token: "linearized-persistence",
+            executionGeneration: generation
+        )
+        let probe = CompletionProbe()
+
+        let attempt = Task { await pipeline.attempt(context: context) }
+        await ingestor.waitUntilStarted()
+        let invalidation = Task {
+            await epoch.invalidate(generation: generation, reason: .sleep)
+            await probe.markComplete()
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        let completedBeforeRelease = await probe.isComplete
+        XCTAssertFalse(completedBeforeRelease)
+
+        await ingestor.release()
+        let result = await attempt.value
+        await invalidation.value
+
+        guard case .stored = result else {
+            return XCTFail("the permit-linearized transaction should finish")
+        }
+        let completedAfterRelease = await probe.isComplete
+        let ingestCalls = await ingestor.calls
+        XCTAssertTrue(completedAfterRelease)
+        XCTAssertEqual(ingestCalls, 1)
+    }
+
+    func testInvalidationAfterPixelsButBeforePermitPreventsPersistence() async {
+        let identity = testIdentity()
+        let epoch = CaptureExecutionEpoch()
+        let generation = await epoch.beginGeneration()
+        let ocr = BlockingOCR()
+        let ingestor = TestIngestor()
+        let pipeline = testPipeline(
+            provider: TestWindowProvider([
+                .exact(.testFixture(identity: identity)),
+                .exact(.testFixture(identity: identity)),
+            ]),
+            environment: TestEnvironment([allowedEnvironment]),
+            capturer: TestCapturer(),
+            ocr: ocr,
+            ingestor: ingestor,
+            validity: epoch
+        )
+        let context = testAttemptContext(
+            token: "pre-permit-invalidation",
+            executionGeneration: generation
+        )
+
+        let attempt = Task { await pipeline.attempt(context: context) }
+        await ocr.waitUntilStarted()
+        await epoch.invalidate(generation: generation, reason: .sleep)
+        await ocr.release()
+        let result = await attempt.value
+
+        XCTAssertEqual(result, .invalidated(.sleep))
+        let entries = await ingestor.entries
+        XCTAssertTrue(entries.isEmpty)
+    }
+
     func testSecureInputTransitionDropsPixelsBeforeAllPixelConsumers() async {
         let identity = testIdentity()
         let provider = TestWindowProvider([
@@ -32,7 +151,7 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt()
+        let result = await pipeline.attempt(context: testAttemptContext(token: "secure-post"))
         XCTAssertEqual(result, .denied(.secureInput))
         let providerCalls = await provider.calls
         let captureCalls = await capturer.calls
@@ -75,7 +194,7 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt()
+        let result = await pipeline.attempt(context: testAttemptContext(token: "secure-pre"))
         let providerCalls = await provider.calls
         let captureCalls = await capturer.calls
         XCTAssertEqual(result, .denied(.secureInput))
@@ -121,7 +240,7 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt()
+        let result = await pipeline.attempt(context: testAttemptContext(token: "secure-lookup"))
         let providerCalls = await provider.calls
         let captureCalls = await capturer.calls
         let ocrCalls = await ocr.calls
@@ -156,7 +275,7 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt()
+        let result = await pipeline.attempt(context: testAttemptContext(token: "permission-pre"))
         let providerCalls = await provider.calls
         let captureCalls = await capturer.calls
         XCTAssertEqual(result, .denied(.permissionDenied))
@@ -179,7 +298,7 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt()
+        let result = await pipeline.attempt(context: testAttemptContext(token: "foreground"))
         XCTAssertEqual(result, .denied(.foregroundChanged))
         XCTAssertEqual(normalizer.calls, 0)
         let entries = await ingestor.entries
@@ -216,7 +335,7 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt()
+        let result = await pipeline.attempt(context: testAttemptContext(token: "permission-loss"))
         XCTAssertEqual(result, .denied(.permissionDenied))
         let entries = await ingestor.entries
         guard case let .denied(reason, _) = entries.first?.record else {
@@ -237,7 +356,7 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt()
+        let result = await pipeline.attempt(context: testAttemptContext(token: "capture-failure"))
         guard case .stored = result else {
             return XCTFail("coarse capture failure was not durably stored")
         }
@@ -274,9 +393,15 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let first = await pipeline.attempt(proofToken: token)
+        let first = await pipeline.attempt(
+            context: testAttemptContext(token: "proof-first"),
+            proofToken: token
+        )
         let initialEntries = await ingestor.entries
-        let second = await pipeline.attempt(proofToken: token)
+        let second = await pipeline.attempt(
+            context: testAttemptContext(token: "proof-second"),
+            proofToken: token
+        )
         let captureCalls = await capturer.calls
         XCTAssertEqual(first, .proofSucceeded)
         XCTAssertTrue(initialEntries.isEmpty)
@@ -309,7 +434,10 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt(proofToken: token)
+        let result = await pipeline.attempt(
+            context: testAttemptContext(token: "proof-text"),
+            proofToken: token
+        )
         XCTAssertEqual(result, .denied(.chronicleSelf))
         XCTAssertEqual(encoder.calls, 0)
         let entries = await ingestor.entries
@@ -343,7 +471,10 @@ final class CaptureRaceTests: XCTestCase {
             ingestor: ingestor
         )
 
-        let result = await pipeline.attempt(proofToken: token)
+        let result = await pipeline.attempt(
+            context: testAttemptContext(token: "proof-scope"),
+            proofToken: token
+        )
         let captureCalls = await capturer.calls
         let ocrCalls = await ocr.calls
         XCTAssertEqual(result, .denied(.chronicleSelf))
@@ -354,5 +485,92 @@ final class CaptureRaceTests: XCTestCase {
         let entries = await ingestor.entries
         XCTAssertEqual(entries.count, 1)
         XCTAssertNil(entries[0].image)
+    }
+}
+
+private actor BlockingCapturer: ExactWindowCapturing {
+    private var started = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func capture(_ window: ResolvedActiveWindow) async -> CapturedWindowImage {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+        return CapturedWindowImage(image: testImage(), scaleMilli: 2_000)
+    }
+
+    func waitUntilStarted() async {
+        while !started { await Task.yield() }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor BlockingCaptureIngestor: CaptureIngesting {
+    private var started = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var calls = 0
+
+    func ingest(
+        record: CaptureIngestRecord,
+        image: Data?,
+        context: CaptureAttemptContext,
+        observedAt: Date,
+        permit: CapturePersistencePermit
+    ) async -> CaptureIngestAcknowledgement {
+        calls += 1
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+        return CaptureIngestAcknowledgement(
+            durability: .durable,
+            eventID: context.eventID,
+            ocrEventID: context.eventID,
+            imageArtifactID: context.imageArtifactID
+        )
+    }
+
+    func waitUntilStarted() async {
+        while !started { await Task.yield() }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor CompletionProbe {
+    private(set) var isComplete = false
+    func markComplete() { isComplete = true }
+}
+
+private actor BlockingOCR: OCRRecognizing {
+    private var started = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func recognize(_ image: NormalizedImage) async -> OCRRecognition {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+        return .complete(
+            text: "Synthetic text",
+            confidence: 0.9,
+            provenance: OCRProvenance(
+                engineAdapter: "blocking-test",
+                engineVersion: "1",
+                automaticLanguageDetection: true,
+                recognitionLanguages: []
+            )
+        )
+    }
+
+    func waitUntilStarted() async {
+        while !started { await Task.yield() }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }

@@ -3,6 +3,32 @@ import XCTest
 @testable import OpenChronicle
 
 final class CaptureIngestorTests: XCTestCase {
+    func testClockDiscontinuityIsRejectedBeforeCoreCall() async throws {
+        let core = SpyCoreService()
+        let instant = Date(timeIntervalSince1970: 1_784_016_000)
+        let ingestor = CoreCaptureIngestor(
+            core: core,
+            recordingTime: FixedRecordingTimeSource(instant.addingTimeInterval(2))
+        )
+
+        do {
+            _ = try await ingestor.ingest(
+                record: .denied(reason: .permissionDenied, presence: .active),
+                image: nil,
+                context: context(instant: instant),
+                observedAt: instant.addingTimeInterval(-1),
+                permit: permit()
+            )
+            XCTFail("clock rollback should be rejected")
+        } catch CoreCaptureIngestorError.clockDiscontinuity {
+            // Expected: no event may span a wall-clock discontinuity.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        let capturedRequest = await core.lastRequest
+        XCTAssertNil(capturedRequest)
+    }
+
     func testFactoryRoundTripsChangedImageAndLifecycleThroughRealRustCore() async throws {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -11,8 +37,10 @@ final class CaptureIngestorTests: XCTestCase {
         let instant = Date(timeIntervalSince1970: 1_784_016_000)
         let core = try InProcessCore(applicationSupportURL: temporary, now: instant)
         try await startRecording(core, at: instant)
-        let source = FixedMetadataSource(metadata(instant: instant))
-        let ingestor = CoreCaptureIngestor(core: core, metadata: source)
+        let ingestor = CoreCaptureIngestor(
+            core: core,
+            recordingTime: FixedRecordingTimeSource(instant.addingTimeInterval(2))
+        )
 
         let acknowledgement = try await ingestor.ingest(
             record: changedRecord(
@@ -27,7 +55,10 @@ final class CaptureIngestorTests: XCTestCase {
                     scaleMilli: 2_000
                 )
             ),
-            image: Data([1, 2, 3])
+            image: Data([1, 2, 3]),
+            context: context(instant: instant),
+            observedAt: instant.addingTimeInterval(1),
+            permit: permit()
         )
 
         XCTAssertTrue(acknowledgement.durability.isCanonicalDurable)
@@ -65,7 +96,7 @@ final class CaptureIngestorTests: XCTestCase {
         let instant = Date(timeIntervalSince1970: 1_784_016_000)
         let ingestor = CoreCaptureIngestor(
             core: core,
-            metadata: FixedMetadataSource(metadata(instant: instant))
+            recordingTime: FixedRecordingTimeSource(instant.addingTimeInterval(2))
         )
 
         _ = try await ingestor.ingest(
@@ -73,13 +104,25 @@ final class CaptureIngestorTests: XCTestCase {
                 ocr: .failed(provenance: provenance),
                 dimensions: nil
             ),
-            image: nil
+            image: nil,
+            context: context(instant: instant),
+            observedAt: instant.addingTimeInterval(1),
+            permit: permit()
         )
 
         let capturedRequest = await core.lastRequest
         let request = try XCTUnwrap(capturedRequest)
         let json = try JSONSerialization.jsonObject(with: request) as! [String: Any]
         let event = json["event"] as! [String: Any]
+        XCTAssertEqual(event["scheduled_at"] as? String, timestamp(instant))
+        XCTAssertEqual(
+            event["observed_at"] as? String,
+            timestamp(instant.addingTimeInterval(1))
+        )
+        XCTAssertEqual(
+            event["recorded_at"] as? String,
+            timestamp(instant.addingTimeInterval(2))
+        )
         let payload = event["payload"] as! [String: Any]
         let attempt = payload["data"] as! [String: Any]
         let content = attempt["content"] as! [String: Any]
@@ -93,12 +136,15 @@ final class CaptureIngestorTests: XCTestCase {
         let instant = Date(timeIntervalSince1970: 1_784_016_000)
         let ingestor = CoreCaptureIngestor(
             core: core,
-            metadata: FixedMetadataSource(metadata(instant: instant))
+            recordingTime: FixedRecordingTimeSource(instant.addingTimeInterval(2))
         )
 
         _ = try await ingestor.ingest(
             record: .denied(reason: .applicationExcluded, presence: .active),
-            image: nil
+            image: nil,
+            context: context(instant: instant),
+            observedAt: instant.addingTimeInterval(1),
+            permit: permit()
         )
 
         let capturedRequest = await core.lastRequest
@@ -122,11 +168,14 @@ final class CaptureIngestorTests: XCTestCase {
             let instant = Date(timeIntervalSince1970: 1_784_016_000)
             let ingestor = CoreCaptureIngestor(
                 core: core,
-                metadata: FixedMetadataSource(metadata(instant: instant))
+                recordingTime: FixedRecordingTimeSource(instant.addingTimeInterval(2))
             )
             _ = try await ingestor.ingest(
                 record: .denied(reason: reason, presence: .active),
-                image: nil
+                image: nil,
+                context: context(instant: instant),
+                observedAt: instant.addingTimeInterval(1),
+                permit: permit()
             )
             let capturedRequest = await core.lastRequest
             let request = try XCTUnwrap(capturedRequest)
@@ -152,11 +201,14 @@ final class CaptureIngestorTests: XCTestCase {
             let instant = Date(timeIntervalSince1970: 1_784_016_000)
             let ingestor = CoreCaptureIngestor(
                 core: core,
-                metadata: FixedMetadataSource(metadata(instant: instant))
+                recordingTime: FixedRecordingTimeSource(instant.addingTimeInterval(2))
             )
             _ = try await ingestor.ingest(
                 record: .denied(reason: reason, presence: .unknown),
-                image: nil
+                image: nil,
+                context: context(instant: instant),
+                observedAt: instant.addingTimeInterval(1),
+                permit: permit()
             )
             let capturedRequest = await core.lastRequest
             let request = try XCTUnwrap(capturedRequest)
@@ -197,29 +249,38 @@ final class CaptureIngestorTests: XCTestCase {
         )
     }
 
-    private func metadata(instant: Date) -> CaptureEventMetadata {
-        CaptureEventMetadata(
+    private func context(instant: Date) -> CaptureAttemptContext {
+        CaptureAttemptContext(
             eventID: "event-u7-1",
             lifecycleEventID: "lifecycle-u7-1",
             imageArtifactID: "image-u7-1",
             deviceID: "device-u7",
             scheduledAt: instant,
-            observedAt: instant,
-            recordedAt: instant,
             displayTimezone: "Europe/Zurich",
             sourceVersion: "test-1",
             cadenceSeconds: 30,
             bootSequence: "boot-u7",
             monotonicTick: 1,
-            screenshotExpiresAt: instant.addingTimeInterval(86_400)
+            retentionSeconds: 86_400,
+            executionGeneration: 1
         )
+    }
+
+    private func timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    private func permit() -> CapturePersistencePermit {
+        CapturePersistencePermit(id: UUID(), executionGeneration: 1)
     }
 }
 
-private actor FixedMetadataSource: CaptureEventMetadataProviding {
-    let value: CaptureEventMetadata
-    init(_ value: CaptureEventMetadata) { self.value = value }
-    func nextMetadata() -> CaptureEventMetadata { value }
+private struct FixedRecordingTimeSource: CaptureRecordingTimeProviding {
+    let value: Date
+    init(_ value: Date) { self.value = value }
+    func now() -> Date { value }
 }
 
 private actor SpyCoreService: CoreService {

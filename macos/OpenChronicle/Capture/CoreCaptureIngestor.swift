@@ -1,89 +1,63 @@
 import Foundation
 
-struct CaptureEventMetadata: Equatable, Sendable {
-    let eventID: String
-    let lifecycleEventID: String
-    let imageArtifactID: String
-    let deviceID: String
-    let scheduledAt: Date
+private struct CaptureEventMetadata {
+    let context: CaptureAttemptContext
     let observedAt: Date
     let recordedAt: Date
-    let displayTimezone: String
-    let sourceVersion: String
-    let cadenceSeconds: UInt32
-    let bootSequence: String
-    let monotonicTick: UInt64
-    let screenshotExpiresAt: Date
 }
 
-protocol CaptureEventMetadataProviding: Sendable {
-    func nextMetadata() async -> CaptureEventMetadata
+protocol CaptureRecordingTimeProviding: Sendable {
+    func now() async -> Date
 }
 
-actor SystemCaptureEventMetadataSource: CaptureEventMetadataProviding {
-    private let deviceID: String
-    private let cadenceSeconds: UInt32
-    private let retentionSeconds: TimeInterval
-    private let bootSequence = "boot-\(UUID().uuidString.lowercased())"
-    private var monotonicTick: UInt64 = 0
-
-    init(
-        deviceID: String,
-        cadenceSeconds: UInt32,
-        retentionSeconds: TimeInterval
-    ) {
-        self.deviceID = deviceID
-        self.cadenceSeconds = cadenceSeconds
-        self.retentionSeconds = retentionSeconds
-    }
-
-    func nextMetadata() -> CaptureEventMetadata {
-        monotonicTick &+= 1
-        let now = Date()
-        let token = UUID().uuidString.lowercased()
-        return CaptureEventMetadata(
-            eventID: "event-\(token)",
-            lifecycleEventID: "lifecycle-\(UUID().uuidString.lowercased())",
-            imageArtifactID: "image-\(UUID().uuidString.lowercased())",
-            deviceID: deviceID,
-            scheduledAt: now,
-            observedAt: now,
-            recordedAt: now,
-            displayTimezone: TimeZone.current.identifier,
-            sourceVersion: "macos-capture-1",
-            cadenceSeconds: cadenceSeconds,
-            bootSequence: bootSequence,
-            monotonicTick: monotonicTick,
-            screenshotExpiresAt: now.addingTimeInterval(retentionSeconds)
-        )
-    }
+struct SystemCaptureRecordingTimeSource: CaptureRecordingTimeProviding {
+    func now() -> Date { Date() }
 }
 
 enum CoreCaptureIngestorError: Error {
     case malformedRecord
+    case clockDiscontinuity
+    case invalidPersistencePermit
     case coreRejected(ChronicleErrorPayload?)
 }
 
 actor CoreCaptureIngestor: CaptureIngesting {
     private let core: any CoreService
-    private let metadata: any CaptureEventMetadataProviding
+    private let recordingTime: any CaptureRecordingTimeProviding
     private let privacyPolicyVersion: String
 
     init(
         core: any CoreService,
-        metadata: any CaptureEventMetadataProviding,
+        recordingTime: any CaptureRecordingTimeProviding = SystemCaptureRecordingTimeSource(),
         privacyPolicyVersion: String = CapturePrivacyPolicy.default.policyVersion
     ) {
         self.core = core
-        self.metadata = metadata
+        self.recordingTime = recordingTime
         self.privacyPolicyVersion = privacyPolicyVersion
     }
 
     func ingest(
         record: CaptureIngestRecord,
-        image: Data?
+        image: Data?,
+        context: CaptureAttemptContext,
+        observedAt: Date,
+        permit: CapturePersistencePermit
     ) async throws -> CaptureIngestAcknowledgement {
-        let metadata = await metadata.nextMetadata()
+        guard permit.executionGeneration == context.executionGeneration else {
+            throw CoreCaptureIngestorError.invalidPersistencePermit
+        }
+        guard observedAt >= context.scheduledAt else {
+            throw CoreCaptureIngestorError.clockDiscontinuity
+        }
+        let recordedAt = await recordingTime.now()
+        guard recordedAt >= observedAt else {
+            throw CoreCaptureIngestorError.clockDiscontinuity
+        }
+        let metadata = CaptureEventMetadata(
+            context: context,
+            observedAt: observedAt,
+            recordedAt: recordedAt
+        )
         let built = try Self.build(
             record: record,
             image: image,
@@ -94,8 +68,9 @@ actor CoreCaptureIngestor: CaptureIngesting {
             "schema_version": "1.0",
             "now": Self.timestamp(metadata.recordedAt),
             "cadence": [
-                "boot_sequence": metadata.bootSequence,
-                "monotonic_tick": metadata.monotonicTick,
+                "boot_sequence": context.bootSequence,
+                "monotonic_tick": context.monotonicTick,
+                "execution_generation": context.executionGeneration,
             ],
             "event": built.event,
             "completion": built.completion ?? NSNull(),
@@ -118,9 +93,9 @@ actor CoreCaptureIngestor: CaptureIngesting {
         }
         return CaptureIngestAcknowledgement(
             durability: durability,
-            eventID: metadata.eventID,
-            ocrEventID: built.hasOCR ? metadata.eventID : nil,
-            imageArtifactID: image == nil ? nil : metadata.imageArtifactID
+            eventID: context.eventID,
+            ocrEventID: built.hasOCR ? context.eventID : nil,
+            imageArtifactID: image == nil ? nil : context.imageArtifactID
         )
     }
 
@@ -204,11 +179,11 @@ actor CoreCaptureIngestor: CaptureIngesting {
                     throw CoreCaptureIngestorError.malformedRecord
                 }
                 let managedPath = managedImagePath(
-                    artifactID: metadata.imageArtifactID,
+                    artifactID: metadata.context.imageArtifactID,
                     date: metadata.recordedAt
                 )
                 imageObject = [
-                    "artifact_id": metadata.imageArtifactID,
+                    "artifact_id": metadata.context.imageArtifactID,
                     "managed_relative_path": managedPath,
                     "content_hash": contentHash,
                     "dimensions": [
@@ -216,7 +191,11 @@ actor CoreCaptureIngestor: CaptureIngesting {
                         "height": dimensions.height,
                         "scale_milli": dimensions.scaleMilli,
                     ],
-                    "expires_at": timestamp(metadata.screenshotExpiresAt),
+                    "expires_at": timestamp(
+                        metadata.recordedAt.addingTimeInterval(
+                            metadata.context.retentionSeconds
+                        )
+                    ),
                     "intent_state": "pending",
                 ]
                 completion = lifecycleCompletion(metadata: metadata)
@@ -301,7 +280,7 @@ actor CoreCaptureIngestor: CaptureIngesting {
         return [
             "type": "observation-attempt",
             "data": [
-                "cadence_seconds": metadata.cadenceSeconds,
+                "cadence_seconds": metadata.context.cadenceSeconds,
                 "attempt_status": attemptStatus,
                 "evidence_state": evidenceState,
                 "presence_state": mappedPresence,
@@ -318,13 +297,13 @@ actor CoreCaptureIngestor: CaptureIngesting {
     ) -> [String: Any] {
         [
             "schema_version": "1.0",
-            "event_id": metadata.eventID,
-            "device_id": metadata.deviceID,
-            "scheduled_at": timestamp(metadata.scheduledAt),
+            "event_id": metadata.context.eventID,
+            "device_id": metadata.context.deviceID,
+            "scheduled_at": timestamp(metadata.context.scheduledAt),
             "observed_at": timestamp(metadata.observedAt),
             "recorded_at": timestamp(metadata.recordedAt),
-            "display_timezone": metadata.displayTimezone,
-            "source": ["adapter": "macos-exact-window", "version": metadata.sourceVersion],
+            "display_timezone": metadata.context.displayTimezone,
+            "source": ["adapter": "macos-exact-window", "version": metadata.context.sourceVersion],
             "kind": "observation-attempt",
             "payload": payload,
         ]
@@ -336,24 +315,24 @@ actor CoreCaptureIngestor: CaptureIngesting {
         let when = timestamp(metadata.recordedAt)
         return [
             "schema_version": "1.0",
-            "event_id": metadata.lifecycleEventID,
-            "device_id": metadata.deviceID,
+            "event_id": metadata.context.lifecycleEventID,
+            "device_id": metadata.context.deviceID,
             "scheduled_at": NSNull(),
             "observed_at": when,
             "recorded_at": when,
-            "display_timezone": metadata.displayTimezone,
-            "source": ["adapter": "macos-exact-window", "version": metadata.sourceVersion],
+            "display_timezone": metadata.context.displayTimezone,
+            "source": ["adapter": "macos-exact-window", "version": metadata.context.sourceVersion],
             "kind": "screenshot-lifecycle",
             "payload": [
                 "type": "screenshot-lifecycle",
                 "data": [
-                    "artifact_id": metadata.imageArtifactID,
+                    "artifact_id": metadata.context.imageArtifactID,
                     "action": "write-completed",
                     "deletion_cause": NSNull(),
                     "projected_state": "retained",
                     "requested_at": NSNull(),
                     "completed_at": when,
-                    "source_event_id": metadata.eventID,
+                    "source_event_id": metadata.context.eventID,
                 ],
             ],
         ]

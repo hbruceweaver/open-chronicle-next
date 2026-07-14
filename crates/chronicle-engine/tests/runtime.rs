@@ -7,7 +7,8 @@ use chronicle_domain::{
 };
 use chronicle_engine::{
     CadenceStamp, CaptureAdmissionReason, ChunkerConfig, EngineError, IngestRequest,
-    RecordingCoordinator, RuntimeFaultInjector, StartupReconcileRequest,
+    RecordingCoordinator, RuntimeFaultInjector, RuntimeGapReason, RuntimeGapReconcileRequest,
+    StartupReconcileRequest,
 };
 use chronicle_store::{
     CanonicalJournal, FaultInjector, FaultPoint, JournalFamily, ManagedRoot, StoreError,
@@ -33,6 +34,15 @@ fn open(root: ManagedRoot, now: DateTime<Utc>) -> RecordingCoordinator {
 fn startup(session_id: &str, now: DateTime<Utc>) -> StartupReconcileRequest {
     StartupReconcileRequest {
         session_id: session_id.to_owned(),
+        device_id: DeviceId::new("dev-runtime-test").expect("device ID"),
+        display_timezone: "Europe/Zurich".to_owned(),
+        now,
+    }
+}
+
+fn runtime_gap(reason: RuntimeGapReason, now: DateTime<Utc>) -> RuntimeGapReconcileRequest {
+    RuntimeGapReconcileRequest {
+        reason,
         device_id: DeviceId::new("dev-runtime-test").expect("device ID"),
         display_timezone: "Europe/Zurich".to_owned(),
         now,
@@ -496,6 +506,267 @@ fn screenshot_fault_matrix_recovers_the_strongest_canonical_heartbeat_without_re
             "supplied completion count after {point:?}"
         );
     }
+}
+
+#[test]
+fn runtime_gap_reconciliation_is_forward_idempotent_for_each_allowed_reason() {
+    for (reason, expected) in [
+        (RuntimeGapReason::Sleep, GapReason::Sleep),
+        (RuntimeGapReason::StorageOutage, GapReason::StorageOutage),
+        (
+            RuntimeGapReason::ClockCorrection,
+            GapReason::ClockCorrection,
+        ),
+    ] {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ManagedRoot::initialize(temporary.path().join("store")).expect("managed root");
+        let mut coordinator = open(root.clone(), at("2026-07-13T09:00:00Z"));
+        coordinator
+            .startup_reconcile(startup("session-gap", at("2026-07-13T09:00:00Z")))
+            .expect("start session");
+        let request = runtime_gap(reason, at("2026-07-13T09:05:00Z"));
+        let first = coordinator
+            .reconcile_runtime_gap(request.clone())
+            .expect("reconcile runtime gap");
+        let repeated = coordinator
+            .reconcile_runtime_gap(request)
+            .expect("repeat runtime gap");
+        assert_eq!(first, repeated);
+        assert_eq!(first.gap_event_ids.len(), 1);
+
+        let gaps = gap_events(&root);
+        assert_eq!(gaps.len(), 1);
+        let EventPayload::RecordingGap(gap) = &gaps[0].payload else {
+            unreachable!();
+        };
+        assert_eq!(gap.start, at("2026-07-13T09:00:00Z"));
+        assert_eq!(gap.end, at("2026-07-13T09:05:00Z"));
+        assert_eq!(gap.reason, expected);
+    }
+}
+
+#[test]
+fn runtime_gap_zero_range_is_a_stable_no_op() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = ManagedRoot::initialize(temporary.path().join("store")).expect("managed root");
+    let mut coordinator = open(root.clone(), at("2026-07-13T09:00:00Z"));
+    coordinator
+        .startup_reconcile(startup("session-zero", at("2026-07-13T09:00:00Z")))
+        .expect("start session");
+    let request = runtime_gap(RuntimeGapReason::Sleep, at("2026-07-13T09:00:00Z"));
+    let first = coordinator
+        .reconcile_runtime_gap(request.clone())
+        .expect("zero gap");
+    let repeated = coordinator
+        .reconcile_runtime_gap(request)
+        .expect("repeat zero gap");
+    assert_eq!(first, repeated);
+    assert!(first.gap_event_ids.is_empty());
+    assert!(gap_events(&root).is_empty());
+}
+
+#[test]
+fn backward_clock_correction_resets_the_authoritative_heartbeat() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = ManagedRoot::initialize(temporary.path().join("store")).expect("managed root");
+    let mut coordinator = open(root.clone(), at("2026-07-13T09:10:00Z"));
+    coordinator
+        .startup_reconcile(startup("session-rollback", at("2026-07-13T09:10:00Z")))
+        .expect("start session");
+    coordinator
+        .reconcile_runtime_gap(runtime_gap(
+            RuntimeGapReason::ClockCorrection,
+            at("2026-07-13T09:05:00Z"),
+        ))
+        .expect("record backward correction");
+    coordinator
+        .reconcile_runtime_gap(runtime_gap(
+            RuntimeGapReason::Sleep,
+            at("2026-07-13T09:06:00Z"),
+        ))
+        .expect("record from reset heartbeat");
+
+    let gaps = gap_events(&root);
+    assert_eq!(gaps.len(), 2);
+    let correction = gaps
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::RecordingGap(gap)
+                    if gap.reason == GapReason::ClockCorrection
+            )
+        })
+        .expect("clock correction event");
+    assert_eq!(correction.observed_at, at("2026-07-13T09:05:00Z"));
+    assert_eq!(correction.recorded_at, at("2026-07-13T09:05:00Z"));
+    let ranges = gaps
+        .iter()
+        .map(|event| {
+            let EventPayload::RecordingGap(gap) = &event.payload else {
+                unreachable!();
+            };
+            (gap.start, gap.end, gap.reason)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranges,
+        vec![
+            (
+                at("2026-07-13T09:05:00Z"),
+                at("2026-07-13T09:10:00Z"),
+                GapReason::ClockCorrection,
+            ),
+            (
+                at("2026-07-13T09:05:00Z"),
+                at("2026-07-13T09:06:00Z"),
+                GapReason::Sleep,
+            ),
+        ]
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&root.read("config.json").expect("read runtime config"))
+            .expect("decode runtime config");
+    assert_eq!(
+        document["lifecycle_checkpoint"]["last_heartbeat_at"],
+        "2026-07-13T09:06:00Z"
+    );
+}
+
+#[test]
+fn backward_sleep_or_storage_gap_is_rejected_without_mutating_checkpoint() {
+    for reason in [RuntimeGapReason::Sleep, RuntimeGapReason::StorageOutage] {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = ManagedRoot::initialize(temporary.path().join("store")).expect("managed root");
+        let mut coordinator = open(root.clone(), at("2026-07-13T09:10:00Z"));
+        coordinator
+            .startup_reconcile(startup(
+                "session-backward-reject",
+                at("2026-07-13T09:10:00Z"),
+            ))
+            .expect("start session");
+        assert!(matches!(
+            coordinator.reconcile_runtime_gap(runtime_gap(
+                reason,
+                at("2026-07-13T09:05:00Z")
+            )),
+            Err(EngineError::Configuration(message))
+                if message.contains("clock-correction")
+        ));
+        assert!(gap_events(&root).is_empty());
+        let document: serde_json::Value =
+            serde_json::from_slice(&root.read("config.json").expect("read runtime config"))
+                .expect("decode runtime config");
+        assert_eq!(
+            document["lifecycle_checkpoint"]["last_heartbeat_at"],
+            "2026-07-13T09:10:00Z"
+        );
+        assert!(document.get("pending_runtime_gap_reconciliation").is_none());
+    }
+}
+
+#[test]
+fn startup_finishes_a_runtime_gap_interrupted_before_journal_durability() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = ManagedRoot::initialize(temporary.path().join("store")).expect("managed root");
+    let mut first = open(root.clone(), at("2026-07-13T09:00:00Z"));
+    first
+        .startup_reconcile(startup("session-first", at("2026-07-13T09:00:00Z")))
+        .expect("start session");
+    assert!(matches!(
+        first.reconcile_runtime_gap_with_faults(
+            runtime_gap(RuntimeGapReason::Sleep, at("2026-07-13T09:10:00Z")),
+            FaultInjector::at(FaultPoint::AfterJournalAppend),
+            RuntimeFaultInjector::none(),
+        ),
+        Err(EngineError::Store(StoreError::InjectedFault(
+            FaultPoint::AfterJournalAppend
+        )))
+    ));
+    drop(first);
+
+    let mut reopened = open(root.clone(), at("2026-07-13T09:12:00Z"));
+    reopened
+        .startup_reconcile(startup("session-next", at("2026-07-13T09:12:00Z")))
+        .expect("recover pending gap before startup");
+    let gaps = gap_events(&root);
+    assert_eq!(gaps.len(), 2);
+    let reasons = gaps
+        .iter()
+        .map(|event| {
+            let EventPayload::RecordingGap(gap) = &event.payload else {
+                unreachable!();
+            };
+            gap.reason
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reasons, vec![GapReason::Sleep, GapReason::Quit]);
+    assert_eq!(
+        gaps.iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::RecordingGap(gap) if gap.reason == GapReason::Sleep
+                )
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn startup_finishes_a_canonical_runtime_gap_before_checkpoint_commit() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = ManagedRoot::initialize(temporary.path().join("store")).expect("managed root");
+    let mut first = open(root.clone(), at("2026-07-13T09:00:00Z"));
+    first
+        .startup_reconcile(startup("session-first", at("2026-07-13T09:00:00Z")))
+        .expect("start session");
+    assert!(matches!(
+        first.reconcile_runtime_gap_with_faults(
+            runtime_gap(
+                RuntimeGapReason::StorageOutage,
+                at("2026-07-13T09:10:00Z")
+            ),
+            FaultInjector::none(),
+            RuntimeFaultInjector::before_checkpoint_write(),
+        ),
+        Err(EngineError::Configuration(message))
+            if message.contains("runtime checkpoint write")
+    ));
+    assert_eq!(gap_events(&root).len(), 1);
+    update_config(&root, |document| {
+        document["pending_runtime_gap_reconciliation"]["future_gap_policy"] =
+            serde_json::json!({"keep": true});
+    });
+    drop(first);
+
+    let mut reopened = open(root.clone(), at("2026-07-13T09:12:00Z"));
+    reopened
+        .startup_reconcile(startup("session-next", at("2026-07-13T09:12:00Z")))
+        .expect("recover canonical gap before startup");
+    let gaps = gap_events(&root);
+    assert_eq!(gaps.len(), 2);
+    assert_eq!(
+        gaps.iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::RecordingGap(gap)
+                        if gap.reason == GapReason::StorageOutage
+                )
+            })
+            .count(),
+        1
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&root.read("config.json").expect("read runtime config"))
+            .expect("decode runtime config");
+    assert!(document.get("pending_runtime_gap_reconciliation").is_none());
+    assert_eq!(
+        document["last_runtime_gap_reconciliation"]["future_gap_policy"]["keep"],
+        true
+    );
 }
 
 #[test]

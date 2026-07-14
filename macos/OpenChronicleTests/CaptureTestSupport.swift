@@ -165,6 +165,9 @@ actor TestIngestor: CaptureIngesting {
     struct Entry: Equatable {
         let record: CaptureIngestRecord
         let image: Data?
+        let context: CaptureAttemptContext
+        let observedAt: Date
+        let permit: CapturePersistencePermit
     }
 
     private(set) var entries: [Entry] = []
@@ -176,9 +179,18 @@ actor TestIngestor: CaptureIngesting {
 
     func ingest(
         record: CaptureIngestRecord,
-        image: Data?
+        image: Data?,
+        context: CaptureAttemptContext,
+        observedAt: Date,
+        permit: CapturePersistencePermit
     ) -> CaptureIngestAcknowledgement {
-        entries.append(Entry(record: record, image: image))
+        entries.append(Entry(
+            record: record,
+            image: image,
+            context: context,
+            observedAt: observedAt,
+            permit: permit
+        ))
         if acknowledgements.isEmpty {
             return CaptureIngestAcknowledgement(
                 durability: .durable,
@@ -191,6 +203,48 @@ actor TestIngestor: CaptureIngesting {
     }
 }
 
+func testAttemptContext(
+    token: String = UUID().uuidString.lowercased(),
+    scheduledAt: Date = Date(timeIntervalSince1970: 1_784_016_000),
+    monotonicTick: UInt64 = 1,
+    executionGeneration: UInt64 = 1
+) -> CaptureAttemptContext {
+    CaptureAttemptContext(
+        eventID: "event-\(token)",
+        lifecycleEventID: "lifecycle-\(token)",
+        imageArtifactID: "image-\(token)",
+        deviceID: "device-test",
+        scheduledAt: scheduledAt,
+        displayTimezone: "Europe/Zurich",
+        sourceVersion: "test-1",
+        cadenceSeconds: 30,
+        bootSequence: "boot-test",
+        monotonicTick: monotonicTick,
+        retentionSeconds: 86_400,
+        executionGeneration: executionGeneration
+    )
+}
+
+struct AlwaysValidCaptureAttempt: CaptureAttemptValidityChecking {
+    func invalidation(for executionGeneration: UInt64) -> CaptureInvalidation? { nil }
+
+    func claimPersistence(
+        for executionGeneration: UInt64
+    ) -> CapturePersistencePermit? {
+        CapturePersistencePermit(
+            id: UUID(),
+            executionGeneration: executionGeneration
+        )
+    }
+
+    func releasePersistence(_ permit: CapturePersistencePermit) {}
+}
+
+struct FixedCaptureTimeSource: CaptureRecordingTimeProviding {
+    let value: Date
+    func now() -> Date { value }
+}
+
 struct FixedIdleReader: IdleSecondsReading {
     let value: TimeInterval?
     func idleSeconds() -> TimeInterval? { value }
@@ -199,13 +253,17 @@ struct FixedIdleReader: IdleSecondsReading {
 func testPipeline(
     provider: TestWindowProvider,
     environment: TestEnvironment,
-    capturer: TestCapturer,
+    capturer: any ExactWindowCapturing,
     normalizer: TestNormalizer = TestNormalizer(),
     deduplicator: ContentDeduplicator = ContentDeduplicator(),
-    ocr: TestOCR = TestOCR(),
+    ocr: any OCRRecognizing = TestOCR(),
     encoder: TestEncoder = TestEncoder(),
     proofTokens: CaptureProofTokenStore = CaptureProofTokenStore(),
-    ingestor: TestIngestor
+    ingestor: any CaptureIngesting,
+    observationTime: any CaptureRecordingTimeProviding = FixedCaptureTimeSource(
+        value: Date(timeIntervalSince1970: 1_784_016_001)
+    ),
+    validity: any CaptureAttemptValidityChecking = AlwaysValidCaptureAttempt()
 ) -> CaptureAttemptPipeline {
     CaptureAttemptPipeline(
         windowProvider: provider,
@@ -217,6 +275,8 @@ func testPipeline(
         encoder: encoder,
         idleState: IdleStateSource(reader: FixedIdleReader(value: 0)),
         proofTokens: proofTokens,
-        ingestor: ingestor
+        ingestor: ingestor,
+        observationTime: observationTime,
+        validity: validity
     )
 }

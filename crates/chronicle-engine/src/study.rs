@@ -16,8 +16,8 @@ use serde_json::{Map, Value};
 use crate::{
     CadenceStamp, CaptureAdmission, CaptureAdmissionReason, ChunkerConfig, EngineError,
     HeartbeatAcknowledgementProof, IngestEngine, IngestOutcome, IngestRequest, Result,
-    RuntimeConfigState, RuntimeController, RuntimeFaultInjector, StartupReconcileRequest,
-    StartupReconcileResult,
+    RuntimeConfigState, RuntimeController, RuntimeFaultInjector, RuntimeGapReconcileRequest,
+    RuntimeGapReconcileResult, StartupReconcileRequest, StartupReconcileResult,
 };
 
 const CONFIG_PATH: &str = "config.json";
@@ -396,6 +396,7 @@ impl RecordingCoordinator {
         event_faults: FaultInjector,
     ) -> Result<StartupReconcileResult> {
         self.reconcile_heartbeat_intent()?;
+        self.reconcile_pending_runtime_gap()?;
         let prepared = self.runtime.prepare_startup(&request)?;
         let has_pending_events = !prepared.gap_events.is_empty();
         for event in prepared.gap_events {
@@ -421,7 +422,48 @@ impl RecordingCoordinator {
 
     pub fn prepare_termination(&mut self, session_id: &str, now: DateTime<Utc>) -> Result<()> {
         self.reconcile_heartbeat_intent()?;
+        self.reconcile_pending_runtime_gap()?;
         self.runtime.prepare_termination(session_id, now)
+    }
+
+    pub fn reconcile_runtime_gap(
+        &mut self,
+        request: RuntimeGapReconcileRequest,
+    ) -> Result<RuntimeGapReconcileResult> {
+        self.reconcile_runtime_gap_with_faults(
+            request,
+            FaultInjector::none(),
+            RuntimeFaultInjector::none(),
+        )
+    }
+
+    pub fn reconcile_runtime_gap_with_faults(
+        &mut self,
+        request: RuntimeGapReconcileRequest,
+        event_faults: FaultInjector,
+        checkpoint_faults: RuntimeFaultInjector,
+    ) -> Result<RuntimeGapReconcileResult> {
+        self.reconcile_heartbeat_intent()?;
+        self.reconcile_pending_runtime_gap()?;
+        let prepared = self.runtime.prepare_runtime_gap(&request)?;
+        for event in &prepared.gap_events {
+            self.ingest.ingest_with_faults(
+                IngestRequest {
+                    event: event.clone(),
+                    cadence: None,
+                },
+                request.now,
+                event_faults,
+                FaultInjector::none(),
+            )?;
+        }
+        if let Some(pending) = &prepared.pending {
+            self.runtime
+                .commit_runtime_gap(pending, &prepared.gap_event_ids, checkpoint_faults)?;
+        }
+        Ok(RuntimeGapReconcileResult {
+            gap_event_ids: prepared.gap_event_ids,
+        })
     }
 
     pub fn configure_study(&mut self, boundary: StudyBoundary) -> Result<StudyBoundary> {
@@ -477,6 +519,7 @@ impl RecordingCoordinator {
         heartbeat_faults: RuntimeFaultInjector,
     ) -> Result<IngestOutcome> {
         self.reconcile_heartbeat_intent()?;
+        self.reconcile_pending_runtime_gap()?;
         self.require_live_event(&request.event, now)?;
         if matches!(
             &request.event.payload,
@@ -543,6 +586,7 @@ impl RecordingCoordinator {
         heartbeat_faults: RuntimeFaultInjector,
     ) -> Result<RetainedImageAcknowledgement> {
         self.reconcile_heartbeat_intent()?;
+        self.reconcile_pending_runtime_gap()?;
         self.require_live_event(observation, now)?;
         completion.validate().map_err(EngineError::Aggregation)?;
         if completion.recorded_at > now {
@@ -658,6 +702,28 @@ impl RecordingCoordinator {
         self.runtime.resolve_heartbeat_intent(
             &intent,
             &canonical_event_ids,
+            RuntimeFaultInjector::none(),
+        )
+    }
+
+    fn reconcile_pending_runtime_gap(&mut self) -> Result<()> {
+        let Some(pending) = self.runtime.pending_runtime_gap()? else {
+            return Ok(());
+        };
+        let event = pending.gap_event.clone();
+        let event_id = event.event_id.clone();
+        self.ingest.ingest_with_faults(
+            IngestRequest {
+                event: event.clone(),
+                cadence: None,
+            },
+            pending.reconciled_at,
+            FaultInjector::none(),
+            FaultInjector::none(),
+        )?;
+        self.runtime.commit_runtime_gap(
+            &pending,
+            std::slice::from_ref(&event_id),
             RuntimeFaultInjector::none(),
         )
     }
